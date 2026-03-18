@@ -145,8 +145,10 @@ export class Schedule {
    * Also updates runCount and lastRunAt.
    *
    * If the schedule has reached its limit, the job will not be dispatched.
+   *
+   * @param payload - Optional custom payload for the job
    */
-  async trigger(): Promise<void> {
+  async trigger(payload?: any): Promise<void> {
     // Check if limit is reached
     if (this.#data.limit !== null && this.#data.runCount >= this.#data.limit) {
       return
@@ -155,7 +157,7 @@ export class Schedule {
     const adapter = QueueManager.use()
 
     // Dispatch the job
-    const dispatcher = new JobDispatcher(this.#data.name, this.#data.payload)
+    const dispatcher = new JobDispatcher(this.#data.name, payload ?? this.#data.payload)
     await dispatcher.run()
 
     // Update run metadata

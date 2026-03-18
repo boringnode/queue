@@ -353,6 +353,22 @@ test.group('Schedule', (group) => {
     assert.isNull(job2)
   })
 
+  test('schedule.trigger(payload) should dispatch job with custom payload', async ({ assert }) => {
+    await new ScheduleBuilder('TriggerJob', { immediate: true, custom: false })
+      .id('triggerable')
+      .every('1h')
+      .run()
+
+    const schedule = await Schedule.find('triggerable')
+    await schedule!.trigger({ immediate: true, custom: true })
+
+    // Job should be in the queue
+    const job = await sharedAdapter.pop()
+    assert.isNotNull(job)
+    assert.equal(job!.name, 'TriggerJob')
+    assert.deepEqual(job!.payload, { immediate: true, custom: true })
+  })
+
   test('schedule properties should reflect data', async ({ assert }) => {
     const fromDate = new Date('2025-01-01')
     const toDate = new Date('2025-12-31')
