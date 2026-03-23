@@ -6,6 +6,25 @@ import { JobDispatcher } from '../src/job_dispatcher.js'
 import { JobBatchDispatcher } from '../src/job_batch_dispatcher.js'
 
 test.group('JobDispatcher', () => {
+  test('should wrap adapter calls with internalOperationWrapper', async ({ assert }) => {
+    const sharedAdapter = memory()()
+    let internalCalls = 0
+
+    await QueueManager.init({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      internalOperationWrapper: async (fn) => {
+        internalCalls++
+        return fn()
+      },
+    })
+
+    await new JobDispatcher('WrappedJob', { foo: 'bar' }).run()
+    await new JobBatchDispatcher('WrappedBatchJob', [{ foo: 1 }, { foo: 2 }]).run()
+
+    assert.equal(internalCalls, 2)
+  })
+
   test('should dispatch job correctly', async ({ assert }) => {
     const sharedAdapter = memory()()
 

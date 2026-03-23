@@ -1,5 +1,6 @@
 import type { BackoffStrategy as BackoffStrategyClass } from '../strategies/backoff_strategy.js'
 import type { Adapter } from '../contracts/adapter.js'
+import type { AcquiredJob } from '../contracts/adapter.js'
 import type { Logger } from '../logger.js'
 import { Job } from '../job.js'
 
@@ -120,6 +121,12 @@ export interface JobData {
    * ```
    */
   groupId?: string
+
+  /**
+   * Serialized trace context for distributed tracing.
+   * Injected by OTel plugin at dispatch time.
+   */
+  traceContext?: Record<string, string>
 }
 
 /**
@@ -503,4 +510,16 @@ export interface QueueManagerConfig {
    * ```
    */
   jobFactory?: JobFactory
+
+  /**
+   * Wraps internal adapter operations (Redis, Knex calls) to suppress
+   * or customize instrumentation. Used by OTel to suppress child spans.
+   */
+  internalOperationWrapper?: <T>(fn: () => Promise<T>) => Promise<T>
+
+  /**
+   * Wraps job execution to inject tracing context or custom behavior.
+   * Called around `runtime.execute()` for each job attempt.
+   */
+  executionWrapper?: <T>(fn: () => Promise<T>, job: AcquiredJob, queue: string) => Promise<T>
 }

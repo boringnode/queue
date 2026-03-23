@@ -13,3 +13,4 @@ export {
   fixedBackoff,
 } from './src/strategies/backoff_strategy.js'
 export * as errors from './src/exceptions.js'
+export * as tracingChannels from './src/tracing_channels.js'

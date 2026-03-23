@@ -7,12 +7,17 @@ import { QueueConfigResolver } from './queue_config_resolver.js'
 import type { Adapter } from './contracts/adapter.js'
 import type { AdapterFactory, JobFactory, QueueManagerConfig } from './types/main.js'
 
+const noopInternalOperationWrapper: NonNullable<QueueManagerConfig['internalOperationWrapper']> = async (fn) => fn()
+const noopExecutionWrapper: NonNullable<QueueManagerConfig['executionWrapper']> = async (fn) => fn()
+
 type QueueManagerFakeState = {
   defaultAdapter: string
   adapters: Record<string, AdapterFactory>
   adapterInstances: Map<string, Adapter>
   logger: Logger
   jobFactory?: JobFactory
+  internalOperationWrapper?: QueueManagerConfig['internalOperationWrapper']
+  executionWrapper?: QueueManagerConfig['executionWrapper']
   configResolver: QueueConfigResolver
   fakeAdapter: FakeAdapter
 }
@@ -55,6 +60,8 @@ class QueueManagerSingleton {
   #adapterInstances: Map<string, Adapter> = new Map()
   #logger: Logger = consoleLogger
   #jobFactory?: JobFactory
+  #internalOperationWrapper?: QueueManagerConfig['internalOperationWrapper']
+  #executionWrapper?: QueueManagerConfig['executionWrapper']
   #configResolver: QueueConfigResolver = new QueueConfigResolver({})
   #fakeState?: QueueManagerFakeState
 
@@ -93,6 +100,8 @@ class QueueManagerSingleton {
     this.#adapters = config.adapters
     this.#logger = config.logger ?? consoleLogger
     this.#jobFactory = config.jobFactory
+    this.#internalOperationWrapper = config.internalOperationWrapper
+    this.#executionWrapper = config.executionWrapper
     this.#configResolver = QueueConfigResolver.from(config)
 
     if (config.locations && config.locations.length > 0) {
@@ -242,6 +251,8 @@ class QueueManagerSingleton {
       adapterInstances: this.#adapterInstances,
       logger: this.#logger,
       jobFactory: this.#jobFactory,
+      internalOperationWrapper: this.#internalOperationWrapper,
+      executionWrapper: this.#executionWrapper,
       configResolver: this.#configResolver,
       fakeAdapter,
     }
@@ -281,6 +292,8 @@ class QueueManagerSingleton {
     this.#adapterInstances = state.adapterInstances
     this.#logger = state.logger
     this.#jobFactory = state.jobFactory
+    this.#internalOperationWrapper = state.internalOperationWrapper
+    this.#executionWrapper = state.executionWrapper
     this.#configResolver = state.configResolver
   }
 
@@ -294,10 +307,31 @@ class QueueManagerSingleton {
   }
 
   /**
+   * Whether the queue manager has been initialized.
+   */
+  isInitialized(): boolean {
+    return this.#initialized
+  }
+
+  /**
    * Get the configured logger used by the queue runtime.
    */
   getLogger(): Logger {
     return this.#logger
+  }
+
+  /**
+   * Get the configured internal operation wrapper.
+   */
+  getInternalOperationWrapper() {
+    return this.#internalOperationWrapper ?? noopInternalOperationWrapper
+  }
+
+  /**
+   * Get the configured execution wrapper.
+   */
+  getExecutionWrapper() {
+    return this.#executionWrapper ?? noopExecutionWrapper
   }
 
   /**
@@ -362,6 +396,8 @@ class QueueManagerSingleton {
 
     this.#adapterInstances.clear()
     this.#initialized = false
+    this.#internalOperationWrapper = undefined
+    this.#executionWrapper = undefined
     this.#configResolver = new QueueConfigResolver({})
     this.#fakeState = undefined
   }

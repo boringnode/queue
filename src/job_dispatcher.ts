@@ -1,8 +1,10 @@
 import debug from './debug.js'
 import { randomUUID } from 'node:crypto'
 import { QueueManager } from './queue_manager.js'
+import { dispatchChannel } from './tracing_channels.js'
 import type { Adapter } from './contracts/adapter.js'
 import type { DispatchResult, Duration } from './types/main.js'
+import type { JobDispatchMessage } from './types/tracing_channels.js'
 import { parse } from './utils.js'
 
 /**
@@ -184,8 +186,10 @@ export class JobDispatcher<T> {
     debug('dispatching job %s with id %s using payload %s', this.#name, id, this.#payload)
 
     const adapter = this.#getAdapterInstance()
+    const wrapInternal = QueueManager.getInternalOperationWrapper()
+    const parsedDelay = this.#delay ? parse(this.#delay) : undefined
 
-    const payload = {
+    const jobData = {
       id,
       name: this.#name,
       payload: this.#payload,
@@ -194,17 +198,17 @@ export class JobDispatcher<T> {
       groupId: this.#groupId,
     }
 
-    if (this.#delay) {
-      const parsedDelay = parse(this.#delay)
+    const message: JobDispatchMessage = { jobs: [jobData], queue: this.#queue, delay: parsedDelay }
 
-      await adapter.pushLaterOn(this.#queue, payload, parsedDelay)
-    } else {
-      await adapter.pushOn(this.#queue, payload)
-    }
+    await dispatchChannel.tracePromise(async () => {
+      if (parsedDelay !== undefined) {
+        await wrapInternal(() => adapter.pushLaterOn(this.#queue, jobData, parsedDelay))
+      } else {
+        await wrapInternal(() => adapter.pushOn(this.#queue, jobData))
+      }
+    }, message)
 
-    return {
-      jobId: id,
-    }
+    return { jobId: id }
   }
 
   /**

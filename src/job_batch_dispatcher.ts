@@ -1,8 +1,10 @@
 import debug from './debug.js'
 import { randomUUID } from 'node:crypto'
 import { QueueManager } from './queue_manager.js'
+import { dispatchChannel } from './tracing_channels.js'
 import type { Adapter } from './contracts/adapter.js'
 import type { DispatchManyResult } from './types/main.js'
+import type { JobDispatchMessage } from './types/tracing_channels.js'
 
 /**
  * Fluent builder for dispatching multiple jobs to the queue in a single batch.
@@ -143,9 +145,12 @@ export class JobBatchDispatcher<T> {
    * ```
    */
   async run(): Promise<DispatchManyResult> {
+    if (this.#payloads.length === 0) return { jobIds: [] }
+
     debug('dispatching %d jobs of type %s', this.#payloads.length, this.#name)
 
     const adapter = this.#getAdapterInstance()
+    const wrapInternal = QueueManager.getInternalOperationWrapper()
 
     const jobs = this.#payloads.map((payload) => ({
       id: randomUUID(),
@@ -156,11 +161,14 @@ export class JobBatchDispatcher<T> {
       groupId: this.#groupId,
     }))
 
-    await adapter.pushManyOn(this.#queue, jobs)
+    const message: JobDispatchMessage = { jobs, queue: this.#queue }
 
-    return {
-      jobIds: jobs.map((job) => job.id),
-    }
+
+    await dispatchChannel.tracePromise(async () => {
+      await wrapInternal(() => adapter.pushManyOn(this.#queue, jobs))
+    }, message)
+
+    return { jobIds: jobs.map((job) => job.id) }
   }
 
   /**

@@ -2,6 +2,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { Locator } from '../locator.js'
 import { QueueManager } from '../queue_manager.js'
 import { JobExecutionRuntime } from '../job_runtime.js'
+import { executeChannel } from '../tracing_channels.js'
 import type { Adapter, AcquiredJob } from '../contracts/adapter.js'
 import type {
   JobContext,
@@ -11,6 +12,7 @@ import type {
   ScheduleData,
   ScheduleListOptions,
 } from '../types/main.js'
+import type { JobExecuteMessage } from '../types/tracing_channels.js'
 import { DEFAULT_PRIORITY } from '../constants.js'
 
 /**
@@ -165,40 +167,60 @@ export class SyncAdapter implements Adapter {
       defaultTimeout: configResolver.getWorkerTimeout(),
     })
     const jobFactory = QueueManager.getJobFactory()
+    const executionWrapper = QueueManager.getExecutionWrapper()
     let attempts = jobData.attempts
 
     while (true) {
+      const now = Date.now()
+      const acquiredJob: AcquiredJob = { ...jobData, attempts, acquiredAt: now }
+
       const context: JobContext = {
         jobId: jobData.id,
         name: jobData.name,
         attempt: attempts + 1,
         queue,
         priority: jobData.priority ?? DEFAULT_PRIORITY,
-        acquiredAt: new Date(),
+        acquiredAt: new Date(now),
         stalledCount: jobData.stalledCount ?? 0,
       }
 
       const jobInstance = jobFactory ? await jobFactory(JobClass) : new JobClass()
 
-      try {
-        await runtime.execute(jobInstance, jobData.payload, context)
-        return
-      } catch (error) {
-        const outcome = runtime.resolveFailure(error as Error, attempts)
+      const startTime = performance.now()
+      const executeMessage: JobExecuteMessage = { job: acquiredJob, queue }
 
-        if (outcome.type === 'failed') {
-          await jobInstance.failed?.(outcome.hookError)
-          return
-        }
+      const run = () => {
+        return executeChannel.tracePromise(async () => {
+          try {
+            await runtime.execute(jobInstance, jobData.payload, context)
+            executeMessage.status = 'completed'
+          } catch (error) {
+            const outcome = runtime.resolveFailure(error as Error, attempts)
+            executeMessage.error = error as Error
 
-        attempts++
-
-        if (outcome.type === 'retry' && outcome.retryAt) {
-          const delay = outcome.retryAt.getTime() - Date.now()
-
-          if (delay > 0) {
-            await sleep(delay)
+            if (outcome.type === 'failed') {
+              executeMessage.status = 'failed'
+              await jobInstance.failed?.(outcome.hookError)
+            } else if (outcome.type === 'retry') {
+              executeMessage.status = 'retrying'
+              executeMessage.nextRetryAt = outcome.retryAt
+            }
           }
+
+          executeMessage.duration = Number((performance.now() - startTime).toFixed(2))
+        }, executeMessage)
+      }
+
+      await executionWrapper(run, acquiredJob, queue)
+
+      if (executeMessage.status !== 'retrying') return
+
+      attempts++
+
+      if (executeMessage.nextRetryAt) {
+        const delay = executeMessage.nextRetryAt.getTime() - Date.now()
+        if (delay > 0) {
+          await sleep(delay)
         }
       }
     }

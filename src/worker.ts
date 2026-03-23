@@ -5,8 +5,10 @@ import { parse } from './utils.js'
 import { QueueManager } from './queue_manager.js'
 import { JobPool } from './job_pool.js'
 import { JobExecutionRuntime } from './job_runtime.js'
+import { dispatchChannel, executeChannel } from './tracing_channels.js'
 import type { Adapter, AcquiredJob } from './contracts/adapter.js'
-import type { JobContext, JobOptions, QueueManagerConfig, WorkerCycle } from './types/main.js'
+import type { JobContext, JobOptions, JobRetention, QueueManagerConfig, WorkerCycle } from './types/main.js'
+import type { JobDispatchMessage, JobExecuteMessage } from './types/tracing_channels.js'
 import { Locator } from './locator.js'
 import { DEFAULT_PRIORITY } from './constants.js'
 import type { Job } from './job.js'
@@ -60,6 +62,7 @@ export class Worker {
   readonly #onShutdownSignal?: () => void | Promise<void>
 
   #adapter!: Adapter
+  #wrapInternal: <T>(fn: () => Promise<T>) => Promise<T> = (fn) => fn()
   #running = false
   #initialized = false
   #generator?: AsyncGenerator<WorkerCycle, void, unknown>
@@ -109,6 +112,7 @@ export class Worker {
 
     this.#adapter = QueueManager.use()
     this.#adapter.setWorkerId(this.#id)
+    this.#wrapInternal = QueueManager.getInternalOperationWrapper()
 
     this.#initialized = true
 
@@ -337,49 +341,58 @@ export class Worker {
       defaultTimeout: configResolver.getWorkerTimeout(),
     })
 
-    try {
-      await runtime.execute(instance, payload, context)
-      await this.#adapter.completeJob(job.id, queue, retention.removeOnComplete)
+    const executeMessage: JobExecuteMessage = { job, queue }
 
-      const duration = (performance.now() - startTime).toFixed(2)
-      debug('worker %s: successfully executed job %s in %dms', this.#id, job.id, duration)
-    } catch (e) {
-      const outcome = runtime.resolveFailure(e as Error, job.attempts)
+    const run = () => {
+      return executeChannel.tracePromise(async () => {
+        try {
+          await runtime.execute(instance, payload, context)
+          await this.#wrapInternal(() => this.#adapter.completeJob(job.id, queue, retention.removeOnComplete))
+          executeMessage.status = 'completed'
+          debug('worker %s: successfully executed job %s in %dms', this.#id, job.id, (performance.now() - startTime).toFixed(2))
+        } catch (e) {
+          await this.#handleExecutionFailure({ error: e as Error, job, queue, instance, runtime, retention, executeMessage })
+        }
 
-      if (outcome.type === 'failed' && outcome.reason === 'timeout') {
-        debug('worker %s: job %s timed out and failOnTimeout is set', this.#id, job.id)
-        await this.#adapter.failJob(job.id, queue, outcome.storageError, retention.removeOnFail)
-        await instance.failed?.(outcome.hookError)
-        return
-      }
+        executeMessage.duration = Number((performance.now() - startTime).toFixed(2))
+      }, executeMessage)
+    }
 
-      if (outcome.type === 'failed' && outcome.reason === 'no-retries') {
-        debug('worker %s: job %s has no retries configured, marking as failed', this.#id, job.id)
-        await this.#adapter.failJob(job.id, queue, outcome.storageError, retention.removeOnFail)
-        await instance.failed?.(outcome.hookError)
-        return
-      }
+    const executionWrapper = QueueManager.getExecutionWrapper()
+    await executionWrapper(run, job, queue)
+  }
 
-      if (outcome.type === 'failed' && outcome.reason === 'max-attempts') {
-        debug(
-          'worker %s: job %s has exceeded max retries (%d), marking as failed',
-          this.#id,
-          job.id,
-          runtime.maxRetries
-        )
-        await this.#adapter.failJob(job.id, queue, outcome.storageError, retention.removeOnFail)
-        await instance.failed?.(outcome.hookError)
+  async #handleExecutionFailure(options: {
+    error: Error
+    job: AcquiredJob
+    queue: string
+    instance: Job
+    runtime: JobExecutionRuntime
+    retention: { removeOnComplete?: JobRetention; removeOnFail?: JobRetention }
+    executeMessage: JobExecuteMessage
+  }) {
+    const outcome = options.runtime.resolveFailure(options.error, options.job.attempts)
+    options.executeMessage.error = options.error
 
-        return
-      }
+    if (outcome.type === 'failed') {
+      options.executeMessage.status = 'failed'
+      await this.#wrapInternal(() =>
+        this.#adapter.failJob(options.job.id, options.queue, outcome.storageError, options.retention.removeOnFail)
+      )
+      await options.instance.failed?.(outcome.hookError)
+      return
+    }
 
-      if (outcome.type === 'retry' && outcome.retryAt) {
-        debug('worker %s: job %s will retry at %s', this.#id, job.id, outcome.retryAt.toISOString())
-        await this.#adapter.retryJob(job.id, queue, outcome.retryAt)
-        return
-      }
+    if (outcome.type !== 'retry') return
 
-      await this.#adapter.retryJob(job.id, queue)
+    options.executeMessage.status = 'retrying'
+    options.executeMessage.nextRetryAt = outcome.retryAt
+
+    if (outcome.retryAt) {
+      debug('worker %s: job %s will retry at %s', this.#id, options.job.id, outcome.retryAt.toISOString())
+      await this.#wrapInternal(() => this.#adapter.retryJob(options.job.id, options.queue, outcome.retryAt))
+    } else {
+      await this.#wrapInternal(() => this.#adapter.retryJob(options.job.id, options.queue))
     }
   }
 
@@ -413,14 +426,14 @@ export class Worker {
     } catch (error) {
       debug('worker %s: failed to initialize job %s (%s)', this.#id, job.id, job.name)
       const retention = QueueManager.getConfigResolver().resolveJobOptions(queue)
-      await this.#adapter.failJob(job.id, queue, error as Error, retention.removeOnFail)
+      await this.#wrapInternal(() => this.#adapter.failJob(job.id, queue, error as Error, retention.removeOnFail))
       throw error
     }
   }
 
   async #acquireNextJob(queues: string[]): Promise<{ job: AcquiredJob; queue: string } | null> {
     for (const queue of queues) {
-      const job = await this.#adapter.popFrom(queue)
+      const job = await this.#wrapInternal(() => this.#adapter.popFrom(queue))
 
       if (!job) {
         continue
@@ -444,10 +457,8 @@ export class Worker {
     this.#lastStalledCheck = now
 
     for (const queue of queues) {
-      const recovered = await this.#adapter.recoverStalledJobs(
-        queue,
-        this.#stalledThreshold,
-        this.#maxStalledCount
+      const recovered = await this.#wrapInternal(() =>
+        this.#adapter.recoverStalledJobs(queue, this.#stalledThreshold, this.#maxStalledCount)
       )
 
       if (recovered > 0) {
@@ -492,7 +503,7 @@ export class Worker {
   async #dispatchDueSchedules(): Promise<void> {
     // Keep claiming due schedules until there are none left
     while (true) {
-      const schedule = await this.#adapter.claimDueSchedule()
+      const schedule = await this.#wrapInternal(() => this.#adapter.claimDueSchedule())
 
       if (!schedule) {
         break
@@ -510,14 +521,18 @@ export class Worker {
       const JobClass = Locator.get(schedule.name)
       const queue = JobClass?.options?.queue ?? 'default'
 
-      // Dispatch the job to the queue
-      await this.#adapter.pushOn(queue, {
+      const jobData = {
         id: randomUUID(),
         name: schedule.name,
         payload: schedule.payload,
         attempts: 0,
         priority: JobClass?.options?.priority,
-      })
+      }
+
+      const message: JobDispatchMessage = { jobs: [jobData], queue }
+      await dispatchChannel.tracePromise(async () => {
+        await this.#wrapInternal(() => this.#adapter.pushOn(queue, jobData))
+      }, message)
     }
   }
 }

@@ -519,6 +519,77 @@ await QueueManager.init({
 })
 ```
 
+## OpenTelemetry Instrumentation (experimental)
+
+> [!WARNING]
+> The OpenTelemetry instrumentation is experimental and its API may change in future releases.
+
+`@boringnode/queue` ships with built-in OpenTelemetry instrumentation that creates **PRODUCER** spans for job dispatch and **CONSUMER** spans for job execution, following [OTel messaging semantic conventions](https://opentelemetry.io/docs/specs/semconv/messaging/messaging-spans/).
+
+### Quick Setup
+
+```typescript
+import { QueueInstrumentation } from '@boringnode/queue/otel'
+import * as boringqueue from '@boringnode/queue'
+
+const instrumentation = new QueueInstrumentation({
+  messagingSystem: 'boringqueue', // default
+  executionSpanLinkMode: 'link',  // or 'parent'
+})
+
+instrumentation.enable()
+instrumentation.manuallyRegister(boringqueue)
+```
+
+The instrumentation patches `QueueManager.init()` to automatically inject its wrappers — no config changes needed in your queue setup.
+
+### Span Attributes
+
+The instrumentation uses standard [OTel messaging semantic conventions](https://opentelemetry.io/docs/specs/semconv/messaging/messaging-spans/) where they map cleanly, plus a few queue-specific custom attributes.
+
+| Attribute                       | Kind    | Description                                |
+| ------------------------------- | ------- | ------------------------------------------ |
+| `messaging.system`              | Semconv | `'boringqueue'` (configurable)             |
+| `messaging.operation.name`      | Semconv | `'publish'` or `'process'`                 |
+| `messaging.destination.name`    | Semconv | Queue name                                 |
+| `messaging.message.id`          | Semconv | Job ID for single-message spans            |
+| `messaging.batch.message_count` | Semconv | Number of jobs in a batch dispatch         |
+| `messaging.message.retry.count` | Custom  | Retry count (0-based) for a job attempt    |
+| `messaging.job.name`            | Custom  | Job class name (e.g. `SendEmailJob`)       |
+| `messaging.job.status`          | Custom  | `'completed'`, `'failed'`, or `'retrying'` |
+| `messaging.job.group_id`        | Custom  | Queue-specific group identifier            |
+| `messaging.job.priority`        | Custom  | Queue-specific job priority                |
+| `messaging.job.delay_ms`        | Custom  | Delay before the job becomes available     |
+
+### Trace Context Propagation
+
+The instrumentation automatically propagates trace context from dispatch to execution:
+
+- **Link mode** (default): Each job execution is an independent trace, linked to the dispatch span
+- **Parent mode**: Job execution is a child of the dispatch span (same trace)
+
+Child spans created inside `execute()` (DB queries, HTTP calls, etc.) are automatically parented to the job consumer span.
+
+### diagnostics_channel
+
+Raw telemetry events are available via `diagnostics_channel` for custom subscribers:
+
+```typescript
+import { tracingChannels } from '@boringnode/queue'
+
+const { executeChannel } = tracingChannels
+
+executeChannel.subscribe({
+  start() {},
+  end() {},
+  asyncStart() {},
+  asyncEnd(message) {
+    console.log(`Job ${message.job.name} ${message.status} in ${message.duration}ms`)
+  },
+  error() {},
+})
+```
+
 ## Benchmarks
 
 Performance comparison with BullMQ (5ms simulated work per job):
