@@ -46,7 +46,7 @@ import type { JobContext, JobOptions } from './types/main.js'
  * }
  * ```
  */
-export abstract class Job<Payload = any> {
+export abstract class Job<Payload = any, Output = any> {
   #payload!: Payload
   #context!: JobContext
   #signal?: AbortSignal
@@ -173,12 +173,15 @@ export abstract class Job<Payload = any> {
   static dispatch<T extends Job>(
     this: abstract new (...args: any[]) => T,
     payload: T extends Job<infer P> ? P : never
-  ): JobDispatcher<T extends Job<infer P> ? P : never> {
+  ): JobDispatcher<T extends Job<infer P> ? P : never, T extends Job<any, infer O> ? O : never> {
     const jobClass = this as unknown as { options?: JobOptions; name: string }
     const options = jobClass.options || {}
     const jobName = options.name || this.name
 
-    const dispatcher = new JobDispatcher<T extends Job<infer P> ? P : never>(jobName, payload)
+    const dispatcher = new JobDispatcher<
+      T extends Job<infer P> ? P : never,
+      T extends Job<any, infer O> ? O : never
+    >(jobName, payload)
 
     if (options.queue) {
       dispatcher.toQueue(options.queue)
@@ -305,7 +308,7 @@ export abstract class Job<Payload = any> {
    * }
    * ```
    */
-  abstract execute(): Promise<void>
+  abstract execute(): Promise<Output>
 
   /**
    * Called when the job has permanently failed (after all retries exhausted).

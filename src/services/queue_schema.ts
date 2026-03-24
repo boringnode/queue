@@ -20,6 +20,7 @@ export class QueueSchemaService {
       table.string('queue', 255).notNullable()
       table.enu('status', ['pending', 'active', 'delayed', 'completed', 'failed']).notNullable()
       table.text('data').notNullable()
+      table.text('output').nullable()
       table.bigint('score').unsigned().nullable()
       table.string('worker_id', 255).nullable()
       table.bigint('acquired_at').unsigned().nullable()
@@ -57,10 +58,7 @@ export class QueueSchemaService {
       table.integer('run_count').unsigned().notNullable().defaultTo(0)
       table.timestamp('next_run_at').nullable()
       table.timestamp('last_run_at').nullable()
-      table
-        .timestamp('created_at')
-        .notNullable()
-        .defaultTo(this.#connection.fn.now())
+      table.timestamp('created_at').notNullable().defaultTo(this.#connection.fn.now())
       table.index(['status', 'next_run_at'])
 
       extend?.(table)

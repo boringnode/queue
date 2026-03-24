@@ -5,7 +5,9 @@ import { dispatchChannel } from './tracing_channels.js'
 import type { Adapter } from './contracts/adapter.js'
 import type { DispatchResult, Duration } from './types/main.js'
 import type { JobDispatchMessage } from './types/tracing_channels.js'
+import { setTimeout } from 'node:timers/promises'
 import { parse } from './utils.js'
+import { E_JOB_EXECUTION_FAILED, E_JOB_EXECUTION_NOT_FOUND } from './exceptions.ts'
 
 /**
  * Fluent builder for dispatching jobs to the queue.
@@ -39,9 +41,9 @@ import { parse } from './utils.js'
  * await ReminderJob.dispatch({ userId: 123 }).in('24h')
  * ```
  */
-export class JobDispatcher<T> {
+export class JobDispatcher<TPayload, TOutput> {
   readonly #name: string
-  readonly #payload: T
+  readonly #payload: TPayload
   #queue: string = 'default'
   #adapter?: string | (() => Adapter)
   #delay?: Duration
@@ -54,7 +56,7 @@ export class JobDispatcher<T> {
    * @param name - The job class name (used to locate the class at runtime)
    * @param payload - The data to pass to the job
    */
-  constructor(name: string, payload: T) {
+  constructor(name: string, payload: TPayload) {
     this.#name = name
     this.#payload = payload
   }
@@ -209,6 +211,39 @@ export class JobDispatcher<T> {
     }, message)
 
     return { jobId: id }
+  }
+
+  /**
+   * Dispatch the job to the queue and
+   * await for job to complete or fail.
+   *
+   * @param pollingInterval - Interval between each check
+   * @param signal - Optional signal to abort waiting
+   * @returns The job output
+   */
+  async wait(pollingInterval: Duration = 2000, signal?: AbortSignal): Promise<TOutput> {
+    const adapter = this.#getAdapterInstance()
+    const dispatchResult = await this.run()
+
+    while (true) {
+      signal?.throwIfAborted()
+
+      await setTimeout(parse(pollingInterval))
+
+      const job = await adapter.getJob(dispatchResult.jobId, this.#queue)
+
+      if (!job) {
+        throw new E_JOB_EXECUTION_NOT_FOUND([dispatchResult.jobId])
+      }
+
+      if (job.status === 'completed') {
+        return job.output
+      }
+
+      if (job.status === 'failed') {
+        throw new E_JOB_EXECUTION_FAILED([dispatchResult.jobId], { cause: job.error })
+      }
+    }
   }
 
   /**

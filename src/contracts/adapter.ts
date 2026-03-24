@@ -84,8 +84,14 @@ export interface Adapter {
    * @param jobId - The job ID to complete
    * @param queue - The queue the job belongs to
    * @param removeOnComplete - Optional retention policy for completed jobs
+   * @param output - Optional output returned by the job
    */
-  completeJob(jobId: string, queue: string, removeOnComplete?: JobRetention): Promise<void>
+  completeJob(
+    jobId: string,
+    queue: string,
+    removeOnComplete?: JobRetention,
+    output?: any
+  ): Promise<void>
 
   /**
    * Mark a job as failed permanently and remove it from the queue.

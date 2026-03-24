@@ -117,9 +117,7 @@ export class KnexAdapter implements Adapter {
 
       // Update job to active status
       // For SQLite (no SKIP LOCKED), add status='pending' guard to prevent double-claim
-      const updateQuery = trx(this.#jobsTable)
-        .where('id', job.id)
-        .where('queue', queue)
+      const updateQuery = trx(this.#jobsTable).where('id', job.id).where('queue', queue)
 
       if (!this.#supportsSkipLocked()) {
         updateQuery.where('status', 'pending')
@@ -178,19 +176,21 @@ export class KnexAdapter implements Adapter {
         const priority = jobData.priority ?? DEFAULT_PRIORITY
         const score = calculateScore(priority, now)
 
-        await trx(this.#jobsTable)
-          .where('id', job.id)
-          .where('queue', queue)
-          .update({
-            status: 'pending',
-            score,
-            execute_at: null,
-          })
+        await trx(this.#jobsTable).where('id', job.id).where('queue', queue).update({
+          status: 'pending',
+          score,
+          execute_at: null,
+        })
       }
     })
   }
 
-  async completeJob(jobId: string, queue: string, removeOnComplete?: JobRetention): Promise<void> {
+  async completeJob(
+    jobId: string,
+    queue: string,
+    removeOnComplete?: JobRetention,
+    output?: any
+  ): Promise<void> {
     const { keep, maxAge, maxCount } = resolveRetention(removeOnComplete)
 
     if (!keep) {
@@ -213,6 +213,7 @@ export class KnexAdapter implements Adapter {
         worker_id: null,
         acquired_at: null,
         finished_at: now,
+        output: output ? JSON.stringify(output) : null,
       })
 
     if (!updated) {
@@ -276,6 +277,7 @@ export class KnexAdapter implements Adapter {
       status: row.status as JobStatus,
       data: jobData,
       finishedAt: row.finished_at ? Number(row.finished_at) : undefined,
+      output: row.output ? JSON.parse(row.output) : undefined,
       error: row.error || undefined,
     }
   }
@@ -331,33 +333,27 @@ export class KnexAdapter implements Adapter {
 
     if (retryAt && retryAt.getTime() > now) {
       // Move to delayed
-      await this.#connection(this.#jobsTable)
-        .where('id', jobId)
-        .where('queue', queue)
-        .update({
-          status: 'delayed',
-          data: updatedData,
-          worker_id: null,
-          acquired_at: null,
-          score: null,
-          execute_at: retryAt.getTime(),
-        })
+      await this.#connection(this.#jobsTable).where('id', jobId).where('queue', queue).update({
+        status: 'delayed',
+        data: updatedData,
+        worker_id: null,
+        acquired_at: null,
+        score: null,
+        execute_at: retryAt.getTime(),
+      })
     } else {
       // Move back to pending
       const priority = jobData.priority ?? DEFAULT_PRIORITY
       const score = calculateScore(priority, now)
 
-      await this.#connection(this.#jobsTable)
-        .where('id', jobId)
-        .where('queue', queue)
-        .update({
-          status: 'pending',
-          data: updatedData,
-          worker_id: null,
-          acquired_at: null,
-          score,
-          execute_at: null,
-        })
+      await this.#connection(this.#jobsTable).where('id', jobId).where('queue', queue).update({
+        status: 'pending',
+        data: updatedData,
+        worker_id: null,
+        acquired_at: null,
+        score,
+        execute_at: null,
+      })
     }
   }
 
@@ -458,10 +454,7 @@ export class KnexAdapter implements Adapter {
 
         if (currentStalledCount >= maxStalledCount) {
           // Fail permanently - remove the job
-          await trx(this.#jobsTable)
-            .where('id', row.id)
-            .where('queue', queue)
-            .delete()
+          await trx(this.#jobsTable).where('id', row.id).where('queue', queue).delete()
         } else {
           // Recover: increment stalledCount and put back in pending
           jobData.stalledCount = currentStalledCount + 1
@@ -534,9 +527,9 @@ export class KnexAdapter implements Adapter {
   }
 
   async getSchedule(id: string): Promise<ScheduleData | null> {
-    const row = (await this.#connection(this.#schedulesTable)
-      .where('id', id)
-      .first()) as ScheduleRow | undefined
+    const row = (await this.#connection(this.#schedulesTable).where('id', id).first()) as
+      | ScheduleRow
+      | undefined
     if (!row) return null
 
     return this.#rowToScheduleData(row)
@@ -565,16 +558,12 @@ export class KnexAdapter implements Adapter {
     if (updates.runCount !== undefined) data.run_count = updates.runCount
 
     if (Object.keys(data).length > 0) {
-      await this.#connection(this.#schedulesTable)
-        .where('id', id)
-        .update(data)
+      await this.#connection(this.#schedulesTable).where('id', id).update(data)
     }
   }
 
   async deleteSchedule(id: string): Promise<void> {
-    await this.#connection(this.#schedulesTable)
-      .where('id', id)
-      .delete()
+    await this.#connection(this.#schedulesTable).where('id', id).delete()
   }
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
@@ -629,13 +618,11 @@ export class KnexAdapter implements Adapter {
       }
 
       // Update atomically
-      await trx(this.#schedulesTable)
-        .where('id', row.id)
-        .update({
-          next_run_at: nextRunAt,
-          last_run_at: now,
-          run_count: newRunCount,
-        })
+      await trx(this.#schedulesTable).where('id', row.id).update({
+        next_run_at: nextRunAt,
+        last_run_at: now,
+        run_count: newRunCount,
+      })
 
       // Return schedule data (before update state for payload)
       return this.#rowToScheduleData(row)

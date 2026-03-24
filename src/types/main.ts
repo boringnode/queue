@@ -141,6 +141,8 @@ export interface JobRecord {
   finishedAt?: number
   /** Error message (for failed jobs) */
   error?: string
+  /** Serialized job output */
+  output?: any
 }
 
 /**

@@ -35,6 +35,16 @@ export const E_JOB_NOT_FOUND = createError<[jobName: string]>(
   'E_JOB_NOT_FOUND'
 )
 
+export const E_JOB_EXECUTION_NOT_FOUND = createError<[jobId: string]>(
+  'The job execution "%s" could not be found',
+  'E_JOB_EXECUTION_NOT_FOUND'
+)
+
+export const E_JOB_EXECUTION_FAILED = createError<[jobId: string]>(
+  'The job execution "%s" failed',
+  'E_JOB_EXECUTION_FAILED'
+)
+
 export const E_JOB_MAX_ATTEMPTS_REACHED = createError<[jobName: string]>(
   'The job "%s" has reached the maximum number of retry attempts',
   'E_JOB_MAX_ATTEMPTS_REACHED'

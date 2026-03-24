@@ -75,7 +75,7 @@ export class JobExecutionRuntime {
   /**
    * Execute a hydrated job instance and enforce the configured timeout.
    */
-  async execute(instance: Job, payload: unknown, context: JobContext): Promise<void> {
+  async execute(instance: Job, payload: unknown, context: JobContext): Promise<unknown> {
     if (this.#timeout === undefined) {
       instance.$hydrate(payload, context)
       return instance.execute()
@@ -90,7 +90,7 @@ export class JobExecutionRuntime {
     )
 
     try {
-      await Promise.race([instance.execute(), abortPromise])
+      return Promise.race([instance.execute(), abortPromise])
     } finally {
       cleanupAbortListener()
     }
