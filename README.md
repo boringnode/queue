@@ -270,19 +270,21 @@ await QueueManager.init({
   locations: ['./app/jobs/**/*.ts'],
 })
 
-const adapter = QueueManager.fake()
+// The `using` keyword automatically restores the real adapters when
+// the variable goes out of scope (at the end of the test function).
+using fake = QueueManager.fake()
 
 await SendEmailJob.dispatch({ to: 'user@example.com' })
 
-adapter.assertPushed(SendEmailJob)
-adapter.assertPushed(SendEmailJob, {
+fake.assertPushed(SendEmailJob)
+fake.assertPushed(SendEmailJob, {
   queue: 'default',
   payload: (payload) => payload.to === 'user@example.com',
 })
-adapter.assertPushedCount(1)
-
-QueueManager.restore()
+fake.assertPushedCount(1)
 ```
+
+You can also call `QueueManager.restore()` manually if you need more control over when the real adapters are restored.
 
 ### Sync (for testing)
 

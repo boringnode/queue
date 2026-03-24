@@ -168,6 +168,24 @@ test.group('QueueManager', () => {
     await QueueManager.destroy()
   })
 
+  test('should restore fake using Symbol.dispose', async ({ assert }) => {
+    await QueueManager.init({
+      default: 'sync',
+      adapters: { sync: sync() },
+    })
+
+    const original = QueueManager.use()
+
+    {
+      using fake = QueueManager.fake()
+      assert.strictEqual(QueueManager.use(), fake)
+    }
+
+    assert.strictEqual(QueueManager.use(), original)
+
+    await QueueManager.destroy()
+  })
+
   test('should destroy existing adapter instances before reinitializing', async ({
     assert,
     cleanup,

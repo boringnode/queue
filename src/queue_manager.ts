@@ -219,19 +219,18 @@ class QueueManagerSingleton {
    * Replace all adapters with a fake adapter for testing.
    *
    * The fake adapter records pushed jobs and exposes assertion helpers.
-   * Call `restore()` to return to the previous configuration.
-   *
-   * @returns The fake adapter instance for assertions
-   * @throws {E_QUEUE_NOT_INITIALIZED} If `init()` hasn't been called
+   * Use the `using` keyword to automatically restore the previous
+   * configuration when the variable goes out of scope, or call
+   * `restore()` manually.
    *
    * @example
    * ```typescript
-   * const fake = QueueManager.fake()
+   * using fake = QueueManager.fake()
    *
    * await SendEmailJob.dispatch({ to: 'user@example.com' })
    *
    * fake.assertPushed(SendEmailJob)
-   * QueueManager.restore()
+   * // Automatically restored at end of scope
    * ```
    */
   fake(): FakeAdapter {
@@ -244,6 +243,7 @@ class QueueManagerSingleton {
     }
 
     const fakeAdapter = new FakeAdapter()
+    fakeAdapter.onDispose(() => this.restore())
 
     this.#fakeState = {
       defaultAdapter: this.#defaultAdapter,

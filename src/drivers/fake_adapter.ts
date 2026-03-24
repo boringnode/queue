@@ -71,6 +71,19 @@ export class FakeAdapter implements Adapter {
   #pendingTimeouts = new Set<NodeJS.Timeout>()
   #schedules = new Map<string, ScheduleData>()
   #pushedJobs: FakeJobRecord[] = []
+  #onDispose?: () => void
+
+  /**
+   * Set the function to call when the fake is disposed
+   */
+  onDispose(fn: () => void) {
+    this.#onDispose = fn
+    return this
+  }
+
+  [Symbol.dispose]() {
+    this.#onDispose?.()
+  }
 
   setWorkerId(_workerId: string): void {}
 
