@@ -152,10 +152,11 @@ await SendInvoiceJob.dispatch({ orderId: 123 }).id('order-123').run()
 await SendReceiptJob.dispatch({ orderId: 123 }).id('order-123').run()
 ```
 
-Deduplication is atomic and race-condition-free across all adapters:
+Deduplication is atomic and race-condition-free for adapters that support storage-level uniqueness checks:
 
 - **Redis**: Uses `HSETNX` (set-if-not-exists)
 - **Knex**: Uses `INSERT ... ON CONFLICT DO NOTHING`
+- **SyncAdapter**: Executes jobs inline and does not support deduplication
 
 > [!NOTE]
 > Without `.id()`, jobs use auto-generated UUIDs and are never deduplicated. The `.id()` method is only available on single dispatch, not `dispatchMany`.

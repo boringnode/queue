@@ -161,8 +161,8 @@ export class FakeAdapter implements Adapter {
 
   async pushOn(queue: string, jobData: JobData): Promise<void> {
     if (jobData.unique) {
-      const jobs = this.#queues.get(queue)
-      if (jobs?.some((j) => j.id === jobData.id)) return
+      const existing = await this.getJob(jobData.id, queue)
+      if (existing) return
     }
 
     this.#recordPush(queue, jobData)
@@ -173,13 +173,10 @@ export class FakeAdapter implements Adapter {
     return this.pushLaterOn('default', jobData, delay)
   }
 
-  pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<void> {
+  async pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<void> {
     if (jobData.unique) {
-      const jobs = this.#queues.get(queue)
-      if (jobs?.some((j) => j.id === jobData.id)) return Promise.resolve()
-
-      const delayed = this.#delayedJobs.get(queue)
-      if (delayed?.has(jobData.id)) return Promise.resolve()
+      const existing = await this.getJob(jobData.id, queue)
+      if (existing) return
     }
 
     this.#recordPush(queue, jobData, delay)
