@@ -91,7 +91,7 @@ test.group('FakeAdapter', () => {
     await adapter.destroy()
   })
 
-  test('should skip duplicate pushOn when unique flag is set', async ({ assert }) => {
+  test('should skip duplicate pushOn when dedup is set', async ({ assert }) => {
     const adapter = fake()()
 
     await adapter.pushOn('default', {
@@ -99,7 +99,7 @@ test.group('FakeAdapter', () => {
       name: 'TestJob',
       payload: { attempt: 1 },
       attempts: 0,
-      unique: true,
+      dedup: { id: 'order-1' },
     })
 
     await adapter.pushOn('default', {
@@ -107,7 +107,7 @@ test.group('FakeAdapter', () => {
       name: 'TestJob',
       payload: { attempt: 2 },
       attempts: 0,
-      unique: true,
+      dedup: { id: 'order-1' },
     })
 
     const size = await adapter.size()
@@ -117,7 +117,7 @@ test.group('FakeAdapter', () => {
     await adapter.destroy()
   })
 
-  test('should skip duplicate pushLaterOn when unique flag is set', async () => {
+  test('should skip duplicate pushLaterOn when dedup is set', async () => {
     const adapter = fake()()
 
     await adapter.pushLaterOn(
@@ -127,7 +127,7 @@ test.group('FakeAdapter', () => {
         name: 'TestJob',
         payload: { attempt: 1 },
         attempts: 0,
-        unique: true,
+        dedup: { id: 'delayed-1' },
       },
       5000
     )
@@ -139,7 +139,7 @@ test.group('FakeAdapter', () => {
         name: 'TestJob',
         payload: { attempt: 2 },
         attempts: 0,
-        unique: true,
+        dedup: { id: 'delayed-1' },
       },
       5000
     )

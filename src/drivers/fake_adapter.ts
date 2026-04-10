@@ -160,7 +160,7 @@ export class FakeAdapter implements Adapter {
   }
 
   async pushOn(queue: string, jobData: JobData): Promise<void> {
-    if (jobData.unique) {
+    if (jobData.dedup) {
       const existing = await this.getJob(jobData.id, queue)
       if (existing) return
     }
@@ -174,7 +174,7 @@ export class FakeAdapter implements Adapter {
   }
 
   async pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<void> {
-    if (jobData.unique) {
+    if (jobData.dedup) {
       const existing = await this.getJob(jobData.id, queue)
       if (existing) return
     }

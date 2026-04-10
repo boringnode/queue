@@ -134,22 +134,22 @@ The `groupId` is stored with job data and accessible via `job.data.groupId`.
 
 ## Job Deduplication
 
-Prevent the same job from being pushed to the queue twice using custom job IDs:
+Prevent the same job from being pushed to the queue twice using `.dedup()`:
 
 ```typescript
 // First dispatch - job is created
-await SendInvoiceJob.dispatch({ orderId: 123 }).id('order-123').run()
+await SendInvoiceJob.dispatch({ orderId: 123 }).dedup({ id: 'order-123' }).run()
 
-// Second dispatch with same ID - silently skipped
-await SendInvoiceJob.dispatch({ orderId: 123 }).id('order-123').run()
+// Second dispatch with same dedup ID - silently skipped
+await SendInvoiceJob.dispatch({ orderId: 123 }).dedup({ id: 'order-123' }).run()
 ```
 
-The custom ID is automatically prefixed with the job name, so different job types can use the same ID without conflicts:
+The dedup ID is automatically prefixed with the job name, so different job types can use the same ID without conflicts:
 
 ```typescript
 // These are two different jobs, no conflict
-await SendInvoiceJob.dispatch({ orderId: 123 }).id('order-123').run()
-await SendReceiptJob.dispatch({ orderId: 123 }).id('order-123').run()
+await SendInvoiceJob.dispatch({ orderId: 123 }).dedup({ id: 'order-123' }).run()
+await SendReceiptJob.dispatch({ orderId: 123 }).dedup({ id: 'order-123' }).run()
 ```
 
 Deduplication is atomic and race-condition-free for adapters that support storage-level uniqueness checks:
@@ -159,10 +159,10 @@ Deduplication is atomic and race-condition-free for adapters that support storag
 - **SyncAdapter**: Executes jobs inline and does not support deduplication
 
 > [!NOTE]
-> Without `.id()`, jobs use auto-generated UUIDs and are never deduplicated. The `.id()` method is only available on single dispatch, not `dispatchMany`.
+> Without `.dedup()`, jobs use auto-generated UUIDs and are never deduplicated. The `.dedup()` method is only available on single dispatch, not `dispatchMany`.
 
 > [!TIP]
-> When job retention is enabled (`removeOnComplete: false`), completed jobs remain in storage. A re-dispatch with the same custom ID will be silently skipped since the record still exists. With the default retention (`true`), completed jobs are removed immediately, so re-dispatch with the same ID succeeds normally.
+> When job retention is enabled (`removeOnComplete: false`), completed jobs remain in storage. A re-dispatch with the same dedup ID will be silently skipped since the record still exists. With the default retention (`true`), completed jobs are removed immediately, so re-dispatch with the same ID succeeds normally.
 
 ## Job History & Retention
 

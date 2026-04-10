@@ -1650,7 +1650,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.equal(third!.id, 'low')
   })
 
-  test('pushOn with unique flag should skip duplicate job', async ({ assert }) => {
+  test('pushOn with dedup should skip duplicate job', async ({ assert }) => {
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')
 
@@ -1659,7 +1659,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { attempt: 1 },
       attempts: 0,
-      unique: true,
+      dedup: { id: 'order-1' },
     })
 
     await adapter.pushOn('test-queue', {
@@ -1667,7 +1667,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { attempt: 2 },
       attempts: 0,
-      unique: true,
+      dedup: { id: 'order-1' },
     })
 
     const size = await adapter.sizeOf('test-queue')
@@ -1677,7 +1677,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.deepEqual(job!.payload, { attempt: 1 })
   })
 
-  test('pushOn without unique flag should insert normally', async ({ assert }) => {
+  test('pushOn without dedup should insert normally', async ({ assert }) => {
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')
 
@@ -1699,7 +1699,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.equal(size, 2)
   })
 
-  test('pushLaterOn with unique flag should skip duplicate delayed job', async ({ assert }) => {
+  test('pushLaterOn with dedup should skip duplicate delayed job', async ({ assert }) => {
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')
 
@@ -1710,7 +1710,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
         name: 'TestJob',
         payload: { attempt: 1 },
         attempts: 0,
-        unique: true,
+        dedup: { id: 'delayed-1' },
       },
       60_000
     )
@@ -1722,7 +1722,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
         name: 'TestJob',
         payload: { attempt: 2 },
         attempts: 0,
-        unique: true,
+        dedup: { id: 'delayed-1' },
       },
       60_000
     )
@@ -1732,7 +1732,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.deepEqual(job!.data.payload, { attempt: 1 })
   })
 
-  test('pushOn with unique flag should allow same id on different queues', async ({ assert }) => {
+  test('pushOn with dedup should allow same id on different queues', async ({ assert }) => {
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')
 
@@ -1741,7 +1741,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { queue: 'a' },
       attempts: 0,
-      unique: true,
+      dedup: { id: 'shared-id' },
     })
 
     await adapter.pushOn('queue-b', {
@@ -1749,7 +1749,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { queue: 'b' },
       attempts: 0,
-      unique: true,
+      dedup: { id: 'shared-id' },
     })
 
     const sizeA = await adapter.sizeOf('queue-a')

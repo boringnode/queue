@@ -378,7 +378,7 @@ export class KnexAdapter implements Adapter {
       score,
     })
 
-    if (jobData.unique) {
+    if (jobData.dedup) {
       await query.onConflict(['id', 'queue']).ignore()
     } else {
       await query
@@ -400,7 +400,7 @@ export class KnexAdapter implements Adapter {
       execute_at: executeAt,
     })
 
-    if (jobData.unique) {
+    if (jobData.dedup) {
       await query.onConflict(['id', 'queue']).ignore()
     } else {
       await query

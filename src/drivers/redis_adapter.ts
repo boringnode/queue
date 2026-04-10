@@ -36,11 +36,11 @@ const PUSH_JOB_SCRIPT = `
 `
 
 /**
- * Lua script for pushing a unique job.
+ * Lua script for pushing a dedup job.
  * Uses HSETNX to only store data if the job doesn't already exist.
  * Only adds to pending ZSET if the job was newly created.
  */
-const PUSH_UNIQUE_JOB_SCRIPT = `
+const PUSH_DEDUP_JOB_SCRIPT = `
   local data_key = KEYS[1]
   local pending_key = KEYS[2]
   local job_id = ARGV[1]
@@ -73,11 +73,11 @@ const PUSH_DELAYED_JOB_SCRIPT = `
 `
 
 /**
- * Lua script for pushing a unique delayed job.
+ * Lua script for pushing a dedup delayed job.
  * Uses HSETNX to only store data if the job doesn't already exist.
  * Only adds to delayed ZSET if the job was newly created.
  */
-const PUSH_UNIQUE_DELAYED_JOB_SCRIPT = `
+const PUSH_DEDUP_DELAYED_JOB_SCRIPT = `
   local data_key = KEYS[1]
   local delayed_key = KEYS[2]
   local job_id = ARGV[1]
@@ -660,7 +660,7 @@ export class RedisAdapter implements Adapter {
     const keys = this.#getKeys(queue)
     const executeAt = Date.now() + delay
 
-    const script = jobData.unique ? PUSH_UNIQUE_DELAYED_JOB_SCRIPT : PUSH_DELAYED_JOB_SCRIPT
+    const script = jobData.dedup ? PUSH_DEDUP_DELAYED_JOB_SCRIPT : PUSH_DELAYED_JOB_SCRIPT
 
     await this.#connection.eval(
       script,
@@ -679,7 +679,7 @@ export class RedisAdapter implements Adapter {
     const timestamp = Date.now()
     const score = calculateScore(priority, timestamp)
 
-    const script = jobData.unique ? PUSH_UNIQUE_JOB_SCRIPT : PUSH_JOB_SCRIPT
+    const script = jobData.dedup ? PUSH_DEDUP_JOB_SCRIPT : PUSH_JOB_SCRIPT
 
     await this.#connection.eval(
       script,

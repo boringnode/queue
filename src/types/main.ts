@@ -135,11 +135,15 @@ export interface JobData {
   traceContext?: Record<string, string>
 
   /**
-   * When true, adapters use atomic insert-if-not-exists semantics
+   * Deduplication configuration for this job.
+   * When set, adapters use atomic insert-if-not-exists semantics
    * to silently skip duplicate jobs with the same ID.
-   * Set automatically when a custom job ID is provided via `.id()`.
+   * Set automatically when `.dedup()` is called on the dispatcher.
    */
-  unique?: boolean
+  dedup?: {
+    /** The original dedup key provided by the caller (before name-prefixing). */
+    id: string
+  }
 }
 
 /**

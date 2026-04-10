@@ -15,11 +15,12 @@ import { parse } from './utils.js'
  *
  * ```
  * Job.dispatch(payload)
- *     .toQueue('emails')     // optional: target queue
- *     .priority(1)           // optional: 1-10, lower = higher priority
- *     .in('5m')              // optional: delay before processing
- *     .with('redis')         // optional: specific adapter
- *     .run()                 // dispatch the job
+ *     .toQueue('emails')              // optional: target queue
+ *     .priority(1)                    // optional: 1-10, lower = higher priority
+ *     .in('5m')                       // optional: delay before processing
+ *     .dedup({ id: 'order-123' })     // optional: deduplication
+ *     .with('redis')                  // optional: specific adapter
+ *     .run()                          // dispatch the job
  * ```
  *
  * @typeParam T - The payload type for this job
@@ -47,7 +48,7 @@ export class JobDispatcher<T> {
   #delay?: Duration
   #priority?: number
   #groupId?: string
-  #id?: string
+  #dedup?: { id: string }
 
   /**
    * Create a new job dispatcher.
@@ -150,35 +151,36 @@ export class JobDispatcher<T> {
   }
 
   /**
-   * Set a custom job ID for deduplication.
+   * Configure deduplication for this job.
    *
-   * When a custom ID is provided, the adapter will silently skip
-   * the job if one with the same ID already exists in the queue.
+   * When deduplication is configured, the adapter will silently skip
+   * the job if one with the same dedup ID already exists in the queue.
    * The ID is automatically prefixed with the job name to prevent
    * collisions between different job types.
    *
-   * @param jobId - Custom identifier for this job
+   * @param options - Deduplication options
+   * @param options.id - Unique deduplication key
    * @returns This dispatcher for chaining
    *
    * @example
    * ```typescript
    * // Prevent duplicate invoice jobs for the same order
    * await SendInvoiceJob.dispatch({ orderId: 123 })
-   *   .id('order-123')
+   *   .dedup({ id: 'order-123' })
    *   .run()
    *
-   * // Second dispatch with same ID is silently skipped
+   * // Second dispatch with same dedup ID is silently skipped
    * await SendInvoiceJob.dispatch({ orderId: 123 })
-   *   .id('order-123')
+   *   .dedup({ id: 'order-123' })
    *   .run()
    * ```
    */
-  id(jobId: string): this {
-    if (!jobId) {
-      throw new Error('Job ID must be a non-empty string')
+  dedup(options: { id: string }): this {
+    if (!options.id) {
+      throw new Error('Dedup ID must be a non-empty string')
     }
 
-    this.#id = jobId
+    this.#dedup = options
 
     return this
   }
@@ -216,7 +218,7 @@ export class JobDispatcher<T> {
    * ```
    */
   async run(): Promise<DispatchResult> {
-    const id = this.#id ? `${this.#name}::${this.#id}` : randomUUID()
+    const id = this.#dedup ? `${this.#name}::${this.#dedup.id}` : randomUUID()
 
     debug('dispatching job %s with id %s using payload %s', this.#name, id, this.#payload)
 
@@ -232,7 +234,7 @@ export class JobDispatcher<T> {
       priority: this.#priority,
       groupId: this.#groupId,
       createdAt: Date.now(),
-      ...(this.#id ? { unique: true } : {}),
+      ...(this.#dedup ? { dedup: { id: this.#dedup.id } } : {}),
     }
 
     const message: JobDispatchMessage = { jobs: [jobData], queue: this.#queue, delay: parsedDelay }
