@@ -613,7 +613,9 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.isNull(job3)
   })
 
-  test('recoverStalledJobs should only recover jobs from the targeted queue', async ({ assert }) => {
+  test('recoverStalledJobs should only recover jobs from the targeted queue', async ({
+    assert,
+  }) => {
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')
 
@@ -1646,5 +1648,113 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.equal(first!.id, 'high')
     assert.equal(second!.id, 'medium')
     assert.equal(third!.id, 'low')
+  })
+
+  test('pushOn with unique flag should skip duplicate job', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('test-queue', {
+      id: 'TestJob::order-1',
+      name: 'TestJob',
+      payload: { attempt: 1 },
+      attempts: 0,
+      unique: true,
+    })
+
+    await adapter.pushOn('test-queue', {
+      id: 'TestJob::order-1',
+      name: 'TestJob',
+      payload: { attempt: 2 },
+      attempts: 0,
+      unique: true,
+    })
+
+    const size = await adapter.sizeOf('test-queue')
+    assert.equal(size, 1)
+
+    const job = await adapter.popFrom('test-queue')
+    assert.deepEqual(job!.payload, { attempt: 1 })
+  })
+
+  test('pushOn without unique flag should insert normally', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('test-queue', {
+      id: 'job-1',
+      name: 'TestJob',
+      payload: { data: 'first' },
+      attempts: 0,
+    })
+
+    await adapter.pushOn('test-queue', {
+      id: 'job-2',
+      name: 'TestJob',
+      payload: { data: 'second' },
+      attempts: 0,
+    })
+
+    const size = await adapter.sizeOf('test-queue')
+    assert.equal(size, 2)
+  })
+
+  test('pushLaterOn with unique flag should skip duplicate delayed job', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushLaterOn(
+      'test-queue',
+      {
+        id: 'TestJob::delayed-1',
+        name: 'TestJob',
+        payload: { attempt: 1 },
+        attempts: 0,
+        unique: true,
+      },
+      60_000
+    )
+
+    await adapter.pushLaterOn(
+      'test-queue',
+      {
+        id: 'TestJob::delayed-1',
+        name: 'TestJob',
+        payload: { attempt: 2 },
+        attempts: 0,
+        unique: true,
+      },
+      60_000
+    )
+
+    const job = await adapter.getJob('TestJob::delayed-1', 'test-queue')
+    assert.isNotNull(job)
+    assert.deepEqual(job!.data.payload, { attempt: 1 })
+  })
+
+  test('pushOn with unique flag should allow same id on different queues', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('queue-a', {
+      id: 'TestJob::shared-id',
+      name: 'TestJob',
+      payload: { queue: 'a' },
+      attempts: 0,
+      unique: true,
+    })
+
+    await adapter.pushOn('queue-b', {
+      id: 'TestJob::shared-id',
+      name: 'TestJob',
+      payload: { queue: 'b' },
+      attempts: 0,
+      unique: true,
+    })
+
+    const sizeA = await adapter.sizeOf('queue-a')
+    const sizeB = await adapter.sizeOf('queue-b')
+    assert.equal(sizeA, 1)
+    assert.equal(sizeB, 1)
   })
 }

@@ -36,6 +36,26 @@ const PUSH_JOB_SCRIPT = `
 `
 
 /**
+ * Lua script for pushing a unique job.
+ * Uses HSETNX to only store data if the job doesn't already exist.
+ * Only adds to pending ZSET if the job was newly created.
+ */
+const PUSH_UNIQUE_JOB_SCRIPT = `
+  local data_key = KEYS[1]
+  local pending_key = KEYS[2]
+  local job_id = ARGV[1]
+  local job_data = ARGV[2]
+  local score = tonumber(ARGV[3])
+
+  local added = redis.call('HSETNX', data_key, job_id, job_data)
+  if added == 1 then
+    redis.call('ZADD', pending_key, score, job_id)
+  end
+
+  return added
+`
+
+/**
  * Lua script for pushing a delayed job.
  * Stores job data in the central hash and adds jobId to delayed ZSET.
  */
@@ -50,6 +70,26 @@ const PUSH_DELAYED_JOB_SCRIPT = `
   redis.call('ZADD', delayed_key, execute_at, job_id)
 
   return 1
+`
+
+/**
+ * Lua script for pushing a unique delayed job.
+ * Uses HSETNX to only store data if the job doesn't already exist.
+ * Only adds to delayed ZSET if the job was newly created.
+ */
+const PUSH_UNIQUE_DELAYED_JOB_SCRIPT = `
+  local data_key = KEYS[1]
+  local delayed_key = KEYS[2]
+  local job_id = ARGV[1]
+  local job_data = ARGV[2]
+  local execute_at = tonumber(ARGV[3])
+
+  local added = redis.call('HSETNX', data_key, job_id, job_data)
+  if added == 1 then
+    redis.call('ZADD', delayed_key, execute_at, job_id)
+  end
+
+  return added
 `
 
 /**
@@ -620,8 +660,10 @@ export class RedisAdapter implements Adapter {
     const keys = this.#getKeys(queue)
     const executeAt = Date.now() + delay
 
+    const script = jobData.unique ? PUSH_UNIQUE_DELAYED_JOB_SCRIPT : PUSH_DELAYED_JOB_SCRIPT
+
     await this.#connection.eval(
-      PUSH_DELAYED_JOB_SCRIPT,
+      script,
       2,
       keys.data,
       keys.delayed,
@@ -637,8 +679,10 @@ export class RedisAdapter implements Adapter {
     const timestamp = Date.now()
     const score = calculateScore(priority, timestamp)
 
+    const script = jobData.unique ? PUSH_UNIQUE_JOB_SCRIPT : PUSH_JOB_SCRIPT
+
     await this.#connection.eval(
-      PUSH_JOB_SCRIPT,
+      script,
       2,
       keys.data,
       keys.pending,

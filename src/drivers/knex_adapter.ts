@@ -370,13 +370,19 @@ export class KnexAdapter implements Adapter {
     const timestamp = Date.now()
     const score = calculateScore(priority, timestamp)
 
-    await this.#connection(this.#jobsTable).insert({
+    const query = this.#connection(this.#jobsTable).insert({
       id: jobData.id,
       queue,
       status: 'pending',
       data: JSON.stringify(jobData),
       score,
     })
+
+    if (jobData.unique) {
+      await query.onConflict(['id', 'queue']).ignore()
+    } else {
+      await query
+    }
   }
 
   async pushLater(jobData: JobData, delay: number): Promise<void> {
@@ -386,13 +392,19 @@ export class KnexAdapter implements Adapter {
   async pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<void> {
     const executeAt = Date.now() + delay
 
-    await this.#connection(this.#jobsTable).insert({
+    const query = this.#connection(this.#jobsTable).insert({
       id: jobData.id,
       queue,
       status: 'delayed',
       data: JSON.stringify(jobData),
       execute_at: executeAt,
     })
+
+    if (jobData.unique) {
+      await query.onConflict(['id', 'queue']).ignore()
+    } else {
+      await query
+    }
   }
 
   async pushMany(jobs: JobData[]): Promise<void> {

@@ -133,6 +133,13 @@ export interface JobData {
    * Injected by OTel plugin at dispatch time.
    */
   traceContext?: Record<string, string>
+
+  /**
+   * When true, adapters use atomic insert-if-not-exists semantics
+   * to silently skip duplicate jobs with the same ID.
+   * Set automatically when a custom job ID is provided via `.id()`.
+   */
+  unique?: boolean
 }
 
 /**

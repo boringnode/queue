@@ -26,6 +26,7 @@ npm install @boringnode/queue
 - **Priority Queues**: Process high-priority jobs first
 - **Bulk Dispatch**: Efficiently dispatch thousands of jobs at once
 - **Job Grouping**: Organize related jobs for monitoring
+- **Job Deduplication**: Prevent duplicate jobs with custom IDs
 - **Retry with Backoff**: Exponential, linear, or fixed backoff strategies
 - **Job Timeout**: Fail or retry jobs that exceed a time limit
 - **Job History**: Retain completed/failed jobs for debugging
@@ -130,6 +131,37 @@ await SendEmailJob.dispatchMany(recipients).group('newsletter-jan-2025')
 ```
 
 The `groupId` is stored with job data and accessible via `job.data.groupId`.
+
+## Job Deduplication
+
+Prevent the same job from being pushed to the queue twice using custom job IDs:
+
+```typescript
+// First dispatch - job is created
+await SendInvoiceJob.dispatch({ orderId: 123 }).id('order-123').run()
+
+// Second dispatch with same ID - silently skipped
+await SendInvoiceJob.dispatch({ orderId: 123 }).id('order-123').run()
+```
+
+The custom ID is automatically prefixed with the job name, so different job types can use the same ID without conflicts:
+
+```typescript
+// These are two different jobs, no conflict
+await SendInvoiceJob.dispatch({ orderId: 123 }).id('order-123').run()
+await SendReceiptJob.dispatch({ orderId: 123 }).id('order-123').run()
+```
+
+Deduplication is atomic and race-condition-free across all adapters:
+
+- **Redis**: Uses `HSETNX` (set-if-not-exists)
+- **Knex**: Uses `INSERT ... ON CONFLICT DO NOTHING`
+
+> [!NOTE]
+> Without `.id()`, jobs use auto-generated UUIDs and are never deduplicated. The `.id()` method is only available on single dispatch, not `dispatchMany`.
+
+> [!TIP]
+> When job retention is enabled (`removeOnComplete: false`), completed jobs remain in storage. A re-dispatch with the same custom ID will be silently skipped since the record still exists. With the default retention (`true`), completed jobs are removed immediately, so re-dispatch with the same ID succeeds normally.
 
 ## Job History & Retention
 

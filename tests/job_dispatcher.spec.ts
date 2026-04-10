@@ -317,6 +317,119 @@ test.group('JobDispatcher | groupId', () => {
   })
 })
 
+test.group('JobDispatcher | custom id', () => {
+  test('should throw error when id is empty', async ({ assert }) => {
+    assert.throws(
+      () => new JobDispatcher('TestJob', { data: 'test' }).id(''),
+      'Job ID must be a non-empty string'
+    )
+  })
+
+  test('should use custom id prefixed with job name', async ({ assert }) => {
+    const sharedAdapter = memory()()
+
+    await QueueManager.init({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+    })
+
+    const { jobId } = await new JobDispatcher('SendInvoiceJob', { orderId: 123 })
+      .id('order-123')
+      .run()
+
+    assert.equal(jobId, 'SendInvoiceJob::order-123')
+
+    const job = await sharedAdapter.pop()
+    assert.isNotNull(job)
+    assert.equal(job!.id, 'SendInvoiceJob::order-123')
+  })
+
+  test('should set unique flag on job data when custom id is provided', async ({ assert }) => {
+    const sharedAdapter = memory()()
+
+    await QueueManager.init({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+    })
+
+    await new JobDispatcher('UniqueJob', { data: 'test' }).id('my-id').run()
+
+    const job = await sharedAdapter.pop()
+    assert.isNotNull(job)
+    assert.isTrue(job!.unique)
+  })
+
+  test('should not set unique flag when no custom id is provided', async ({ assert }) => {
+    const sharedAdapter = memory()()
+
+    await QueueManager.init({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+    })
+
+    await new JobDispatcher('RegularJob', { data: 'test' }).run()
+
+    const job = await sharedAdapter.pop()
+    assert.isNotNull(job)
+    assert.isUndefined(job!.unique)
+  })
+
+  test('should silently skip duplicate job with same custom id', async ({ assert }) => {
+    const sharedAdapter = memory()()
+
+    await QueueManager.init({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+    })
+
+    await new JobDispatcher('DedupJob', { attempt: 1 }).id('dedup-1').run()
+    await new JobDispatcher('DedupJob', { attempt: 2 }).id('dedup-1').run()
+
+    const size = await sharedAdapter.size()
+    assert.equal(size, 1)
+
+    const job = await sharedAdapter.pop()
+    assert.deepEqual(job!.payload, { attempt: 1 })
+  })
+
+  test('should allow same custom id for different job names', async ({ assert }) => {
+    const sharedAdapter = memory()()
+
+    await QueueManager.init({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+    })
+
+    await new JobDispatcher('JobA', { type: 'a' }).id('same-id').run()
+    await new JobDispatcher('JobB', { type: 'b' }).id('same-id').run()
+
+    const size = await sharedAdapter.size()
+    assert.equal(size, 2)
+  })
+
+  test('should work with other options like priority and queue', async ({ assert }) => {
+    const sharedAdapter = memory()()
+
+    await QueueManager.init({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+    })
+
+    const { jobId } = await new JobDispatcher('PriorityDedupJob', { task: 'important' })
+      .id('task-1')
+      .toQueue('high')
+      .priority(1)
+      .run()
+
+    assert.equal(jobId, 'PriorityDedupJob::task-1')
+
+    const job = await sharedAdapter.popFrom('high')
+    assert.isNotNull(job)
+    assert.equal(job!.priority, 1)
+    assert.isTrue(job!.unique)
+  })
+})
+
 test.group('JobBatchDispatcher', () => {
   test('should dispatch multiple jobs correctly', async ({ assert }) => {
     const sharedAdapter = memory()()

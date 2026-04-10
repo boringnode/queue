@@ -51,6 +51,11 @@ export class MemoryAdapter implements Adapter {
   }
 
   async pushOn(queue: string, jobData: JobData): Promise<void> {
+    if (jobData.unique) {
+      const jobs = this.#queues.get(queue)
+      if (jobs?.some((j) => j.id === jobData.id)) return
+    }
+
     if (!this.#queues.has(queue)) {
       this.#queues.set(queue, [])
     }
@@ -63,6 +68,14 @@ export class MemoryAdapter implements Adapter {
   }
 
   pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<void> {
+    if (jobData.unique) {
+      const jobs = this.#queues.get(queue)
+      if (jobs?.some((j) => j.id === jobData.id)) return Promise.resolve()
+
+      const delayed = this.#delayedJobs.get(queue)
+      if (delayed?.has(jobData.id)) return Promise.resolve()
+    }
+
     if (!this.#delayedJobs.has(queue)) {
       this.#delayedJobs.set(queue, new Map())
     }

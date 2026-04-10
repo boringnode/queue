@@ -47,6 +47,7 @@ export class JobDispatcher<T> {
   #delay?: Duration
   #priority?: number
   #groupId?: string
+  #id?: string
 
   /**
    * Create a new job dispatcher.
@@ -149,6 +150,40 @@ export class JobDispatcher<T> {
   }
 
   /**
+   * Set a custom job ID for deduplication.
+   *
+   * When a custom ID is provided, the adapter will silently skip
+   * the job if one with the same ID already exists in the queue.
+   * The ID is automatically prefixed with the job name to prevent
+   * collisions between different job types.
+   *
+   * @param jobId - Custom identifier for this job
+   * @returns This dispatcher for chaining
+   *
+   * @example
+   * ```typescript
+   * // Prevent duplicate invoice jobs for the same order
+   * await SendInvoiceJob.dispatch({ orderId: 123 })
+   *   .id('order-123')
+   *   .run()
+   *
+   * // Second dispatch with same ID is silently skipped
+   * await SendInvoiceJob.dispatch({ orderId: 123 })
+   *   .id('order-123')
+   *   .run()
+   * ```
+   */
+  id(jobId: string): this {
+    if (!jobId) {
+      throw new Error('Job ID must be a non-empty string')
+    }
+
+    this.#id = jobId
+
+    return this
+  }
+
+  /**
    * Use a specific adapter for this job.
    *
    * @param adapter - Adapter name or factory function
@@ -181,7 +216,7 @@ export class JobDispatcher<T> {
    * ```
    */
   async run(): Promise<DispatchResult> {
-    const id = randomUUID()
+    const id = this.#id ? `${this.#name}::${this.#id}` : randomUUID()
 
     debug('dispatching job %s with id %s using payload %s', this.#name, id, this.#payload)
 
@@ -197,6 +232,7 @@ export class JobDispatcher<T> {
       priority: this.#priority,
       groupId: this.#groupId,
       createdAt: Date.now(),
+      ...(this.#id ? { unique: true } : {}),
     }
 
     const message: JobDispatchMessage = { jobs: [jobData], queue: this.#queue, delay: parsedDelay }
