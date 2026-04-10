@@ -117,7 +117,7 @@ test.group('FakeAdapter', () => {
     await adapter.destroy()
   })
 
-  test('should skip duplicate pushLaterOn when unique flag is set', async ({ assert }) => {
+  test('should skip duplicate pushLaterOn when unique flag is set', async () => {
     const adapter = fake()()
 
     await adapter.pushLaterOn(
