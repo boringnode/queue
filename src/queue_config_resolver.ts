@@ -102,10 +102,7 @@ export class QueueConfigResolver {
    * merge like `retry.maxRetries`.
    */
   #normalizeJobRetryConfig(jobOptions?: JobOptions): RetryConfig | undefined {
-    if (
-      !jobOptions ||
-      (jobOptions.retry === undefined && jobOptions.maxRetries === undefined)
-    ) {
+    if (!jobOptions || (jobOptions.retry === undefined && jobOptions.maxRetries === undefined)) {
       return undefined
     }
 

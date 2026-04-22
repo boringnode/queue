@@ -59,6 +59,10 @@ export class SyncAdapter implements Adapter {
   }
 
   async pushManyOn(queue: string, jobs: JobData[]): Promise<void> {
+    if (jobs.some((j) => j.dedup)) {
+      throw new Error('dedup is not supported in batch dispatch; use single dispatch')
+    }
+
     for (const job of jobs) {
       await this.pushOn(queue, job)
     }

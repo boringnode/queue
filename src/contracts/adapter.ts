@@ -1,4 +1,5 @@
 import type {
+  DedupOutcome,
   JobData,
   JobRecord,
   JobRetention,
@@ -6,6 +7,17 @@ import type {
   ScheduleData,
   ScheduleListOptions,
 } from '../types/main.js'
+
+/**
+ * Result of a push operation when dedup was involved.
+ * `outcome` tells the dispatcher what happened; `jobId` is the ID of the
+ * existing job when deduped (skipped/replaced/extended).
+ */
+export interface PushResult {
+  outcome: DedupOutcome
+  /** ID of the existing job when a duplicate was detected, otherwise the newly added job's id. */
+  jobId: string
+}
 
 /**
  * A job that has been acquired by a worker for processing.
@@ -119,24 +131,27 @@ export interface Adapter {
    * Push a job to the default queue for immediate processing.
    *
    * @param jobData - The job data to push
+   * @returns PushResult if jobData.dedup is set, otherwise void
    */
-  push(jobData: JobData): Promise<void>
+  push(jobData: JobData): Promise<PushResult | void>
 
   /**
    * Push a job to a specific queue for immediate processing.
    *
    * @param queue - The queue name to push to
    * @param jobData - The job data to push
+   * @returns PushResult if jobData.dedup is set, otherwise void
    */
-  pushOn(queue: string, jobData: JobData): Promise<void>
+  pushOn(queue: string, jobData: JobData): Promise<PushResult | void>
 
   /**
    * Push a job to the default queue with a delay.
    *
    * @param jobData - The job data to push
    * @param delay - Delay in milliseconds before the job becomes available
+   * @returns PushResult if jobData.dedup is set, otherwise void
    */
-  pushLater(jobData: JobData, delay: number): Promise<void>
+  pushLater(jobData: JobData, delay: number): Promise<PushResult | void>
 
   /**
    * Push a job to a specific queue with a delay.
@@ -144,8 +159,9 @@ export interface Adapter {
    * @param queue - The queue name to push to
    * @param jobData - The job data to push
    * @param delay - Delay in milliseconds before the job becomes available
+   * @returns PushResult if jobData.dedup is set, otherwise void
    */
-  pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<void>
+  pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<PushResult | void>
 
   /**
    * Push multiple jobs to the default queue for immediate processing.

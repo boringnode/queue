@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto'
 import { Redis, type RedisOptions } from 'ioredis'
 import { DEFAULT_PRIORITY } from '../constants.js'
 import { calculateScore } from '../utils.js'
-import type { Adapter, AcquiredJob } from '../contracts/adapter.js'
+import type { Adapter, AcquiredJob, PushResult } from '../contracts/adapter.js'
+import type { DedupOutcome } from '../types/main.js'
 import type {
   JobData,
   JobRecord,
@@ -37,22 +38,55 @@ const PUSH_JOB_SCRIPT = `
 
 /**
  * Lua script for pushing a dedup job.
- * Uses HSETNX to only store data if the job doesn't already exist.
- * Only adds to pending ZSET if the job was newly created.
+ *
+ * Behavior:
+ * - If dedup key exists AND job still exists AND within TTL: apply replace/extend, skip insert.
+ * - If dedup key exists but job data missing (orphan): proceed to insert new.
+ * - If TTL expired or no prior entry: insert new job, record dedup key with TTL.
+ *
+ * Replace only applies to non-active (pending/delayed) jobs. Active jobs are skipped.
+ *
+ * Returns {outcome, job_id}: outcome ∈ 'added' | 'skipped' | 'replaced' | 'extended'.
  */
 const PUSH_DEDUP_JOB_SCRIPT = `
   local data_key = KEYS[1]
   local pending_key = KEYS[2]
+  local dedup_key = KEYS[3]
+  local active_key = KEYS[4]
   local job_id = ARGV[1]
   local job_data = ARGV[2]
   local score = tonumber(ARGV[3])
+  local ttl = tonumber(ARGV[4])
+  local extend = tonumber(ARGV[5])
+  local replace = tonumber(ARGV[6])
 
-  local added = redis.call('HSETNX', data_key, job_id, job_data)
-  if added == 1 then
-    redis.call('ZADD', pending_key, score, job_id)
+  local existing = redis.call('GET', dedup_key)
+  if existing then
+    local has_data = redis.call('HEXISTS', data_key, existing) == 1
+    if has_data then
+      local is_active = redis.call('HEXISTS', active_key, existing) == 1
+      if replace == 1 and not is_active then
+        redis.call('HSET', data_key, existing, job_data)
+        if extend == 1 and ttl > 0 then
+          redis.call('PEXPIRE', dedup_key, ttl)
+        end
+        return {'replaced', existing}
+      end
+      if extend == 1 and ttl > 0 then
+        redis.call('PEXPIRE', dedup_key, ttl)
+        return {'extended', existing}
+      end
+      return {'skipped', existing}
+    end
   end
 
-  return added
+  redis.call('HSET', data_key, job_id, job_data)
+  redis.call('ZADD', pending_key, score, job_id)
+  redis.call('SET', dedup_key, job_id)
+  if ttl > 0 then
+    redis.call('PEXPIRE', dedup_key, ttl)
+  end
+  return {'added', job_id}
 `
 
 /**
@@ -74,22 +108,47 @@ const PUSH_DELAYED_JOB_SCRIPT = `
 
 /**
  * Lua script for pushing a dedup delayed job.
- * Uses HSETNX to only store data if the job doesn't already exist.
- * Only adds to delayed ZSET if the job was newly created.
+ * Same semantics as PUSH_DEDUP_JOB_SCRIPT but adds to delayed ZSET.
  */
 const PUSH_DEDUP_DELAYED_JOB_SCRIPT = `
   local data_key = KEYS[1]
   local delayed_key = KEYS[2]
+  local dedup_key = KEYS[3]
+  local active_key = KEYS[4]
   local job_id = ARGV[1]
   local job_data = ARGV[2]
   local execute_at = tonumber(ARGV[3])
+  local ttl = tonumber(ARGV[4])
+  local extend = tonumber(ARGV[5])
+  local replace = tonumber(ARGV[6])
 
-  local added = redis.call('HSETNX', data_key, job_id, job_data)
-  if added == 1 then
-    redis.call('ZADD', delayed_key, execute_at, job_id)
+  local existing = redis.call('GET', dedup_key)
+  if existing then
+    local has_data = redis.call('HEXISTS', data_key, existing) == 1
+    if has_data then
+      local is_active = redis.call('HEXISTS', active_key, existing) == 1
+      if replace == 1 and not is_active then
+        redis.call('HSET', data_key, existing, job_data)
+        if extend == 1 and ttl > 0 then
+          redis.call('PEXPIRE', dedup_key, ttl)
+        end
+        return {'replaced', existing}
+      end
+      if extend == 1 and ttl > 0 then
+        redis.call('PEXPIRE', dedup_key, ttl)
+        return {'extended', existing}
+      end
+      return {'skipped', existing}
+    end
   end
 
-  return added
+  redis.call('HSET', data_key, job_id, job_data)
+  redis.call('ZADD', delayed_key, execute_at, job_id)
+  redis.call('SET', dedup_key, job_id)
+  if ttl > 0 then
+    redis.call('PEXPIRE', dedup_key, ttl)
+  end
+  return {'added', job_id}
 `
 
 /**
@@ -150,14 +209,25 @@ const ACQUIRE_JOB_SCRIPT = `
 
 /**
  * Lua script for removing a job completely (no history).
+ * Also cleans up the dedup key if the job had dedup metadata.
  */
 const REMOVE_JOB_SCRIPT = `
   local data_key = KEYS[1]
   local active_key = KEYS[2]
   local job_id = ARGV[1]
+  local dedup_prefix = ARGV[2]
 
   if redis.call('HEXISTS', active_key, job_id) == 0 then
     return 0
+  end
+
+  -- Read job data to extract dedup.id before deleting
+  local job_data = redis.call('HGET', data_key, job_id)
+  if job_data then
+    local ok, job = pcall(cjson.decode, job_data)
+    if ok and job and job.dedup and job.dedup.id then
+      redis.call('DEL', dedup_prefix .. job.dedup.id)
+    end
   end
 
   redis.call('HDEL', active_key, job_id)
@@ -169,6 +239,7 @@ const REMOVE_JOB_SCRIPT = `
 /**
  * Lua script for finalizing a job in history.
  * Removes from active, stores finalization info, and prunes old records.
+ * When pruning removes job data, also deletes the associated dedup key.
  */
 const FINALIZE_JOB_SCRIPT = `
   local data_key = KEYS[1]
@@ -180,6 +251,7 @@ const FINALIZE_JOB_SCRIPT = `
   local max_age = tonumber(ARGV[3])
   local max_count = tonumber(ARGV[4])
   local error_message = ARGV[5]
+  local dedup_prefix = ARGV[6]
 
   -- Verify job is active
   if redis.call('HEXISTS', active_key, job_id) == 0 then
@@ -199,11 +271,24 @@ const FINALIZE_JOB_SCRIPT = `
   redis.call('HSET', history_key, job_id, cjson.encode(record))
   redis.call('ZADD', index_key, now, job_id)
 
+  local function delete_dedup_for(ids)
+    for i = 1, #ids do
+      local d = redis.call('HGET', data_key, ids[i])
+      if d then
+        local ok, job = pcall(cjson.decode, d)
+        if ok and job and job.dedup and job.dedup.id then
+          redis.call('DEL', dedup_prefix .. job.dedup.id)
+        end
+      end
+    end
+  end
+
   -- Prune by age
   if max_age and max_age > 0 then
     local cutoff = now - max_age
     local expired = redis.call('ZRANGEBYSCORE', index_key, 0, cutoff)
     if #expired > 0 then
+      delete_dedup_for(expired)
       redis.call('ZREM', index_key, unpack(expired))
       redis.call('HDEL', history_key, unpack(expired))
       redis.call('HDEL', data_key, unpack(expired))
@@ -217,6 +302,7 @@ const FINALIZE_JOB_SCRIPT = `
       local excess = size - max_count
       local stale = redis.call('ZRANGE', index_key, 0, excess - 1)
       if #stale > 0 then
+        delete_dedup_for(stale)
         redis.call('ZREM', index_key, unpack(stale))
         redis.call('HDEL', history_key, unpack(stale))
         redis.call('HDEL', data_key, unpack(stale))
@@ -290,6 +376,7 @@ const RECOVER_STALLED_JOBS_SCRIPT = `
   local now = tonumber(ARGV[1])
   local stalled_threshold = tonumber(ARGV[2])
   local max_stalled_count = tonumber(ARGV[3])
+  local dedup_prefix = ARGV[4]
 
   local recovered = 0
   local stalled_cutoff = now - stalled_threshold
@@ -315,7 +402,10 @@ const RECOVER_STALLED_JOBS_SCRIPT = `
 
         -- Check if job has exceeded max stalled count
         if current_stalled_count >= max_stalled_count then
-          -- Job failed permanently, remove data too
+          -- Job failed permanently, remove data + dedup key
+          if job.dedup and job.dedup.id then
+            redis.call('DEL', dedup_prefix .. job.dedup.id)
+          end
           redis.call('HDEL', data_key, job_id)
         else
           -- Recover: increment stalledCount and put back in pending
@@ -520,6 +610,14 @@ export class RedisAdapter implements Adapter {
     }
   }
 
+  #getDedupKey(queue: string, dedupId: string): string {
+    return `${this.#getDedupPrefix(queue)}${dedupId}`
+  }
+
+  #getDedupPrefix(queue: string): string {
+    return `${redisKey}::${queue}::dedup::`
+  }
+
   setWorkerId(workerId: string): void {
     this.#workerId = workerId
   }
@@ -558,10 +656,11 @@ export class RedisAdapter implements Adapter {
 
   async completeJob(jobId: string, queue: string, removeOnComplete?: JobRetention): Promise<void> {
     const keys = this.#getKeys(queue)
+    const dedupPrefix = this.#getDedupPrefix(queue)
     const { keep, maxAge, maxCount } = resolveRetention(removeOnComplete)
 
     if (!keep) {
-      await this.#connection.eval(REMOVE_JOB_SCRIPT, 2, keys.data, keys.active, jobId)
+      await this.#connection.eval(REMOVE_JOB_SCRIPT, 2, keys.data, keys.active, jobId, dedupPrefix)
       return
     }
 
@@ -576,7 +675,8 @@ export class RedisAdapter implements Adapter {
       Date.now().toString(),
       maxAge.toString(),
       maxCount.toString(),
-      ''
+      '',
+      dedupPrefix
     )
   }
 
@@ -587,10 +687,11 @@ export class RedisAdapter implements Adapter {
     removeOnFail?: JobRetention
   ): Promise<void> {
     const keys = this.#getKeys(queue)
+    const dedupPrefix = this.#getDedupPrefix(queue)
     const { keep, maxAge, maxCount } = resolveRetention(removeOnFail)
 
     if (!keep) {
-      await this.#connection.eval(REMOVE_JOB_SCRIPT, 2, keys.data, keys.active, jobId)
+      await this.#connection.eval(REMOVE_JOB_SCRIPT, 2, keys.data, keys.active, jobId, dedupPrefix)
       return
     }
 
@@ -605,7 +706,8 @@ export class RedisAdapter implements Adapter {
       Date.now().toString(),
       maxAge.toString(),
       maxCount.toString(),
-      error?.message || ''
+      error?.message || '',
+      dedupPrefix
     )
   }
 
@@ -648,22 +750,39 @@ export class RedisAdapter implements Adapter {
     return JSON.parse(result as string)
   }
 
-  push(jobData: JobData): Promise<void> {
+  push(jobData: JobData): Promise<PushResult | void> {
     return this.pushOn('default', jobData)
   }
 
-  pushLater(jobData: JobData, delay: number): Promise<void> {
+  pushLater(jobData: JobData, delay: number): Promise<PushResult | void> {
     return this.pushLaterOn('default', jobData, delay)
   }
 
-  async pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<void> {
+  async pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<PushResult | void> {
     const keys = this.#getKeys(queue)
     const executeAt = Date.now() + delay
 
-    const script = jobData.dedup ? PUSH_DEDUP_DELAYED_JOB_SCRIPT : PUSH_DELAYED_JOB_SCRIPT
+    if (jobData.dedup) {
+      const dedupKey = this.#getDedupKey(queue, jobData.dedup.id)
+      const result = (await this.#connection.eval(
+        PUSH_DEDUP_DELAYED_JOB_SCRIPT,
+        4,
+        keys.data,
+        keys.delayed,
+        dedupKey,
+        keys.active,
+        jobData.id,
+        JSON.stringify(jobData),
+        executeAt.toString(),
+        (jobData.dedup.ttl ?? 0).toString(),
+        jobData.dedup.extend ? '1' : '0',
+        jobData.dedup.replace ? '1' : '0'
+      )) as [string, string]
+      return { outcome: result[0] as DedupOutcome, jobId: result[1] }
+    }
 
     await this.#connection.eval(
-      script,
+      PUSH_DELAYED_JOB_SCRIPT,
       2,
       keys.data,
       keys.delayed,
@@ -673,16 +792,33 @@ export class RedisAdapter implements Adapter {
     )
   }
 
-  async pushOn(queue: string, jobData: JobData): Promise<void> {
+  async pushOn(queue: string, jobData: JobData): Promise<PushResult | void> {
     const keys = this.#getKeys(queue)
     const priority = jobData.priority ?? DEFAULT_PRIORITY
     const timestamp = Date.now()
     const score = calculateScore(priority, timestamp)
 
-    const script = jobData.dedup ? PUSH_DEDUP_JOB_SCRIPT : PUSH_JOB_SCRIPT
+    if (jobData.dedup) {
+      const dedupKey = this.#getDedupKey(queue, jobData.dedup.id)
+      const result = (await this.#connection.eval(
+        PUSH_DEDUP_JOB_SCRIPT,
+        4,
+        keys.data,
+        keys.pending,
+        dedupKey,
+        keys.active,
+        jobData.id,
+        JSON.stringify(jobData),
+        score.toString(),
+        (jobData.dedup.ttl ?? 0).toString(),
+        jobData.dedup.extend ? '1' : '0',
+        jobData.dedup.replace ? '1' : '0'
+      )) as [string, string]
+      return { outcome: result[0] as DedupOutcome, jobId: result[1] }
+    }
 
     await this.#connection.eval(
-      script,
+      PUSH_JOB_SCRIPT,
       2,
       keys.data,
       keys.pending,
@@ -698,6 +834,10 @@ export class RedisAdapter implements Adapter {
 
   async pushManyOn(queue: string, jobs: JobData[]): Promise<void> {
     if (jobs.length === 0) return
+
+    if (jobs.some((j) => j.dedup)) {
+      throw new Error('dedup is not supported in batch dispatch; use single dispatch')
+    }
 
     const keys = this.#getKeys(queue)
     const now = Date.now()
@@ -738,7 +878,8 @@ export class RedisAdapter implements Adapter {
       keys.pending,
       now.toString(),
       stalledThreshold.toString(),
-      maxStalledCount.toString()
+      maxStalledCount.toString(),
+      this.#getDedupPrefix(queue)
     )
 
     return recovered as number

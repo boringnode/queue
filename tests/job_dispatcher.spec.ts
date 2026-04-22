@@ -325,7 +325,7 @@ test.group('JobDispatcher | dedup', () => {
     )
   })
 
-  test('should use dedup id prefixed with job name', async ({ assert }) => {
+  test('should store dedup id prefixed with job name', async ({ assert }) => {
     const sharedAdapter = memory()()
 
     await QueueManager.init({
@@ -333,15 +333,17 @@ test.group('JobDispatcher | dedup', () => {
       adapters: { memory: () => sharedAdapter },
     })
 
-    const { jobId } = await new JobDispatcher('SendInvoiceJob', { orderId: 123 })
+    const result = await new JobDispatcher('SendInvoiceJob', { orderId: 123 })
       .dedup({ id: 'order-123' })
       .run()
 
-    assert.equal(jobId, 'SendInvoiceJob::order-123')
+    assert.match(result.jobId, /^[0-9a-f-]{36}$/)
+    assert.equal(result.deduped, 'added')
 
     const job = await sharedAdapter.pop()
     assert.isNotNull(job)
-    assert.equal(job!.id, 'SendInvoiceJob::order-123')
+    assert.equal(job!.id, result.jobId)
+    assert.equal(job!.dedup?.id, 'SendInvoiceJob::order-123')
   })
 
   test('should set dedup field on job data when dedup is configured', async ({ assert }) => {
@@ -356,7 +358,7 @@ test.group('JobDispatcher | dedup', () => {
 
     const job = await sharedAdapter.pop()
     assert.isNotNull(job)
-    assert.deepEqual(job!.dedup, { id: 'my-id' })
+    assert.equal(job!.dedup?.id, 'UniqueJob::my-id')
   })
 
   test('should not set dedup field when dedup is not configured', async ({ assert }) => {
@@ -415,18 +417,155 @@ test.group('JobDispatcher | dedup', () => {
       adapters: { memory: () => sharedAdapter },
     })
 
-    const { jobId } = await new JobDispatcher('PriorityDedupJob', { task: 'important' })
+    const { jobId, deduped } = await new JobDispatcher('PriorityDedupJob', { task: 'important' })
       .dedup({ id: 'task-1' })
       .toQueue('high')
       .priority(1)
       .run()
 
-    assert.equal(jobId, 'PriorityDedupJob::task-1')
+    assert.match(jobId, /^[0-9a-f-]{36}$/)
+    assert.equal(deduped, 'added')
 
     const job = await sharedAdapter.popFrom('high')
     assert.isNotNull(job)
     assert.equal(job!.priority, 1)
-    assert.deepEqual(job!.dedup, { id: 'task-1' })
+    assert.equal(job!.dedup?.id, 'PriorityDedupJob::task-1')
+  })
+
+  test('should throw when extend is set without ttl', ({ assert }) => {
+    assert.throws(
+      () => new JobDispatcher('TestJob', {}).dedup({ id: 'x', extend: true }),
+      'dedup.ttl is required when extend or replace is set'
+    )
+  })
+
+  test('should throw when replace is set without ttl', ({ assert }) => {
+    assert.throws(
+      () => new JobDispatcher('TestJob', {}).dedup({ id: 'x', replace: true }),
+      'dedup.ttl is required when extend or replace is set'
+    )
+  })
+
+  test('should throw when ttl is negative', ({ assert }) => {
+    assert.throws(
+      () => new JobDispatcher('TestJob', {}).dedup({ id: 'x', ttl: -1 }),
+      'dedup.ttl must be a non-negative duration'
+    )
+  })
+
+  test('should throw when dedup id exceeds 400 chars', ({ assert }) => {
+    assert.throws(
+      () => new JobDispatcher('TestJob', {}).dedup({ id: 'a'.repeat(401) }),
+      'Dedup ID must be 400 characters or less'
+    )
+  })
+
+  test('TTL: new job allowed after TTL expires', async ({ assert }) => {
+    const sharedAdapter = memory()()
+
+    await QueueManager.init({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+    })
+
+    const first = await new JobDispatcher('ThrottleJob', { n: 1 })
+      .dedup({ id: 'throttle-1', ttl: 80 })
+      .run()
+    assert.equal(first.deduped, 'added')
+
+    const second = await new JobDispatcher('ThrottleJob', { n: 2 })
+      .dedup({ id: 'throttle-1', ttl: 80 })
+      .run()
+    assert.equal(second.deduped, 'skipped')
+
+    await setTimeout(150)
+
+    const third = await new JobDispatcher('ThrottleJob', { n: 3 })
+      .dedup({ id: 'throttle-1', ttl: 80 })
+      .run()
+    assert.equal(third.deduped, 'added')
+    assert.notEqual(third.jobId, first.jobId)
+
+    const size = await sharedAdapter.size()
+    assert.equal(size, 2)
+  })
+
+  test('extend: duplicate within TTL resets the window', async ({ assert }) => {
+    const sharedAdapter = memory()()
+
+    await QueueManager.init({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+    })
+
+    const first = await new JobDispatcher('ExtendJob', { n: 1 })
+      .dedup({ id: 'ext-1', ttl: 100, extend: true })
+      .run()
+    assert.equal(first.deduped, 'added')
+
+    await setTimeout(60)
+
+    const second = await new JobDispatcher('ExtendJob', { n: 2 })
+      .dedup({ id: 'ext-1', ttl: 100, extend: true })
+      .run()
+    assert.equal(second.deduped, 'extended')
+    assert.equal(second.jobId, first.jobId)
+
+    await setTimeout(60)
+
+    // Without extend, original 40ms TTL would've expired (50ms elapsed).
+    // With extend, second push reset timer → still within window.
+    const third = await new JobDispatcher('ExtendJob', { n: 3 })
+      .dedup({ id: 'ext-1', ttl: 100, extend: true })
+      .run()
+    assert.equal(third.deduped, 'extended')
+  })
+
+  test('replace: duplicate within TTL swaps the pending job payload', async ({ assert }) => {
+    const sharedAdapter = memory()()
+
+    await QueueManager.init({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+    })
+
+    const first = await new JobDispatcher('ReplaceJob', { version: 1 })
+      .dedup({ id: 'draft-1', ttl: 100, replace: true })
+      .run()
+    assert.equal(first.deduped, 'added')
+
+    const second = await new JobDispatcher('ReplaceJob', { version: 2 })
+      .dedup({ id: 'draft-1', ttl: 100, replace: true })
+      .run()
+    assert.equal(second.deduped, 'replaced')
+    assert.equal(second.jobId, first.jobId)
+
+    const size = await sharedAdapter.size()
+    assert.equal(size, 1)
+
+    const job = await sharedAdapter.pop()
+    assert.deepEqual(job!.payload, { version: 2 })
+  })
+
+  test('replace: active job is not replaced (returns skipped)', async ({ assert }) => {
+    const sharedAdapter = memory()()
+
+    await QueueManager.init({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+    })
+
+    await new JobDispatcher('ActiveReplaceJob', { version: 1 })
+      .dedup({ id: 'ar-1', ttl: 1000, replace: true })
+      .run()
+
+    await sharedAdapter.pop() // moves to active
+
+    const second = await new JobDispatcher('ActiveReplaceJob', { version: 2 })
+      .dedup({ id: 'ar-1', ttl: 1000, replace: true })
+      .run()
+
+    assert.equal(second.deduped, 'skipped')
   })
 })
 

@@ -58,9 +58,7 @@ test.group('SyncAdapter', (group) => {
     assert.deepEqual(contextJobIds, Array(contextJobIds.length).fill(jobId))
   })
 
-  test('should log delayed sync job failures without unhandled rejections', async ({
-    assert,
-  }) => {
+  test('should log delayed sync job failures without unhandled rejections', async ({ assert }) => {
     const logger = new MemoryLogger()
     let unhandledError: unknown
     const onUnhandledRejection = (error: unknown) => {

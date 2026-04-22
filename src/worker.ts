@@ -7,7 +7,13 @@ import { JobPool } from './job_pool.js'
 import { JobExecutionRuntime } from './job_runtime.js'
 import { dispatchChannel, executeChannel } from './tracing_channels.js'
 import type { Adapter, AcquiredJob } from './contracts/adapter.js'
-import type { JobContext, JobOptions, JobRetention, QueueManagerConfig, WorkerCycle } from './types/main.js'
+import type {
+  JobContext,
+  JobOptions,
+  JobRetention,
+  QueueManagerConfig,
+  WorkerCycle,
+} from './types/main.js'
 import type { JobDispatchMessage, JobExecuteMessage } from './types/tracing_channels.js'
 import { Locator } from './locator.js'
 import { DEFAULT_PRIORITY } from './constants.js'
@@ -347,11 +353,26 @@ export class Worker {
       return executeChannel.tracePromise(async () => {
         try {
           await runtime.execute(instance, payload, context)
-          await this.#wrapInternal(() => this.#adapter.completeJob(job.id, queue, retention.removeOnComplete))
+          await this.#wrapInternal(() =>
+            this.#adapter.completeJob(job.id, queue, retention.removeOnComplete)
+          )
           executeMessage.status = 'completed'
-          debug('worker %s: successfully executed job %s in %dms', this.#id, job.id, (performance.now() - startTime).toFixed(2))
+          debug(
+            'worker %s: successfully executed job %s in %dms',
+            this.#id,
+            job.id,
+            (performance.now() - startTime).toFixed(2)
+          )
         } catch (e) {
-          await this.#handleExecutionFailure({ error: e as Error, job, queue, instance, runtime, retention, executeMessage })
+          await this.#handleExecutionFailure({
+            error: e as Error,
+            job,
+            queue,
+            instance,
+            runtime,
+            retention,
+            executeMessage,
+          })
         }
 
         executeMessage.duration = Number((performance.now() - startTime).toFixed(2))
@@ -377,7 +398,12 @@ export class Worker {
     if (outcome.type === 'failed') {
       options.executeMessage.status = 'failed'
       await this.#wrapInternal(() =>
-        this.#adapter.failJob(options.job.id, options.queue, outcome.storageError, options.retention.removeOnFail)
+        this.#adapter.failJob(
+          options.job.id,
+          options.queue,
+          outcome.storageError,
+          options.retention.removeOnFail
+        )
       )
       await options.instance.failed?.(outcome.hookError)
       return
@@ -389,8 +415,15 @@ export class Worker {
     options.executeMessage.nextRetryAt = outcome.retryAt
 
     if (outcome.retryAt) {
-      debug('worker %s: job %s will retry at %s', this.#id, options.job.id, outcome.retryAt.toISOString())
-      await this.#wrapInternal(() => this.#adapter.retryJob(options.job.id, options.queue, outcome.retryAt))
+      debug(
+        'worker %s: job %s will retry at %s',
+        this.#id,
+        options.job.id,
+        outcome.retryAt.toISOString()
+      )
+      await this.#wrapInternal(() =>
+        this.#adapter.retryJob(options.job.id, options.queue, outcome.retryAt)
+      )
     } else {
       await this.#wrapInternal(() => this.#adapter.retryJob(options.job.id, options.queue))
     }
@@ -426,7 +459,9 @@ export class Worker {
     } catch (error) {
       debug('worker %s: failed to initialize job %s (%s)', this.#id, job.id, job.name)
       const retention = QueueManager.getConfigResolver().resolveJobOptions(queue)
-      await this.#wrapInternal(() => this.#adapter.failJob(job.id, queue, error as Error, retention.removeOnFail))
+      await this.#wrapInternal(() =>
+        this.#adapter.failJob(job.id, queue, error as Error, retention.removeOnFail)
+      )
       throw error
     }
   }

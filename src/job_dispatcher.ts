@@ -48,7 +48,12 @@ export class JobDispatcher<T> {
   #delay?: Duration
   #priority?: number
   #groupId?: string
-  #dedup?: { id: string }
+  #dedup?: {
+    id: string
+    ttl?: number
+    extend?: boolean
+    replace?: boolean
+  }
 
   /**
    * Create a new job dispatcher.
@@ -153,34 +158,63 @@ export class JobDispatcher<T> {
   /**
    * Configure deduplication for this job.
    *
-   * When deduplication is configured, the adapter will silently skip
-   * the job if one with the same dedup ID already exists in the queue.
-   * The ID is automatically prefixed with the job name to prevent
-   * collisions between different job types.
+   * Modes:
+   * - **Simple** (`{ id }`): skip duplicates while the job exists.
+   * - **Throttle** (`{ id, ttl }`): skip duplicates within a TTL window.
+   * - **Debounce** (`{ id, ttl, replace: true }`): replace payload of the existing
+   *   non-active job on duplicate within TTL.
+   * - **Extend** (`{ id, ttl, extend: true }`): reset the TTL window on each duplicate.
    *
-   * @param options - Deduplication options
+   * The id is automatically prefixed with the job name to prevent collisions
+   * between different job types.
+   *
    * @param options.id - Unique deduplication key
-   * @returns This dispatcher for chaining
+   * @param options.ttl - TTL as Duration ('5s', 5000). Required for extend/replace.
+   * @param options.extend - Reset TTL on duplicate within window.
+   * @param options.replace - Replace payload of existing non-active job within window.
    *
    * @example
    * ```typescript
-   * // Prevent duplicate invoice jobs for the same order
+   * // Simple dedup
    * await SendInvoiceJob.dispatch({ orderId: 123 })
    *   .dedup({ id: 'order-123' })
-   *   .run()
    *
-   * // Second dispatch with same dedup ID is silently skipped
-   * await SendInvoiceJob.dispatch({ orderId: 123 })
-   *   .dedup({ id: 'order-123' })
-   *   .run()
+   * // Throttle: 5 second window
+   * await SendEmailJob.dispatch({ to: 'x' })
+   *   .dedup({ id: 'welcome', ttl: '5s' })
+   *
+   * // Debounce: replace payload within window
+   * await SaveDraftJob.dispatch({ content: 'latest' })
+   *   .dedup({ id: 'draft-42', ttl: '2s', replace: true, extend: true })
    * ```
    */
-  dedup(options: { id: string }): this {
+  dedup(options: { id: string; ttl?: Duration; extend?: boolean; replace?: boolean }): this {
     if (!options.id) {
       throw new Error('Dedup ID must be a non-empty string')
     }
 
-    this.#dedup = options
+    if (options.id.length > 400) {
+      throw new Error('Dedup ID must be 400 characters or less')
+    }
+
+    if ((options.extend || options.replace) && options.ttl === undefined) {
+      throw new Error('dedup.ttl is required when extend or replace is set')
+    }
+
+    let parsedTtl: number | undefined
+    if (options.ttl !== undefined) {
+      parsedTtl = parse(options.ttl)
+      if (!Number.isFinite(parsedTtl) || parsedTtl < 0) {
+        throw new Error('dedup.ttl must be a non-negative duration')
+      }
+    }
+
+    this.#dedup = {
+      id: options.id,
+      ttl: parsedTtl,
+      extend: options.extend,
+      replace: options.replace,
+    }
 
     return this
   }
@@ -218,7 +252,8 @@ export class JobDispatcher<T> {
    * ```
    */
   async run(): Promise<DispatchResult> {
-    const id = this.#dedup ? `${this.#name}::${this.#dedup.id}` : randomUUID()
+    const id = randomUUID()
+    const dedupId = this.#dedup ? `${this.#name}::${this.#dedup.id}` : undefined
 
     debug('dispatching job %s with id %s using payload %s', this.#name, id, this.#payload)
 
@@ -234,18 +269,39 @@ export class JobDispatcher<T> {
       priority: this.#priority,
       groupId: this.#groupId,
       createdAt: Date.now(),
-      ...(this.#dedup ? { dedup: { id: this.#dedup.id } } : {}),
+      ...(dedupId
+        ? {
+            dedup: {
+              id: dedupId,
+              ttl: this.#dedup!.ttl,
+              extend: this.#dedup!.extend,
+              replace: this.#dedup!.replace,
+            },
+          }
+        : {}),
     }
 
     const message: JobDispatchMessage = { jobs: [jobData], queue: this.#queue, delay: parsedDelay }
 
+    let pushResult: { outcome: DispatchResult['deduped']; jobId: string } | undefined
     await dispatchChannel.tracePromise(async () => {
-      if (parsedDelay !== undefined) {
-        await wrapInternal(() => adapter.pushLaterOn(this.#queue, jobData, parsedDelay))
-      } else {
-        await wrapInternal(() => adapter.pushOn(this.#queue, jobData))
+      const result =
+        parsedDelay !== undefined
+          ? await wrapInternal(() => adapter.pushLaterOn(this.#queue, jobData, parsedDelay))
+          : await wrapInternal(() => adapter.pushOn(this.#queue, jobData))
+
+      if (result && typeof result === 'object' && 'outcome' in result) {
+        pushResult = { outcome: result.outcome, jobId: result.jobId }
+        message.dedupOutcome = result.outcome
       }
     }, message)
+
+    if (pushResult && this.#dedup) {
+      return {
+        jobId: pushResult.jobId,
+        deduped: pushResult.outcome,
+      }
+    }
 
     return { jobId: id }
   }

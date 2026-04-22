@@ -134,7 +134,9 @@ The `groupId` is stored with job data and accessible via `job.data.groupId`.
 
 ## Job Deduplication
 
-Prevent the same job from being pushed to the queue twice using `.dedup()`:
+Prevent the same job from being pushed multiple times. Four modes, all via `.dedup()`:
+
+### Simple (skip while job exists)
 
 ```typescript
 // First dispatch - job is created
@@ -144,25 +146,65 @@ await SendInvoiceJob.dispatch({ orderId: 123 }).dedup({ id: 'order-123' }).run()
 await SendInvoiceJob.dispatch({ orderId: 123 }).dedup({ id: 'order-123' }).run()
 ```
 
-The dedup ID is automatically prefixed with the job name, so different job types can use the same ID without conflicts:
+### Throttle (skip within TTL window)
 
 ```typescript
-// These are two different jobs, no conflict
-await SendInvoiceJob.dispatch({ orderId: 123 }).dedup({ id: 'order-123' }).run()
-await SendReceiptJob.dispatch({ orderId: 123 }).dedup({ id: 'order-123' }).run()
+// Within 5s, duplicates are skipped. After 5s, a new job is created.
+await SendEmailJob.dispatch({ to: 'user@example.com' })
+  .dedup({ id: 'welcome-123', ttl: '5s' })
+  .run()
 ```
 
-Deduplication is atomic and race-condition-free for adapters that support storage-level uniqueness checks:
+### Extend (reset TTL on duplicate)
 
-- **Redis**: Uses `HSETNX` (set-if-not-exists)
-- **Knex**: Uses `INSERT ... ON CONFLICT DO NOTHING`
-- **SyncAdapter**: Executes jobs inline and does not support deduplication
+```typescript
+// Each duplicate push resets the TTL timer.
+await RateLimitJob.dispatch({ userId: 42 }).dedup({ id: 'rate-42', ttl: '1m', extend: true }).run()
+```
 
-> [!NOTE]
-> Without `.dedup()`, jobs use auto-generated UUIDs and are never deduplicated. The `.dedup()` method is only available on single dispatch, not `dispatchMany`.
+### Debounce (replace payload + reset TTL)
 
-> [!TIP]
-> When job retention is enabled (`removeOnComplete: false`), completed jobs remain in storage. A re-dispatch with the same dedup ID will be silently skipped since the record still exists. With the default retention (`true`), completed jobs are removed immediately, so re-dispatch with the same ID succeeds normally.
+```typescript
+// Within the 2s window, the latest payload overwrites the previous pending job.
+await SaveDraftJob.dispatch({ content: 'latest draft' })
+  .dedup({ id: 'draft-42', ttl: '2s', replace: true, extend: true })
+  .run()
+```
+
+### Inspecting the outcome
+
+`DispatchResult` tells you what happened:
+
+```typescript
+const { jobId, deduped } = await SaveDraftJob.dispatch({ content: '...' })
+  .dedup({ id: 'draft-42', ttl: '2s', replace: true })
+  .run()
+
+// deduped: 'added' | 'skipped' | 'replaced' | 'extended'
+// jobId: the UUID of the job (the existing one when deduped)
+```
+
+### How it works
+
+- The dedup ID is automatically prefixed with the job name (`SendInvoiceJob::order-123`), so different job types can reuse the same key.
+- `ttl` accepts a Duration (`'5s'`, `'1m'`) or milliseconds.
+- `extend` and `replace` **require** `ttl` — calling them without `ttl` throws.
+- `replace` only applies to jobs in `pending` or `delayed` state. Active (executing) jobs are left alone; the dispatch returns `{ deduped: 'skipped' }`.
+- `replace` swaps the **payload only** — priority, queue, delay, and groupId of the existing job are retained. To change those, use a different dedup id or wait for the TTL to expire.
+- `retryJob` does not touch the dedup entry — a retried job continues to occupy the dedup slot. TTL runs on wall-clock time, so long-running retries may outlive the TTL window. Use a generous TTL or no TTL if retries must stay deduped.
+- Atomic and race-free:
+  - **Redis**: `SET + PEXPIRE` under a Lua script with `HSETNX`-style guards.
+  - **Knex**: transactional `SELECT ... FOR UPDATE` + insert/update inside a transaction.
+  - **SyncAdapter**: executes inline, no dedup support.
+
+### Caveats
+
+- Without `.dedup()`, jobs use auto-generated UUIDs and are never deduplicated.
+- `.dedup()` is only available on single dispatch. `dispatchMany` / `pushManyOn` reject jobs with a `dedup` field.
+- Scheduled jobs (`.schedule()`) do not support dedup — each cron/interval fire is an independent dispatch.
+- With no `ttl`, dedup persists until the job is removed (completed/failed without retention). When retention keeps the record, re-dispatch stays blocked until the record is pruned.
+- With `ttl`, dedup expires after the window — a new job (new UUID) is created. The old job still runs.
+- Knex concurrent race: two `pushOn` calls with the same dedup id firing at the exact same instant on Postgres (READ COMMITTED) can both succeed (rare). Serialize at the app layer if strict guarantees are required, or use Redis.
 
 ## Job History & Retention
 
@@ -569,7 +611,7 @@ import * as boringqueue from '@boringnode/queue'
 
 const instrumentation = new QueueInstrumentation({
   messagingSystem: 'boringqueue', // default
-  executionSpanLinkMode: 'link',  // or 'parent'
+  executionSpanLinkMode: 'link', // or 'parent'
 })
 
 instrumentation.enable()
@@ -582,19 +624,19 @@ The instrumentation patches `QueueManager.init()` to automatically inject its wr
 
 The instrumentation uses standard [OTel messaging semantic conventions](https://opentelemetry.io/docs/specs/semconv/messaging/messaging-spans/) where they map cleanly, plus a few queue-specific custom attributes.
 
-| Attribute                       | Kind    | Description                                |
-| ------------------------------- | ------- | ------------------------------------------ |
-| `messaging.system`              | Semconv | `'boringqueue'` (configurable)             |
-| `messaging.operation.name`      | Semconv | `'publish'` or `'process'`                 |
-| `messaging.destination.name`    | Semconv | Queue name                                 |
-| `messaging.message.id`          | Semconv | Job ID for single-message spans            |
-| `messaging.batch.message_count` | Semconv | Number of jobs in a batch dispatch         |
-| `messaging.message.retry.count` | Custom  | Retry count (0-based) for a job attempt    |
-| `messaging.job.name`            | Custom  | Job class name (e.g. `SendEmailJob`)       |
-| `messaging.job.status`          | Custom  | `'completed'`, `'failed'`, or `'retrying'` |
-| `messaging.job.group_id`        | Custom  | Queue-specific group identifier            |
-| `messaging.job.priority`        | Custom  | Queue-specific job priority                |
-| `messaging.job.delay_ms`        | Custom  | Delay before the job becomes available     |
+| Attribute                       | Kind    | Description                                   |
+| ------------------------------- | ------- | --------------------------------------------- |
+| `messaging.system`              | Semconv | `'boringqueue'` (configurable)                |
+| `messaging.operation.name`      | Semconv | `'publish'` or `'process'`                    |
+| `messaging.destination.name`    | Semconv | Queue name                                    |
+| `messaging.message.id`          | Semconv | Job ID for single-message spans               |
+| `messaging.batch.message_count` | Semconv | Number of jobs in a batch dispatch            |
+| `messaging.message.retry.count` | Custom  | Retry count (0-based) for a job attempt       |
+| `messaging.job.name`            | Custom  | Job class name (e.g. `SendEmailJob`)          |
+| `messaging.job.status`          | Custom  | `'completed'`, `'failed'`, or `'retrying'`    |
+| `messaging.job.group_id`        | Custom  | Queue-specific group identifier               |
+| `messaging.job.priority`        | Custom  | Queue-specific job priority                   |
+| `messaging.job.delay_ms`        | Custom  | Delay before the job becomes available        |
 | `messaging.job.queue_time_ms`   | Custom  | Time spent waiting in queue before processing |
 
 ### Trace Context Propagation

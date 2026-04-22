@@ -7,7 +7,9 @@ import { QueueConfigResolver } from './queue_config_resolver.js'
 import type { Adapter } from './contracts/adapter.js'
 import type { AdapterFactory, JobFactory, QueueManagerConfig } from './types/main.js'
 
-const noopInternalOperationWrapper: NonNullable<QueueManagerConfig['internalOperationWrapper']> = async (fn) => fn()
+const noopInternalOperationWrapper: NonNullable<
+  QueueManagerConfig['internalOperationWrapper']
+> = async (fn) => fn()
 const noopExecutionWrapper: NonNullable<QueueManagerConfig['executionWrapper']> = async (fn) => fn()
 
 type QueueManagerFakeState = {

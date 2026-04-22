@@ -43,9 +43,20 @@ export type JobStatus = 'pending' | 'active' | 'delayed' | 'completed' | 'failed
  * console.log(`Dispatched job: ${jobId}`)
  * ```
  */
+/**
+ * Outcome of a dedup-enabled dispatch.
+ * - `added`: new job was inserted
+ * - `skipped`: duplicate found within TTL, skipped silently
+ * - `replaced`: duplicate found within TTL, existing job's payload was replaced
+ * - `extended`: duplicate found within TTL, TTL window was reset
+ */
+export type DedupOutcome = 'added' | 'skipped' | 'replaced' | 'extended'
+
 export interface DispatchResult {
   /** Unique identifier for this specific job instance */
   jobId: string
+  /** Dedup outcome (only present when `.dedup()` was used). */
+  deduped?: DedupOutcome
 }
 
 /**
@@ -136,13 +147,24 @@ export interface JobData {
 
   /**
    * Deduplication configuration for this job.
-   * When set, adapters use atomic insert-if-not-exists semantics
-   * to silently skip duplicate jobs with the same ID.
+   * When set, adapters apply dedup semantics keyed on `dedup.id`.
    * Set automatically when `.dedup()` is called on the dispatcher.
    */
   dedup?: {
-    /** The original dedup key provided by the caller (before name-prefixing). */
+    /** Dedup key, prefixed with the job name (e.g. `SendInvoiceJob::order-123`). */
     id: string
+    /**
+     * TTL in milliseconds. When set, dedup lock auto-expires after TTL.
+     * After expiry, the same dedup id produces a brand-new job (coexists with prior).
+     * 0 or undefined = no TTL; dedup lock persists until the job is removed.
+     */
+    ttl?: number
+    /** Reset the TTL window when a duplicate arrives within it. */
+    extend?: boolean
+    /** Replace payload of the existing non-active job when a duplicate arrives within TTL. */
+    replace?: boolean
+    /** Timestamp (ms) when this dedup entry was recorded. Set by adapters. */
+    createdAt?: number
   }
 }
 

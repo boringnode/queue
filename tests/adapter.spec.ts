@@ -80,7 +80,9 @@ test.group('Adapter | Redis', (group) => {
     )
   })
 
-  test('deleteSchedule should not leave ghost index under write-failure chaos', async ({ assert }) => {
+  test('deleteSchedule should not leave ghost index under write-failure chaos', async ({
+    assert,
+  }) => {
     const adapter = new RedisAdapter(connection)
     const id = 'chaos-delete-schedule'
 
