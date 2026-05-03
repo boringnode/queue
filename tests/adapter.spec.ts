@@ -2,7 +2,7 @@ import Knex from 'knex'
 import { test } from '@japa/runner'
 import { Redis } from 'ioredis'
 import { MemoryAdapter } from './_mocks/memory_adapter.js'
-import { RedisAdapter } from '../src/drivers/redis_adapter.js'
+import { redis, RedisAdapter } from '../src/drivers/redis_adapter.js'
 import { KnexAdapter } from '../src/drivers/knex_adapter.js'
 import { QueueSchemaService } from '../src/services/queue_schema.js'
 import { registerDriverTestSuite } from './_utils/register_driver_test_suite.js'
@@ -114,6 +114,68 @@ test.group('Adapter | Redis', (group) => {
       1,
       'deleteSchedule should be emitted in a single write window to avoid partial state'
     )
+  })
+
+  test('completeJob should not delete a newer TTL dedup lock when Redis keyPrefix is disabled', async ({
+    assert,
+  }) => {
+    const redisOptions = {
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+      db: 15,
+      keyPrefix: '',
+    }
+    const inspectorConnection = new Redis(redisOptions)
+    const adapter = redis(redisOptions)()
+    const queue = 'raw-ttl-clean-queue'
+    const dedupId = 'TestJob::raw-ttl-clean-1'
+    const dedupKey = `jobs::${queue}::dedup::${dedupId}`
+
+    await connection.flushdb()
+
+    try {
+      await adapter.pushOn(queue, {
+        id: 'raw-ttl-clean-uuid-1',
+        name: 'TestJob',
+        payload: { n: 1 },
+        attempts: 0,
+        dedup: { id: dedupId, ttl: 80 },
+      })
+
+      const first = await adapter.popFrom(queue)
+      assert.equal(first!.id, 'raw-ttl-clean-uuid-1')
+
+      await new Promise((r) => setTimeout(r, 150))
+
+      const second = await adapter.pushOn(queue, {
+        id: 'raw-ttl-clean-uuid-2',
+        name: 'TestJob',
+        payload: { n: 2 },
+        attempts: 0,
+        dedup: { id: dedupId, ttl: 10_000 },
+      })
+      assert.equal(second && typeof second === 'object' && second.outcome, 'added')
+      assert.equal(await inspectorConnection.get(dedupKey), 'raw-ttl-clean-uuid-2')
+
+      await adapter.completeJob(first!.id, queue, true)
+
+      assert.equal(await inspectorConnection.get(dedupKey), 'raw-ttl-clean-uuid-2')
+
+      const third = await adapter.pushOn(queue, {
+        id: 'raw-ttl-clean-uuid-3',
+        name: 'TestJob',
+        payload: { n: 3 },
+        attempts: 0,
+        dedup: { id: dedupId, ttl: 10_000 },
+      })
+
+      assert.equal(third && typeof third === 'object' && third.outcome, 'skipped')
+      assert.equal(third && typeof third === 'object' && third.jobId, 'raw-ttl-clean-uuid-2')
+    } finally {
+      await connection.flushdb()
+      await adapter.destroy()
+      await inspectorConnection.quit()
+    }
   })
 })
 
@@ -320,5 +382,105 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       1,
       `Expected a single schedule DELETE query, got ${scheduleDeleteQueries.length}`
     )
+  })
+
+  test('concurrent dedup pushes should not both insert when no existing row is lockable', async ({
+    assert,
+  }) => {
+    const dedupId = 'TestJob::pg-concurrent-missing-row'
+    const barrierFunction = 'queue_jobs_test_dedup_insert_barrier'
+    const barrierTrigger = 'queue_jobs_test_dedup_insert_barrier_trigger'
+
+    await connection.raw(`
+      CREATE OR REPLACE FUNCTION ${barrierFunction}()
+      RETURNS trigger AS $$
+      DECLARE
+        attempts integer := 0;
+      BEGIN
+        IF NEW.dedup_id = '${dedupId}' THEN
+          IF pg_try_advisory_lock(90312001) THEN
+            LOOP
+              EXIT WHEN NOT pg_try_advisory_lock(90312002);
+              PERFORM pg_advisory_unlock(90312002);
+              attempts := attempts + 1;
+              IF attempts > 1000 THEN
+                RAISE EXCEPTION 'timed out waiting for concurrent insert';
+              END IF;
+              PERFORM pg_sleep(0.01);
+            END LOOP;
+          ELSE
+            PERFORM pg_advisory_lock(90312002);
+          END IF;
+        END IF;
+
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+    `)
+
+    await connection.raw(`
+      CREATE TRIGGER ${barrierTrigger}
+      BEFORE INSERT ON ${tableName}
+      FOR EACH ROW
+      EXECUTE FUNCTION ${barrierFunction}()
+    `)
+
+    const createConnection = () =>
+      Knex({
+        client: 'pg',
+        connection: {
+          host: process.env.PG_HOST || 'localhost',
+          port: Number.parseInt(process.env.PG_PORT || '5432', 10),
+          user: process.env.PG_USER || 'postgres',
+          password: process.env.PG_PASSWORD || 'postgres',
+          database: process.env.PG_DATABASE || 'queue_test',
+        },
+        pool: { min: 1, max: 1 },
+      })
+
+    const connectionA = createConnection()
+    const connectionB = createConnection()
+    const adapterA = new KnexAdapter({ connection: connectionA, tableName, schedulesTableName })
+    const adapterB = new KnexAdapter({ connection: connectionB, tableName, schedulesTableName })
+
+    try {
+      const results = await Promise.all([
+        adapterA.pushOn('pg-dedup-race-queue', {
+          id: 'pg-dedup-race-uuid-1',
+          name: 'TestJob',
+          payload: { n: 1 },
+          attempts: 0,
+          dedup: { id: dedupId },
+        }),
+        adapterB.pushOn('pg-dedup-race-queue', {
+          id: 'pg-dedup-race-uuid-2',
+          name: 'TestJob',
+          payload: { n: 2 },
+          attempts: 0,
+          dedup: { id: dedupId },
+        }),
+      ])
+
+      const outcomes = results.map((result) =>
+        result && typeof result === 'object' ? result.outcome : undefined
+      )
+      assert.equal(outcomes.filter((outcome) => outcome === 'added').length, 1)
+      assert.equal(outcomes.filter((outcome) => outcome === 'skipped').length, 1)
+
+      const count = await connection(tableName)
+        .where('queue', 'pg-dedup-race-queue')
+        .where('dedup_id', dedupId)
+        .count<{ total: string }[]>('* as total')
+        .first()
+
+      assert.equal(Number(count?.total), 1)
+    } finally {
+      await adapterA.destroy()
+      await adapterB.destroy()
+      await connectionA.destroy()
+      await connectionB.destroy()
+      await connection.raw(`DROP TRIGGER IF EXISTS ${barrierTrigger} ON ${tableName}`)
+      await connection.raw(`DROP FUNCTION IF EXISTS ${barrierFunction}()`)
+    }
   })
 })

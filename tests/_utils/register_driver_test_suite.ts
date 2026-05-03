@@ -1811,11 +1811,13 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       dedup: { id: 'TestJob::rep-1', ttl: 10_000, replace: true },
     })
     assert.equal(second && typeof second === 'object' && second.outcome, 'replaced')
+    assert.equal(second && typeof second === 'object' && second.jobId, 'rep-uuid-1')
 
     const size = await adapter.sizeOf('rep-queue')
     assert.equal(size, 1)
 
     const job = await adapter.popFrom('rep-queue')
+    assert.equal(job!.id, 'rep-uuid-1')
     assert.deepEqual(job!.payload, { version: 2 })
   })
 
