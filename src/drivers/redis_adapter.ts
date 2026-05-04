@@ -66,6 +66,11 @@ const PUSH_DEDUP_JOB_SCRIPT = `
     if has_data then
       local is_active = redis.call('HEXISTS', active_key, existing) == 1
       if replace == 1 and not is_active then
+        local ok, parsed = pcall(cjson.decode, job_data)
+        if ok and parsed then
+          parsed.id = existing
+          job_data = cjson.encode(parsed)
+        end
         redis.call('HSET', data_key, existing, job_data)
         if extend == 1 and ttl > 0 then
           redis.call('PEXPIRE', dedup_key, ttl)
@@ -128,6 +133,11 @@ const PUSH_DEDUP_DELAYED_JOB_SCRIPT = `
     if has_data then
       local is_active = redis.call('HEXISTS', active_key, existing) == 1
       if replace == 1 and not is_active then
+        local ok, parsed = pcall(cjson.decode, job_data)
+        if ok and parsed then
+          parsed.id = existing
+          job_data = cjson.encode(parsed)
+        end
         redis.call('HSET', data_key, existing, job_data)
         if extend == 1 and ttl > 0 then
           redis.call('PEXPIRE', dedup_key, ttl)
@@ -226,7 +236,10 @@ const REMOVE_JOB_SCRIPT = `
   if job_data then
     local ok, job = pcall(cjson.decode, job_data)
     if ok and job and job.dedup and job.dedup.id then
-      redis.call('DEL', dedup_prefix .. job.dedup.id)
+      local dkey = dedup_prefix .. job.dedup.id
+      if redis.call('GET', dkey) == job_id then
+        redis.call('DEL', dkey)
+      end
     end
   end
 
@@ -273,11 +286,15 @@ const FINALIZE_JOB_SCRIPT = `
 
   local function delete_dedup_for(ids)
     for i = 1, #ids do
-      local d = redis.call('HGET', data_key, ids[i])
+      local id = ids[i]
+      local d = redis.call('HGET', data_key, id)
       if d then
         local ok, job = pcall(cjson.decode, d)
         if ok and job and job.dedup and job.dedup.id then
-          redis.call('DEL', dedup_prefix .. job.dedup.id)
+          local dkey = dedup_prefix .. job.dedup.id
+          if redis.call('GET', dkey) == id then
+            redis.call('DEL', dkey)
+          end
         end
       end
     end
@@ -402,9 +419,12 @@ const RECOVER_STALLED_JOBS_SCRIPT = `
 
         -- Check if job has exceeded max stalled count
         if current_stalled_count >= max_stalled_count then
-          -- Job failed permanently, remove data + dedup key
+          -- Job failed permanently, remove data + dedup key (only if pointer still ours)
           if job.dedup and job.dedup.id then
-            redis.call('DEL', dedup_prefix .. job.dedup.id)
+            local dkey = dedup_prefix .. job.dedup.id
+            if redis.call('GET', dkey) == job_id then
+              redis.call('DEL', dkey)
+            end
           end
           redis.call('HDEL', data_key, job_id)
         else

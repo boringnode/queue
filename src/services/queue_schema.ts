@@ -37,6 +37,8 @@ export class QueueSchemaService {
 
       extend?.(table)
     })
+
+    await this.#createDedupActiveUniqueIndex(tableName)
   }
 
   /**
@@ -64,6 +66,25 @@ export class QueueSchemaService {
         table.index(['queue', 'dedup_id'])
       })
     }
+
+    await this.#createDedupActiveUniqueIndex(tableName)
+  }
+
+  /**
+   * Partial unique index on (queue, dedup_id) for active dedup slots.
+   * Prevents two concurrent inserts with the same dedup_id from both succeeding.
+   * Only PG and SQLite support partial unique indexes; MySQL is skipped.
+   */
+  async #createDedupActiveUniqueIndex(tableName: string): Promise<void> {
+    const client = this.#connection.client.config.client
+    if (client !== 'pg' && client !== 'better-sqlite3' && client !== 'sqlite3') return
+
+    const indexName = `${tableName}_dedup_active_uidx`
+    await this.#connection.raw(
+      `CREATE UNIQUE INDEX IF NOT EXISTS ?? ON ?? ("queue", "dedup_id") ` +
+        `WHERE "dedup_id" IS NOT NULL AND "status" IN ('pending', 'delayed')`,
+      [indexName, tableName]
+    )
   }
 
   /**

@@ -481,19 +481,58 @@ export class KnexAdapter implements Adapter {
 
           return { outcome: 'skipped' as DedupOutcome, jobId: existing.id as string }
         }
-        // TTL expired — fall through to insert a new row. Old row (if retained
-        // history) is left intact.
+        // TTL expired — fall through to insert a new row. If the old row is
+        // still pending/delayed it would collide with the partial unique index
+        // on (queue, dedup_id), so drop it first. Retained history (completed/
+        // failed) is excluded by the index predicate and left intact.
+        const status = existing.status as JobStatus
+        if (status === 'pending' || status === 'delayed') {
+          await trx(this.#jobsTable).where({ id: existing.id, queue }).delete()
+        }
       }
 
-      await trx(this.#jobsTable).insert({
-        ...insertRow,
-        dedup_id: dedup.id,
-        dedup_at: now,
-        dedup_ttl: dedup.ttl ?? null,
-      })
+      let raceLost = false
+      try {
+        await trx.transaction(async (sp) => {
+          await sp(this.#jobsTable).insert({
+            ...insertRow,
+            dedup_id: dedup.id,
+            dedup_at: now,
+            dedup_ttl: dedup.ttl ?? null,
+          })
+        })
+      } catch (err) {
+        if (this.#isUniqueViolation(err)) {
+          raceLost = true
+        } else {
+          throw err
+        }
+      }
+
+      if (raceLost) {
+        const winner = await trx(this.#jobsTable)
+          .where('queue', queue)
+          .where('dedup_id', dedup.id)
+          .whereIn('status', ['pending', 'delayed'])
+          .orderBy('dedup_at', 'desc')
+          .first()
+        if (winner) {
+          return { outcome: 'skipped' as DedupOutcome, jobId: winner.id as string }
+        }
+      }
 
       return { outcome: 'added' as DedupOutcome, jobId: jobData.id }
     })
+  }
+
+  #isUniqueViolation(err: unknown): boolean {
+    if (!err || typeof err !== 'object') return false
+    const e = err as { code?: string; message?: string }
+    return (
+      e.code === '23505' ||
+      e.code === 'SQLITE_CONSTRAINT_UNIQUE' ||
+      /UNIQUE constraint/i.test(e.message ?? '')
+    )
   }
 
   async pushMany(jobs: JobData[]): Promise<void> {
