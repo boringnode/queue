@@ -1732,6 +1732,44 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.deepEqual(job!.data.payload, { attempt: 1 })
   })
 
+  test('pushLaterOn dedup replace preserves the original job id', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushLaterOn(
+      'rep-delayed-queue',
+      {
+        id: 'delayed-rep-uuid-1',
+        name: 'TestJob',
+        payload: { version: 1 },
+        attempts: 0,
+        dedup: { id: 'TestJob::delayed-rep-1', ttl: 10_000, replace: true },
+      },
+      50
+    )
+
+    const second = await adapter.pushLaterOn(
+      'rep-delayed-queue',
+      {
+        id: 'delayed-rep-uuid-2',
+        name: 'TestJob',
+        payload: { version: 2 },
+        attempts: 0,
+        dedup: { id: 'TestJob::delayed-rep-1', ttl: 10_000, replace: true },
+      },
+      50
+    )
+    assert.equal(second && typeof second === 'object' && second.outcome, 'replaced')
+    assert.equal(second && typeof second === 'object' && second.jobId, 'delayed-rep-uuid-1')
+
+    await new Promise((r) => setTimeout(r, 80))
+
+    const job = await adapter.popFrom('rep-delayed-queue')
+    assert.isNotNull(job)
+    assert.equal(job!.id, 'delayed-rep-uuid-1')
+    assert.deepEqual(job!.payload, { version: 2 })
+  })
+
   test('pushOn with dedup should allow same id on different queues', async ({ assert }) => {
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')

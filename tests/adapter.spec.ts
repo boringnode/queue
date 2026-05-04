@@ -177,6 +177,141 @@ test.group('Adapter | Redis', (group) => {
       await inspectorConnection.quit()
     }
   })
+
+  test('history pruning should not delete a newer dedup lock when Redis keyPrefix is disabled', async ({
+    assert,
+  }) => {
+    const redisOptions = {
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+      db: 15,
+      keyPrefix: '',
+    }
+    const inspectorConnection = new Redis(redisOptions)
+    const adapter = redis(redisOptions)()
+    const queue = 'raw-finalize-prune-queue'
+    const dedupId = 'TestJob::raw-finalize-prune-1'
+    const dedupKey = `jobs::${queue}::dedup::${dedupId}`
+
+    await connection.flushdb()
+
+    try {
+      await adapter.pushOn(queue, {
+        id: 'raw-finalize-prune-uuid-1',
+        name: 'TestJob',
+        payload: { n: 1 },
+        attempts: 0,
+        dedup: { id: dedupId, ttl: 80 },
+      })
+
+      const first = await adapter.popFrom(queue)
+      assert.equal(first!.id, 'raw-finalize-prune-uuid-1')
+
+      await adapter.completeJob(first!.id, queue, { count: 1 })
+
+      await new Promise((r) => setTimeout(r, 150))
+
+      const second = await adapter.pushOn(queue, {
+        id: 'raw-finalize-prune-uuid-2',
+        name: 'TestJob',
+        payload: { n: 2 },
+        attempts: 0,
+        dedup: { id: dedupId },
+      })
+      assert.equal(second && typeof second === 'object' && second.outcome, 'added')
+      assert.equal(await inspectorConnection.get(dedupKey), 'raw-finalize-prune-uuid-2')
+
+      const popped = await adapter.popFrom(queue)
+      assert.equal(popped!.id, 'raw-finalize-prune-uuid-2')
+
+      await adapter.completeJob(popped!.id, queue, { count: 1 })
+
+      assert.equal(await inspectorConnection.get(dedupKey), 'raw-finalize-prune-uuid-2')
+
+      const third = await adapter.pushOn(queue, {
+        id: 'raw-finalize-prune-uuid-3',
+        name: 'TestJob',
+        payload: { n: 3 },
+        attempts: 0,
+        dedup: { id: dedupId },
+      })
+
+      assert.equal(third && typeof third === 'object' && third.outcome, 'skipped')
+      assert.equal(
+        third && typeof third === 'object' && third.jobId,
+        'raw-finalize-prune-uuid-2'
+      )
+    } finally {
+      await connection.flushdb()
+      await adapter.destroy()
+      await inspectorConnection.quit()
+    }
+  })
+
+  test('recoverStalledJobs should not delete a newer dedup lock when Redis keyPrefix is disabled', async ({
+    assert,
+  }) => {
+    const redisOptions = {
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+      db: 15,
+      keyPrefix: '',
+    }
+    const inspectorConnection = new Redis(redisOptions)
+    const adapter = redis(redisOptions)()
+    const queue = 'raw-stall-dedup-queue'
+    const dedupId = 'TestJob::raw-stall-dedup-1'
+    const dedupKey = `jobs::${queue}::dedup::${dedupId}`
+
+    await connection.flushdb()
+
+    try {
+      await adapter.pushOn(queue, {
+        id: 'raw-stall-dedup-uuid-1',
+        name: 'TestJob',
+        payload: { n: 1 },
+        attempts: 0,
+        stalledCount: 0,
+        dedup: { id: dedupId, ttl: 80 },
+      })
+
+      const first = await adapter.popFrom(queue)
+      assert.equal(first!.id, 'raw-stall-dedup-uuid-1')
+
+      await new Promise((r) => setTimeout(r, 150))
+
+      const second = await adapter.pushOn(queue, {
+        id: 'raw-stall-dedup-uuid-2',
+        name: 'TestJob',
+        payload: { n: 2 },
+        attempts: 0,
+        dedup: { id: dedupId },
+      })
+      assert.equal(second && typeof second === 'object' && second.outcome, 'added')
+      assert.equal(await inspectorConnection.get(dedupKey), 'raw-stall-dedup-uuid-2')
+
+      // First job still active + stalled. With maxStalledCount=0 it fails permanently.
+      const recovered = await adapter.recoverStalledJobs(queue, 10, 0)
+      assert.equal(recovered, 0)
+
+      assert.equal(await inspectorConnection.get(dedupKey), 'raw-stall-dedup-uuid-2')
+
+      const third = await adapter.pushOn(queue, {
+        id: 'raw-stall-dedup-uuid-3',
+        name: 'TestJob',
+        payload: { n: 3 },
+        attempts: 0,
+        dedup: { id: dedupId },
+      })
+
+      assert.equal(third && typeof third === 'object' && third.outcome, 'skipped')
+      assert.equal(third && typeof third === 'object' && third.jobId, 'raw-stall-dedup-uuid-2')
+    } finally {
+      await connection.flushdb()
+      await adapter.destroy()
+      await inspectorConnection.quit()
+    }
+  })
 })
 
 test.group('Adapter | Knex (SQLite)', (group) => {
