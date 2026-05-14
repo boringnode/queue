@@ -2282,9 +2282,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     )
 
     const results = await Promise.all(dispatches)
-    const outcomes = results.map((r) =>
-      r && typeof r === 'object' ? r.outcome : undefined
-    )
+    const outcomes = results.map((r) => (r && typeof r === 'object' ? r.outcome : undefined))
 
     assert.equal(
       outcomes.filter((o) => o === 'added').length,

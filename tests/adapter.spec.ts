@@ -80,6 +80,38 @@ test.group('Adapter | Redis', (group) => {
     )
   })
 
+  test('claimDueSchedule should use bounded network round-trips when many schedules are not due', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+    const futureRunAt = new Date(Date.now() + 60_000)
+
+    for (let i = 0; i < 50; i++) {
+      const id = `future-schedule-${i}`
+
+      await adapter.upsertSchedule({
+        id,
+        name: 'FutureJob',
+        payload: { i },
+        everyMs: 60_000,
+        timezone: 'UTC',
+      })
+      await adapter.updateSchedule(id, { nextRunAt: futureRunAt })
+    }
+
+    const { result: claimed, writes } = await withRedisWriteSpy({
+      connection,
+      run: () => adapter.claimDueSchedule(),
+    })
+
+    assert.isNull(claimed)
+    assert.isAtMost(
+      writes,
+      2,
+      `Expected bounded claim writes, got ${writes} writes for 50 future schedules`
+    )
+  })
+
   test('deleteSchedule should not leave ghost index under write-failure chaos', async ({
     assert,
   }) => {
@@ -237,10 +269,7 @@ test.group('Adapter | Redis', (group) => {
       })
 
       assert.equal(third && typeof third === 'object' && third.outcome, 'skipped')
-      assert.equal(
-        third && typeof third === 'object' && third.jobId,
-        'raw-finalize-prune-uuid-2'
-      )
+      assert.equal(third && typeof third === 'object' && third.jobId, 'raw-finalize-prune-uuid-2')
     } finally {
       await connection.flushdb()
       await adapter.destroy()
@@ -344,9 +373,7 @@ test.group('Adapter | Redis', (group) => {
     assert.equal(stored, '{not valid json')
   })
 
-  test('dedup: orphan dedup pointer is reclaimed when job data is missing', async ({
-    assert,
-  }) => {
+  test('dedup: orphan dedup pointer is reclaimed when job data is missing', async ({ assert }) => {
     const adapter = new RedisAdapter(connection)
     const queue = 'orphan-dedup-queue'
     const dataKey = `jobs::${queue}::data`

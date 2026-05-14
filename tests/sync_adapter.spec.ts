@@ -132,12 +132,8 @@ test.group('SyncAdapter', (group) => {
 
     Locator.register('DedupIgnoredSyncJob', DedupIgnoredSyncJob)
 
-    const first = await DedupIgnoredSyncJob.dispatch({ n: 1 })
-      .dedup({ id: 'sync-dedup-1' })
-      .run()
-    const second = await DedupIgnoredSyncJob.dispatch({ n: 2 })
-      .dedup({ id: 'sync-dedup-1' })
-      .run()
+    const first = await DedupIgnoredSyncJob.dispatch({ n: 1 }).dedup({ id: 'sync-dedup-1' }).run()
+    const second = await DedupIgnoredSyncJob.dispatch({ n: 2 }).dedup({ id: 'sync-dedup-1' }).run()
     const third = await DedupIgnoredSyncJob.dispatch({ n: 3 })
       .dedup({ id: 'sync-dedup-1', ttl: 10_000, replace: true })
       .run()

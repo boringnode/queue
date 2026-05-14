@@ -3,6 +3,8 @@ import * as errors from '../src/exceptions.js'
 import { QueueManager } from '../src/queue_manager.js'
 import { sync } from '../src/drivers/sync_adapter.js'
 import { MemoryLogger } from './_mocks/memory_logger.js'
+import { Locator } from '../src/locator.js'
+import SendEmailJob from '../examples/jobs/send_email_job.js'
 import type { Adapter } from '../src/contracts/adapter.js'
 
 test.group('QueueManager', () => {
@@ -148,6 +150,53 @@ test.group('QueueManager', () => {
     assert.equal(logger.logs.length, 1)
     assert.equal(logger.logs[0].level, 'warn')
     assert.include(logger.logs[0].message, 'No jobs found for locations')
+  })
+
+  test('should load jobs from configured locations', async ({ assert, cleanup }) => {
+    cleanup(() => Locator.clear())
+
+    await QueueManager.init({
+      default: 'sync',
+      adapters: { sync: sync() },
+      locations: ['./examples/jobs/*.ts'],
+    })
+
+    Locator.clear()
+
+    const registered = await QueueManager.loadJobs()
+
+    assert.equal(registered, 3)
+    assert.equal(Locator.get('SendEmailJob'), SendEmailJob)
+  })
+
+  test('should keep configured locations when automatic job loading is disabled', async ({
+    assert,
+    cleanup,
+  }) => {
+    cleanup(() => Locator.clear())
+
+    await QueueManager.init({
+      default: 'sync',
+      adapters: { sync: sync() },
+      locations: ['./examples/jobs/*.ts'],
+      autoLoadJobs: false,
+    })
+
+    assert.isUndefined(Locator.get('SendEmailJob'))
+
+    const registered = await QueueManager.loadJobs()
+
+    assert.equal(registered, 3)
+    assert.equal(Locator.get('SendEmailJob'), SendEmailJob)
+  })
+
+  test('should load jobs from explicit locations', async ({ assert, cleanup }) => {
+    cleanup(() => Locator.clear())
+
+    const registered = await QueueManager.loadJobs(['./examples/jobs/*.ts'])
+
+    assert.equal(registered, 3)
+    assert.equal(Locator.get('SendEmailJob'), SendEmailJob)
   })
 
   test('should fake adapters and restore them', async ({ assert }) => {

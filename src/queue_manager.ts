@@ -21,6 +21,7 @@ type QueueManagerFakeState = {
   internalOperationWrapper?: QueueManagerConfig['internalOperationWrapper']
   executionWrapper?: QueueManagerConfig['executionWrapper']
   configResolver: QueueConfigResolver
+  locations: string[]
   fakeAdapter: FakeAdapter
 }
 
@@ -65,6 +66,7 @@ class QueueManagerSingleton {
   #internalOperationWrapper?: QueueManagerConfig['internalOperationWrapper']
   #executionWrapper?: QueueManagerConfig['executionWrapper']
   #configResolver: QueueConfigResolver = new QueueConfigResolver({})
+  #locations: string[] = []
   #fakeState?: QueueManagerFakeState
 
   /**
@@ -105,21 +107,50 @@ class QueueManagerSingleton {
     this.#internalOperationWrapper = config.internalOperationWrapper
     this.#executionWrapper = config.executionWrapper
     this.#configResolver = QueueConfigResolver.from(config)
+    this.#locations = config.locations ?? []
 
-    if (config.locations && config.locations.length > 0) {
-      const registered = await Locator.registerFromGlob(config.locations)
-
-      if (registered === 0) {
-        this.#logger.warn(
-          `No jobs found for locations: ${config.locations.join(', ')}. ` +
-            'Verify your glob patterns match your job files.'
-        )
-      }
+    if (config.autoLoadJobs ?? true) {
+      await this.loadJobs()
     }
 
     this.#initialized = true
 
     return this
+  }
+
+  /**
+   * Load and register job classes from configured or explicit locations.
+   *
+   * This low-level API is useful for framework integrations that need to
+   * register jobs at a precise moment in their command lifecycle.
+   *
+   * @param locations - Optional glob patterns. Defaults to the configured locations.
+   * @returns Number of jobs successfully registered.
+   *
+   * @example
+   * ```typescript
+   * await QueueManager.init(config)
+   * await QueueManager.loadJobs()
+   *
+   * // Or with explicit locations
+   * await QueueManager.loadJobs(['./app/jobs/**\/*.js'])
+   * ```
+   */
+  async loadJobs(locations: string[] = this.#locations): Promise<number> {
+    if (locations.length === 0) {
+      return 0
+    }
+
+    const registered = await Locator.registerFromGlob(locations)
+
+    if (registered === 0) {
+      this.#logger.warn(
+        `No jobs found for locations: ${locations.join(', ')}. ` +
+          'Verify your glob patterns match your job files.'
+      )
+    }
+
+    return registered
   }
 
   /**
@@ -256,6 +287,7 @@ class QueueManagerSingleton {
       internalOperationWrapper: this.#internalOperationWrapper,
       executionWrapper: this.#executionWrapper,
       configResolver: this.#configResolver,
+      locations: this.#locations,
       fakeAdapter,
     }
 
@@ -297,6 +329,7 @@ class QueueManagerSingleton {
     this.#internalOperationWrapper = state.internalOperationWrapper
     this.#executionWrapper = state.executionWrapper
     this.#configResolver = state.configResolver
+    this.#locations = state.locations
   }
 
   /**
@@ -401,6 +434,7 @@ class QueueManagerSingleton {
     this.#internalOperationWrapper = undefined
     this.#executionWrapper = undefined
     this.#configResolver = new QueueConfigResolver({})
+    this.#locations = []
     this.#fakeState = undefined
   }
 }

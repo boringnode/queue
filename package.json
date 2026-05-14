@@ -1,7 +1,7 @@
 {
   "name": "@boringnode/queue",
   "description": "A simple and efficient queue system for Node.js applications",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "main": "build/index.js",
   "type": "module",
   "files": [

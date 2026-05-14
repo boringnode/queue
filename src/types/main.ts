@@ -27,7 +27,19 @@ export type Duration = number | string
  * - `false`: Keep job in history indefinitely
  * - `{ age?, count? }`: Keep with pruning by age and/or count
  */
-export type JobRetention = boolean | { age?: Duration; count?: number }
+export type JobRetention =
+  | boolean
+  | {
+      /**
+       * Keep jobs newer than this duration.
+       */
+      age?: Duration
+
+      /**
+       * Keep at most this many jobs.
+       */
+      count?: number
+    }
 
 /**
  * Possible statuses for a job in the queue.
@@ -103,7 +115,7 @@ export interface JobData {
   /**
    * Job priority (lower = higher priority).
    *
-   * @default 0
+   * @default 5
    */
   priority?: number
 
@@ -232,25 +244,31 @@ export interface JobOptions {
 
   /**
    * Adapter name or factory to use for this job.
+   *
+   * Defaults to the queue manager's configured default adapter.
    */
   adapter?: string | (() => Adapter)
 
   /**
    * Maximum retry attempts before permanent failure.
    *
-   * @default 3
+   * This is a convenience alias for `retry.maxRetries`.
+   *
+   * @default 0
    */
   maxRetries?: number
 
   /**
    * Job priority (lower = higher priority).
    *
-   * @default 0
+   * @default 5
    */
   priority?: number
 
   /**
-   * Retry configuration (backoff strategy, delays, etc.).
+   * Retry configuration for this job.
+   *
+   * Overrides queue-level and global retry settings.
    */
   retry?: RetryConfig
 
@@ -264,10 +282,24 @@ export interface JobOptions {
   /**
    * Whether to mark job as failed on timeout.
    *
-   * @default true
+   * When disabled, timed out jobs follow the normal retry policy.
+   *
+   * @default false
    */
   failOnTimeout?: boolean
+
+  /**
+   * Retention policy for completed jobs.
+   *
+   * By default, completed jobs are removed immediately.
+   */
   removeOnComplete?: JobRetention
+
+  /**
+   * Retention policy for failed jobs.
+   *
+   * By default, failed jobs are removed immediately after the failure hooks run.
+   */
   removeOnFail?: JobRetention
 }
 
@@ -345,27 +377,88 @@ export type JobClass<T extends Job = Job> = (new (...args: unknown[]) => T) & {
  */
 export type JobFactory = (JobClass: JobClass) => Job | Promise<Job>
 
+/**
+ * Retry policy used by jobs, queues, or the queue manager.
+ */
 export interface RetryConfig {
+  /**
+   * Number of retry attempts after the first failed execution.
+   *
+   * Set to `0` to disable retries.
+   *
+   * @default 0
+   */
   maxRetries?: number
+
+  /**
+   * Factory that creates the backoff strategy used between retry attempts.
+   *
+   * If omitted, failed jobs are retried as soon as the adapter makes them
+   * available again.
+   */
   backoff?: () => BackoffStrategyClass
 }
 
+/**
+ * Built-in retry delay algorithms.
+ */
 export type BackoffStrategy = 'exponential' | 'linear' | 'fixed'
 
+/**
+ * Configuration for built-in and custom retry backoff strategies.
+ */
 export interface BackoffConfig {
+  /**
+   * Strategy used to compute the delay before the next retry.
+   */
   strategy: BackoffStrategy
+
+  /**
+   * Initial delay used by the strategy.
+   */
   baseDelay: Duration
+
+  /**
+   * Upper bound for computed retry delays.
+   */
   maxDelay?: Duration
+
+  /**
+   * Growth factor for exponential backoff.
+   */
   multiplier?: number
+
+  /**
+   * Whether to randomize retry delays to avoid retry bursts.
+   */
   jitter?: boolean
 }
 
+/**
+ * Runtime configuration for a named queue.
+ */
 export interface QueueConfig {
+  /**
+   * Adapter name used by jobs dispatched to this queue.
+   *
+   * Falls back to the queue manager's default adapter.
+   */
   adapter?: string
+
+  /**
+   * Retry policy applied to jobs in this queue unless overridden by job options.
+   */
   retry?: RetryConfig
+
+  /**
+   * Default job options applied to jobs in this queue unless overridden by the job.
+   */
   defaultJobOptions?: JobOptions
 }
 
+/**
+ * Runtime options for workers that poll queues and execute jobs.
+ */
 export interface WorkerConfig {
   /**
    * Maximum number of jobs to process concurrently.
@@ -422,12 +515,37 @@ export interface WorkerConfig {
   onShutdownSignal?: () => void | Promise<void>
 }
 
+/**
+ * Event yielded by the low-level worker processing generator.
+ */
 export type WorkerCycle =
-  | { type: 'started'; queue: string; job: JobData }
-  | { type: 'completed'; queue: string; job: JobData }
-  | { type: 'idle'; suggestedDelay: Duration }
-  | { type: 'error'; error: Error; suggestedDelay: Duration }
+  | {
+      /** A job was acquired and execution started. */
+      type: 'started'
+      queue: string
+      job: JobData
+    }
+  | {
+      /** A running job finished, either successfully or after failure handling. */
+      type: 'completed'
+      queue: string
+      job: JobData
+    }
+  | {
+      /** No work was available. Consumers should wait before polling again. */
+      type: 'idle'
+      suggestedDelay: Duration
+    }
+  | {
+      /** An unexpected worker loop error occurred. */
+      type: 'error'
+      error: Error
+      suggestedDelay: Duration
+    }
 
+/**
+ * Factory used to lazily create adapter instances.
+ */
 export type AdapterFactory<T extends Adapter = Adapter> = () => T
 
 /**
@@ -533,13 +651,67 @@ export interface ScheduleListOptions {
 }
 
 export interface QueueManagerConfig {
+  /**
+   * Name of the adapter used when a job does not select one explicitly.
+   *
+   * Must match one of the keys from `adapters`.
+   */
   default: string
+
+  /**
+   * Available queue adapters keyed by name.
+   *
+   * Adapters are lazy-instantiated the first time they are used.
+   */
   adapters: Record<string, AdapterFactory>
+
+  /**
+   * Global retry configuration applied to all jobs unless overridden by
+   * queue-level or job-level options.
+   */
   retry?: RetryConfig
+
+  /**
+   * Global job options applied to all jobs unless overridden by queue-level
+   * or job-level options.
+   */
   defaultJobOptions?: JobOptions
+
+  /**
+   * Per-queue configuration keyed by queue name.
+   *
+   * Use this to select adapters or defaults for specific queues.
+   */
   queues?: Record<string, QueueConfig>
+
+  /**
+   * Worker runtime options used by `Worker` instances.
+   */
   worker?: WorkerConfig
+
+  /**
+   * Glob patterns used to discover and register job classes.
+   *
+   * These locations are used by `init()` when `autoLoadJobs` is enabled,
+   * and by `QueueManager.loadJobs()` when called without arguments.
+   */
   locations?: string[]
+
+  /**
+   * Whether `init()` should immediately register jobs from configured locations.
+   *
+   * Framework integrations may disable this to defer job loading until a
+   * command lifecycle is ready, then call `QueueManager.loadJobs()`.
+   *
+   * @default true
+   */
+  autoLoadJobs?: boolean
+
+  /**
+   * Logger used by the queue runtime.
+   *
+   * Defaults to the console logger.
+   */
   logger?: Logger
 
   /**
