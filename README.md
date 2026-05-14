@@ -187,14 +187,16 @@ const { jobId, deduped } = await SaveDraftJob.dispatch({ content: '...' })
 ### How it works
 
 - The dedup ID is automatically prefixed with the job name (`SendInvoiceJob::order-123`), so different job types can reuse the same key.
-- `ttl` accepts a Duration (`'5s'`, `'1m'`) or milliseconds.
+- The user-supplied `id` must be ≤ 400 characters, and the combined `<jobName>::<id>` key must be ≤ 510 characters (constrained by the Knex storage column). Both limits are validated at `.dedup()` time.
+- `ttl` accepts a Duration (`'5s'`, `'1m'`) or milliseconds, and must be **positive** when provided. Use `0` or omit `ttl` if you want no expiry — `ttl: 0` is rejected to avoid an ambiguous "expired immediately vs no-expiry" interpretation across engines.
 - `extend` and `replace` **require** `ttl` — calling them without `ttl` throws.
-- `replace` only applies to jobs in `pending` or `delayed` state. Active (executing) jobs are left alone; the dispatch returns `{ deduped: 'skipped' }`.
-- `replace` swaps the **payload only** — priority, queue, delay, and groupId of the existing job are retained. To change those, use a different dedup id or wait for the TTL to expire.
+- `replace` only applies to jobs in `pending` or `delayed` state. Jobs that are active (executing) or retained in history (`completed`/`failed` with retention) are left alone; the dispatch returns `{ deduped: 'skipped' }`.
+- `replace` swaps the **payload only** — priority, queue, delay, groupId, and stored dedup options of the existing job are retained. To change those, use a different dedup id or wait for the TTL to expire.
+- `extend` resets the TTL clock but never changes the window length. The window length is fixed to the `ttl` from the first dispatch that created the dedup slot. Later dispatches that pass a different `ttl` only reset the clock; their `ttl` value is ignored. To resize the window, let the slot expire and start over with a new dispatch.
 - `retryJob` does not touch the dedup entry — a retried job continues to occupy the dedup slot. TTL runs on wall-clock time, so long-running retries may outlive the TTL window. Use a generous TTL or no TTL if retries must stay deduped.
 - Atomic and race-free:
-  - **Redis**: `SET + PEXPIRE` under a Lua script with `HSETNX`-style guards.
-  - **Knex**: transactional `SELECT ... FOR UPDATE` + insert/update inside a transaction.
+  - **Redis**: a single Lua script per dispatch performs the dedup-key lookup, state check (pending/delayed ZSCORE), payload swap, and TTL refresh atomically.
+  - **Knex**: transactional `SELECT ... FOR UPDATE` + insert/update inside a transaction. A nested savepoint catches unique-constraint violations under concurrent inserts and returns `{ deduped: 'skipped' }` pointing at the winner.
   - **SyncAdapter**: executes inline, no dedup support.
 
 ### Caveats
@@ -204,7 +206,7 @@ const { jobId, deduped } = await SaveDraftJob.dispatch({ content: '...' })
 - Scheduled jobs (`.schedule()`) do not support dedup — each cron/interval fire is an independent dispatch.
 - With no `ttl`, dedup persists until the job is removed (completed/failed without retention). When retention keeps the record, re-dispatch stays blocked until the record is pruned.
 - With `ttl`, dedup expires after the window — a new job (new UUID) is created. The old job still runs.
-- Knex concurrent race: two `pushOn` calls with the same dedup id firing at the exact same instant on Postgres (READ COMMITTED) can both succeed (rare). Serialize at the app layer if strict guarantees are required, or use Redis.
+- Knex MySQL concurrent race: MySQL does not support partial unique indexes, so two `pushOn` calls with the same dedup id firing at the exact same instant can both succeed. Serialize at the app layer if strict guarantees are required, or use Postgres / SQLite / Redis (all of which serialize correctly via the partial unique index or Lua atomicity).
 
 ## Job History & Retention
 

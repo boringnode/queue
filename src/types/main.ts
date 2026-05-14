@@ -151,20 +151,33 @@ export interface JobData {
    * Set automatically when `.dedup()` is called on the dispatcher.
    */
   dedup?: {
-    /** Dedup key, prefixed with the job name (e.g. `SendInvoiceJob::order-123`). */
+    /**
+     * Dedup key, prefixed with the job name (e.g. `SendInvoiceJob::order-123`).
+     * The combined `<jobName>::<id>` length is capped at 510 characters by the
+     * Knex storage column. Dispatcher validates this at `.dedup()` time.
+     */
     id: string
     /**
-     * TTL in milliseconds. When set, dedup lock auto-expires after TTL.
-     * After expiry, the same dedup id produces a brand-new job (coexists with prior).
-     * 0 or undefined = no TTL; dedup lock persists until the job is removed.
+     * TTL in milliseconds (must be positive). When set, dedup lock auto-expires
+     * after TTL. After expiry, the same dedup id produces a brand-new job
+     * (coexists with prior). Omit `ttl` entirely for a no-expiry lock that
+     * persists until the job is removed.
      */
     ttl?: number
-    /** Reset the TTL window when a duplicate arrives within it. */
+    /**
+     * Reset the TTL clock when a duplicate arrives within the window.
+     * The window length stays at the original ttl — passing a different
+     * `ttl` on the duplicating dispatch does not resize the window.
+     */
     extend?: boolean
-    /** Replace payload of the existing non-active job when a duplicate arrives within TTL. */
+    /**
+     * Swap the payload of the existing pending or delayed job when a
+     * duplicate arrives within the TTL window. Active jobs and retained
+     * completed/failed jobs return `'skipped'` without mutation. Only
+     * `payload` is swapped — priority, queue, delay, and groupId of the
+     * existing job are preserved.
+     */
     replace?: boolean
-    /** Timestamp (ms) when this dedup entry was recorded. Set by adapters. */
-    createdAt?: number
   }
 }
 

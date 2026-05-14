@@ -449,7 +449,14 @@ test.group('JobDispatcher | dedup', () => {
   test('should throw when ttl is negative', ({ assert }) => {
     assert.throws(
       () => new JobDispatcher('TestJob', {}).dedup({ id: 'x', ttl: -1 }),
-      'dedup.ttl must be a non-negative duration'
+      'dedup.ttl must be a positive duration'
+    )
+  })
+
+  test('should throw when ttl is zero', ({ assert }) => {
+    assert.throws(
+      () => new JobDispatcher('TestJob', {}).dedup({ id: 'x', ttl: 0 }),
+      'dedup.ttl must be a positive duration'
     )
   })
 
@@ -457,6 +464,14 @@ test.group('JobDispatcher | dedup', () => {
     assert.throws(
       () => new JobDispatcher('TestJob', {}).dedup({ id: 'a'.repeat(401) }),
       'Dedup ID must be 400 characters or less'
+    )
+  })
+
+  test('should throw when job name + dedup id combined exceeds 510 chars', ({ assert }) => {
+    const longJobName = 'A'.repeat(200)
+    assert.throws(
+      () => new JobDispatcher(longJobName, {}).dedup({ id: 'b'.repeat(400) }),
+      /combined with job name exceeds 510 characters/
     )
   })
 

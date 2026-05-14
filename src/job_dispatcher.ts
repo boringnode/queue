@@ -161,17 +161,23 @@ export class JobDispatcher<T> {
    * Modes:
    * - **Simple** (`{ id }`): skip duplicates while the job exists.
    * - **Throttle** (`{ id, ttl }`): skip duplicates within a TTL window.
-   * - **Debounce** (`{ id, ttl, replace: true }`): replace payload of the existing
-   *   non-active job on duplicate within TTL.
-   * - **Extend** (`{ id, ttl, extend: true }`): reset the TTL window on each duplicate.
+   * - **Extend** (`{ id, ttl, extend: true }`): reset the TTL clock on each duplicate.
+   *   The window length stays at the original ttl from the first dispatch.
+   * - **Replace** (`{ id, ttl, replace: true }`): swap the payload of the existing
+   *   pending/delayed job on duplicate within TTL. Active jobs and retained
+   *   completed/failed jobs return `'skipped'`. Only `payload` changes —
+   *   priority/queue/delay/groupId are preserved.
+   * - **Debounce** (`{ id, ttl, replace: true, extend: true }`): replace + reset TTL.
    *
    * The id is automatically prefixed with the job name to prevent collisions
    * between different job types.
    *
    * @param options.id - Unique deduplication key
    * @param options.ttl - TTL as Duration ('5s', 5000). Required for extend/replace.
-   * @param options.extend - Reset TTL on duplicate within window.
-   * @param options.replace - Replace payload of existing non-active job within window.
+   * @param options.extend - Reset the TTL clock on duplicate within window. Window
+   *   length stays at the original ttl; this option's `ttl` arg is ignored on extend.
+   * @param options.replace - Swap payload of existing pending/delayed job within
+   *   window. Active and retained jobs are not modified.
    *
    * @example
    * ```typescript
@@ -197,6 +203,18 @@ export class JobDispatcher<T> {
       throw new Error('Dedup ID must be 400 characters or less')
     }
 
+    // The stored dedup key is `<jobName>::<id>` and must fit within the
+    // adapter storage limit (Knex column is VARCHAR(510)). Reject long
+    // combinations early so the failure surfaces at dispatch time rather
+    // than at insert.
+    const prefixedLength = this.#name.length + 2 + options.id.length
+    if (prefixedLength > 510) {
+      throw new Error(
+        `Dedup ID combined with job name exceeds 510 characters ` +
+          `(got ${prefixedLength}). Shorten either the job name or the dedup id.`
+      )
+    }
+
     if ((options.extend || options.replace) && options.ttl === undefined) {
       throw new Error('dedup.ttl is required when extend or replace is set')
     }
@@ -204,8 +222,8 @@ export class JobDispatcher<T> {
     let parsedTtl: number | undefined
     if (options.ttl !== undefined) {
       parsedTtl = parse(options.ttl)
-      if (!Number.isFinite(parsedTtl) || parsedTtl < 0) {
-        throw new Error('dedup.ttl must be a non-negative duration')
+      if (!Number.isFinite(parsedTtl) || parsedTtl <= 0) {
+        throw new Error('dedup.ttl must be a positive duration')
       }
     }
 

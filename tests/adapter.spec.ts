@@ -312,6 +312,37 @@ test.group('Adapter | Redis', (group) => {
       await inspectorConnection.quit()
     }
   })
+
+  test('dedup replace should return skipped when stored job_data is malformed JSON', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+    const queue = 'malformed-dedup-queue'
+    const dataKey = `jobs::${queue}::data`
+
+    await adapter.pushOn(queue, {
+      id: 'malformed-uuid-1',
+      name: 'TestJob',
+      payload: { version: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::malformed-1', ttl: 10_000, replace: true },
+    })
+
+    await connection.hset(dataKey, 'malformed-uuid-1', '{not valid json')
+
+    const second = await adapter.pushOn(queue, {
+      id: 'malformed-uuid-2',
+      name: 'TestJob',
+      payload: { version: 2 },
+      attempts: 0,
+      dedup: { id: 'TestJob::malformed-1', ttl: 10_000, replace: true },
+    })
+    assert.equal(second && typeof second === 'object' && second.outcome, 'skipped')
+    assert.equal(second && typeof second === 'object' && second.jobId, 'malformed-uuid-1')
+
+    const stored = await connection.hget(dataKey, 'malformed-uuid-1')
+    assert.equal(stored, '{not valid json')
+  })
 })
 
 test.group('Adapter | Knex (SQLite)', (group) => {

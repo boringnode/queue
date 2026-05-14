@@ -44,7 +44,15 @@ const PUSH_JOB_SCRIPT = `
  * - If dedup key exists but job data missing (orphan): proceed to insert new.
  * - If TTL expired or no prior entry: insert new job, record dedup key with TTL.
  *
- * Replace only applies to non-active (pending/delayed) jobs. Active jobs are skipped.
+ * Replace only applies to jobs in pending or delayed state. Active and
+ * retained completed/failed jobs are left untouched (returns 'skipped').
+ * Replace swaps the payload only — priority/queue/delay/groupId/dedup
+ * options of the existing job are preserved.
+ *
+ * Extend uses the ORIGINAL ttl recorded on the existing job (stored in
+ * its dedup field), not the ttl arg of the current dispatch. Matches
+ * Knex/Fake behavior: extend resets the clock but never changes the
+ * window length.
  *
  * Returns {outcome, job_id}: outcome ∈ 'added' | 'skipped' | 'replaced' | 'extended'.
  */
@@ -52,7 +60,7 @@ const PUSH_DEDUP_JOB_SCRIPT = `
   local data_key = KEYS[1]
   local pending_key = KEYS[2]
   local dedup_key = KEYS[3]
-  local active_key = KEYS[4]
+  local delayed_key = KEYS[4]
   local job_id = ARGV[1]
   local job_data = ARGV[2]
   local score = tonumber(ARGV[3])
@@ -62,23 +70,30 @@ const PUSH_DEDUP_JOB_SCRIPT = `
 
   local existing = redis.call('GET', dedup_key)
   if existing then
-    local has_data = redis.call('HEXISTS', data_key, existing) == 1
-    if has_data then
-      local is_active = redis.call('HEXISTS', active_key, existing) == 1
-      if replace == 1 and not is_active then
-        local ok, parsed = pcall(cjson.decode, job_data)
-        if ok and parsed then
-          parsed.id = existing
-          job_data = cjson.encode(parsed)
-        end
-        redis.call('HSET', data_key, existing, job_data)
-        if extend == 1 and ttl > 0 then
-          redis.call('PEXPIRE', dedup_key, ttl)
-        end
-        return {'replaced', existing}
+    local existing_data = redis.call('HGET', data_key, existing)
+    if existing_data then
+      local in_pending = redis.call('ZSCORE', pending_key, existing)
+      local in_delayed = redis.call('ZSCORE', delayed_key, existing)
+      local replaceable = in_pending or in_delayed
+      local ok_e, existing_job = pcall(cjson.decode, existing_data)
+      local original_ttl = nil
+      if ok_e and type(existing_job) == 'table' and existing_job.dedup then
+        original_ttl = tonumber(existing_job.dedup.ttl)
       end
-      if extend == 1 and ttl > 0 then
-        redis.call('PEXPIRE', dedup_key, ttl)
+      if replace == 1 and replaceable then
+        local ok_n, new_job = pcall(cjson.decode, job_data)
+        if ok_e and ok_n and existing_job and new_job then
+          existing_job.payload = new_job.payload
+          redis.call('HSET', data_key, existing, cjson.encode(existing_job))
+          if extend == 1 and original_ttl and original_ttl > 0 then
+            redis.call('PEXPIRE', dedup_key, original_ttl)
+          end
+          return {'replaced', existing}
+        end
+        return {'skipped', existing}
+      end
+      if extend == 1 and original_ttl and original_ttl > 0 then
+        redis.call('PEXPIRE', dedup_key, original_ttl)
         return {'extended', existing}
       end
       return {'skipped', existing}
@@ -119,7 +134,7 @@ const PUSH_DEDUP_DELAYED_JOB_SCRIPT = `
   local data_key = KEYS[1]
   local delayed_key = KEYS[2]
   local dedup_key = KEYS[3]
-  local active_key = KEYS[4]
+  local pending_key = KEYS[4]
   local job_id = ARGV[1]
   local job_data = ARGV[2]
   local execute_at = tonumber(ARGV[3])
@@ -129,23 +144,30 @@ const PUSH_DEDUP_DELAYED_JOB_SCRIPT = `
 
   local existing = redis.call('GET', dedup_key)
   if existing then
-    local has_data = redis.call('HEXISTS', data_key, existing) == 1
-    if has_data then
-      local is_active = redis.call('HEXISTS', active_key, existing) == 1
-      if replace == 1 and not is_active then
-        local ok, parsed = pcall(cjson.decode, job_data)
-        if ok and parsed then
-          parsed.id = existing
-          job_data = cjson.encode(parsed)
-        end
-        redis.call('HSET', data_key, existing, job_data)
-        if extend == 1 and ttl > 0 then
-          redis.call('PEXPIRE', dedup_key, ttl)
-        end
-        return {'replaced', existing}
+    local existing_data = redis.call('HGET', data_key, existing)
+    if existing_data then
+      local in_pending = redis.call('ZSCORE', pending_key, existing)
+      local in_delayed = redis.call('ZSCORE', delayed_key, existing)
+      local replaceable = in_pending or in_delayed
+      local ok_e, existing_job = pcall(cjson.decode, existing_data)
+      local original_ttl = nil
+      if ok_e and type(existing_job) == 'table' and existing_job.dedup then
+        original_ttl = tonumber(existing_job.dedup.ttl)
       end
-      if extend == 1 and ttl > 0 then
-        redis.call('PEXPIRE', dedup_key, ttl)
+      if replace == 1 and replaceable then
+        local ok_n, new_job = pcall(cjson.decode, job_data)
+        if ok_e and ok_n and existing_job and new_job then
+          existing_job.payload = new_job.payload
+          redis.call('HSET', data_key, existing, cjson.encode(existing_job))
+          if extend == 1 and original_ttl and original_ttl > 0 then
+            redis.call('PEXPIRE', dedup_key, original_ttl)
+          end
+          return {'replaced', existing}
+        end
+        return {'skipped', existing}
+      end
+      if extend == 1 and original_ttl and original_ttl > 0 then
+        redis.call('PEXPIRE', dedup_key, original_ttl)
         return {'extended', existing}
       end
       return {'skipped', existing}
@@ -790,7 +812,7 @@ export class RedisAdapter implements Adapter {
         keys.data,
         keys.delayed,
         dedupKey,
-        keys.active,
+        keys.pending,
         jobData.id,
         JSON.stringify(jobData),
         executeAt.toString(),
@@ -826,7 +848,7 @@ export class RedisAdapter implements Adapter {
         keys.data,
         keys.pending,
         dedupKey,
-        keys.active,
+        keys.delayed,
         jobData.id,
         JSON.stringify(jobData),
         score.toString(),

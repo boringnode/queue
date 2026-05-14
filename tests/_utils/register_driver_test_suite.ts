@@ -1995,4 +1995,193 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       /dedup is not supported in batch dispatch/
     )
   })
+
+  test('dedup TTL: old pending job still runs after TTL expiry, new dispatch adds as new entry', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('ttl-keep-queue', {
+      id: 'keep-uuid-1',
+      name: 'TestJob',
+      payload: { n: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::keep-1', ttl: 50 },
+    })
+
+    await new Promise((r) => setTimeout(r, 120))
+
+    const second = await adapter.pushOn('ttl-keep-queue', {
+      id: 'keep-uuid-2',
+      name: 'TestJob',
+      payload: { n: 2 },
+      attempts: 0,
+      dedup: { id: 'TestJob::keep-1', ttl: 50 },
+    })
+    assert.equal(second && typeof second === 'object' && second.outcome, 'added')
+    assert.equal(second && typeof second === 'object' && second.jobId, 'keep-uuid-2')
+
+    assert.equal(await adapter.sizeOf('ttl-keep-queue'), 2)
+
+    const first = await adapter.popFrom('ttl-keep-queue')
+    assert.equal(first!.id, 'keep-uuid-1')
+    assert.deepEqual(first!.payload, { n: 1 })
+
+    const next = await adapter.popFrom('ttl-keep-queue')
+    assert.equal(next!.id, 'keep-uuid-2')
+    assert.deepEqual(next!.payload, { n: 2 })
+  })
+
+  test('dedup replace: preserves priority and groupId of the existing job', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('rep-preserve-queue', {
+      id: 'preserve-uuid-1',
+      name: 'TestJob',
+      payload: { version: 1 },
+      attempts: 0,
+      priority: 1,
+      groupId: 'group-a',
+      dedup: { id: 'TestJob::preserve-1', ttl: 10_000, replace: true },
+    })
+
+    const second = await adapter.pushOn('rep-preserve-queue', {
+      id: 'preserve-uuid-2',
+      name: 'TestJob',
+      payload: { version: 2 },
+      attempts: 0,
+      priority: 9,
+      dedup: { id: 'TestJob::preserve-1', ttl: 10_000, replace: true },
+    })
+    assert.equal(second && typeof second === 'object' && second.outcome, 'replaced')
+    assert.equal(second && typeof second === 'object' && second.jobId, 'preserve-uuid-1')
+
+    const record = await adapter.getJob('preserve-uuid-1', 'rep-preserve-queue')
+    assert.isNotNull(record)
+    assert.deepEqual(record!.data.payload, { version: 2 })
+    assert.equal(record!.data.priority, 1)
+    assert.equal(record!.data.groupId, 'group-a')
+  })
+
+  test('dedup replace: leaves retained completed jobs untouched, returns skipped', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('rep-retain-queue', {
+      id: 'retain-uuid-1',
+      name: 'TestJob',
+      payload: { version: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::retain-1', ttl: 10_000, replace: true },
+    })
+
+    const popped = await adapter.popFrom('rep-retain-queue')
+    await adapter.completeJob(popped!.id, 'rep-retain-queue', false)
+
+    const second = await adapter.pushOn('rep-retain-queue', {
+      id: 'retain-uuid-2',
+      name: 'TestJob',
+      payload: { version: 2 },
+      attempts: 0,
+      dedup: { id: 'TestJob::retain-1', ttl: 10_000, replace: true },
+    })
+    assert.equal(second && typeof second === 'object' && second.outcome, 'skipped')
+    assert.equal(second && typeof second === 'object' && second.jobId, 'retain-uuid-1')
+
+    const record = await adapter.getJob('retain-uuid-1', 'rep-retain-queue')
+    assert.isNotNull(record)
+    assert.deepEqual(record!.data.payload, { version: 1 })
+  })
+
+  test('dedup extend: window length stays the original ttl even when later dispatches pass a different ttl', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('extend-original-queue', {
+      id: 'extend-orig-uuid-1',
+      name: 'TestJob',
+      payload: { n: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::extend-orig-1', ttl: 100, extend: true },
+    })
+
+    await new Promise((r) => setTimeout(r, 50))
+
+    const second = await adapter.pushOn('extend-original-queue', {
+      id: 'extend-orig-uuid-2',
+      name: 'TestJob',
+      payload: { n: 2 },
+      attempts: 0,
+      dedup: { id: 'TestJob::extend-orig-1', ttl: 5000, extend: true },
+    })
+    assert.equal(second && typeof second === 'object' && second.outcome, 'extended')
+
+    // 150ms after the reset (T50). Original 100ms window expired at T150.
+    // If the engine were honoring the new 5000ms ttl, the slot would still
+    // be alive and this dispatch would return 'extended'.
+    await new Promise((r) => setTimeout(r, 200))
+
+    const third = await adapter.pushOn('extend-original-queue', {
+      id: 'extend-orig-uuid-3',
+      name: 'TestJob',
+      payload: { n: 3 },
+      attempts: 0,
+      dedup: { id: 'TestJob::extend-orig-1', ttl: 100, extend: true },
+    })
+    assert.equal(third && typeof third === 'object' && third.outcome, 'added')
+    assert.equal(third && typeof third === 'object' && third.jobId, 'extend-orig-uuid-3')
+  })
+
+  test('dedup debounce: replace + extend swaps payload and resets the TTL window', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('debounce-queue', {
+      id: 'debounce-uuid-1',
+      name: 'TestJob',
+      payload: { version: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::debounce-1', ttl: 200, extend: true, replace: true },
+    })
+
+    await new Promise((r) => setTimeout(r, 120))
+
+    const second = await adapter.pushOn('debounce-queue', {
+      id: 'debounce-uuid-2',
+      name: 'TestJob',
+      payload: { version: 2 },
+      attempts: 0,
+      dedup: { id: 'TestJob::debounce-1', ttl: 200, extend: true, replace: true },
+    })
+    assert.equal(second && typeof second === 'object' && second.outcome, 'replaced')
+    assert.equal(second && typeof second === 'object' && second.jobId, 'debounce-uuid-1')
+
+    const midRecord = await adapter.getJob('debounce-uuid-1', 'debounce-queue')
+    assert.deepEqual(midRecord!.data.payload, { version: 2 })
+
+    // 240ms total elapsed > original 200ms TTL, but the second dispatch reset
+    // the window at T=120. Only 120ms into the new window → still alive.
+    await new Promise((r) => setTimeout(r, 120))
+
+    const third = await adapter.pushOn('debounce-queue', {
+      id: 'debounce-uuid-3',
+      name: 'TestJob',
+      payload: { version: 3 },
+      attempts: 0,
+      dedup: { id: 'TestJob::debounce-1', ttl: 200, extend: true, replace: true },
+    })
+    assert.equal(third && typeof third === 'object' && third.outcome, 'replaced')
+    assert.equal(third && typeof third === 'object' && third.jobId, 'debounce-uuid-1')
+
+    const finalRecord = await adapter.getJob('debounce-uuid-1', 'debounce-queue')
+    assert.deepEqual(finalRecord!.data.payload, { version: 3 })
+  })
 }
