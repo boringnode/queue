@@ -193,6 +193,8 @@ const { jobId, deduped } = await SaveDraftJob.dispatch({ content: '...' })
 - `replace` only applies to jobs in `pending` or `delayed` state. Jobs that are active (executing) or retained in history (`completed`/`failed` with retention) are left alone; the dispatch returns `{ deduped: 'skipped' }`.
 - `replace` swaps the **payload only** — priority, queue, delay, groupId, and stored dedup options of the existing job are retained. To change those, use a different dedup id or wait for the TTL to expire.
 - `extend` resets the TTL clock but never changes the window length. The window length is fixed to the `ttl` from the first dispatch that created the dedup slot. Later dispatches that pass a different `ttl` only reset the clock; their `ttl` value is ignored. To resize the window, let the slot expire and start over with a new dispatch.
+- `extend` works in **all states** — even when the existing job is `active` (executing) or retained in history. Unlike `replace` (which is no-op on non-replaceable states), `extend` always refreshes the dedup TTL window. Use this when you want the dedup slot to keep blocking new dispatches for the lifetime of a long-running job.
+- `extend` requires the **first** dispatch to have set a `ttl`. If the slot was created without a `ttl`, later `extend` dispatches have no window to refresh and return `{ deduped: 'skipped' }` instead of `'extended'`.
 - `retryJob` does not touch the dedup entry — a retried job continues to occupy the dedup slot. TTL runs on wall-clock time, so long-running retries may outlive the TTL window. Use a generous TTL or no TTL if retries must stay deduped.
 - Atomic and race-free:
   - **Redis**: a single Lua script per dispatch performs the dedup-key lookup, state check (pending/delayed ZSCORE), payload swap, and TTL refresh atomically.
@@ -202,6 +204,7 @@ const { jobId, deduped } = await SaveDraftJob.dispatch({ content: '...' })
 ### Caveats
 
 - Without `.dedup()`, jobs use auto-generated UUIDs and are never deduplicated.
+- The **Sync adapter** ignores `.dedup()` entirely — every dispatch executes inline and `deduped` is always `undefined` on the result. Use Redis or Knex if you need real deduplication.
 - `.dedup()` is only available on single dispatch. `dispatchMany` / `pushManyOn` reject jobs with a `dedup` field.
 - Scheduled jobs (`.schedule()`) do not support dedup — each cron/interval fire is an independent dispatch.
 - With no `ttl`, dedup persists until the job is removed (completed/failed without retention). When retention keeps the record, re-dispatch stays blocked until the record is pruned.

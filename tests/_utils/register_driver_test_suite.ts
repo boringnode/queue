@@ -2184,4 +2184,131 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const finalRecord = await adapter.getJob('debounce-uuid-1', 'debounce-queue')
     assert.deepEqual(finalRecord!.data.payload, { version: 3 })
   })
+
+  test('dedup replace: returns skipped when existing job is already active (in-flight)', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('active-rep-queue', {
+      id: 'active-rep-uuid-1',
+      name: 'TestJob',
+      payload: { version: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::active-rep-1', ttl: 10_000, replace: true },
+    })
+
+    // Move job to active state — worker has popped it.
+    const popped = await adapter.popFrom('active-rep-queue')
+    assert.equal(popped!.id, 'active-rep-uuid-1')
+
+    const second = await adapter.pushOn('active-rep-queue', {
+      id: 'active-rep-uuid-2',
+      name: 'TestJob',
+      payload: { version: 2 },
+      attempts: 0,
+      dedup: { id: 'TestJob::active-rep-1', ttl: 10_000, replace: true },
+    })
+
+    assert.equal(second && typeof second === 'object' && second.outcome, 'skipped')
+    assert.equal(second && typeof second === 'object' && second.jobId, 'active-rep-uuid-1')
+
+    // Payload must not be swapped while job is in-flight.
+    assert.deepEqual(popped!.payload, { version: 1 })
+  })
+
+  test('dedup extend: refreshes TTL even when existing job is already active (in-flight)', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('active-ext-queue', {
+      id: 'active-ext-uuid-1',
+      name: 'TestJob',
+      payload: { n: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::active-ext-1', ttl: 200, extend: true },
+    })
+
+    // Move to active mid-window.
+    await new Promise((r) => setTimeout(r, 80))
+    const popped = await adapter.popFrom('active-ext-queue')
+    assert.equal(popped!.id, 'active-ext-uuid-1')
+
+    // Extend against an in-flight job — implementation refreshes the dedup TTL
+    // even though the existing job is active (not replaceable).
+    const second = await adapter.pushOn('active-ext-queue', {
+      id: 'active-ext-uuid-2',
+      name: 'TestJob',
+      payload: { n: 2 },
+      attempts: 0,
+      dedup: { id: 'TestJob::active-ext-1', ttl: 200, extend: true },
+    })
+    assert.equal(second && typeof second === 'object' && second.outcome, 'extended')
+    assert.equal(second && typeof second === 'object' && second.jobId, 'active-ext-uuid-1')
+
+    // Without the extend, the slot would have expired by now (80 + 150 > 200).
+    // With the extend at T=80, the window restarted; at T=230 only 150ms into
+    // new window → still blocking.
+    await new Promise((r) => setTimeout(r, 150))
+
+    const third = await adapter.pushOn('active-ext-queue', {
+      id: 'active-ext-uuid-3',
+      name: 'TestJob',
+      payload: { n: 3 },
+      attempts: 0,
+      dedup: { id: 'TestJob::active-ext-1', ttl: 200, extend: true },
+    })
+    assert.equal(third && typeof third === 'object' && third.outcome, 'extended')
+    assert.equal(third && typeof third === 'object' && third.jobId, 'active-ext-uuid-1')
+  })
+
+  test('dedup: concurrent pushOn with same id - only one wins, rest skipped', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    const dispatches = Array.from({ length: 5 }, (_, i) =>
+      adapter.pushOn('concurrent-dedup-queue', {
+        id: `concurrent-uuid-${i}`,
+        name: 'TestJob',
+        payload: { n: i },
+        attempts: 0,
+        dedup: { id: 'TestJob::concurrent-1' },
+      })
+    )
+
+    const results = await Promise.all(dispatches)
+    const outcomes = results.map((r) =>
+      r && typeof r === 'object' ? r.outcome : undefined
+    )
+
+    assert.equal(
+      outcomes.filter((o) => o === 'added').length,
+      1,
+      `Expected exactly one 'added' outcome, got ${JSON.stringify(outcomes)}`
+    )
+    assert.equal(
+      outcomes.filter((o) => o === 'skipped').length,
+      4,
+      `Expected four 'skipped' outcomes, got ${JSON.stringify(outcomes)}`
+    )
+
+    const size = await adapter.sizeOf('concurrent-dedup-queue')
+    assert.equal(size, 1)
+
+    // All skipped results must point at the same winner job id.
+    const winners = results
+      .filter((r) => r && typeof r === 'object' && r.outcome === 'added')
+      .map((r) => (r as { jobId: string }).jobId)
+    const skippedJobIds = results
+      .filter((r) => r && typeof r === 'object' && r.outcome === 'skipped')
+      .map((r) => (r as { jobId: string }).jobId)
+    for (const id of skippedJobIds) {
+      assert.equal(id, winners[0], 'skipped dispatch should reference the winning job id')
+    }
+  })
 }

@@ -343,6 +343,52 @@ test.group('Adapter | Redis', (group) => {
     const stored = await connection.hget(dataKey, 'malformed-uuid-1')
     assert.equal(stored, '{not valid json')
   })
+
+  test('dedup: orphan dedup pointer is reclaimed when job data is missing', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+    const queue = 'orphan-dedup-queue'
+    const dataKey = `jobs::${queue}::data`
+    const dedupKey = `jobs::${queue}::dedup::TestJob::orphan-1`
+
+    await adapter.pushOn(queue, {
+      id: 'orphan-uuid-1',
+      name: 'TestJob',
+      payload: { version: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::orphan-1' },
+    })
+
+    // Simulate the pointer outliving the job data (e.g. an external pruner
+    // removes the hash entry and pending ZSET entry while the dedup key has
+    // not expired yet). The dedup pointer remains pointing at a vanished id.
+    const pendingKey = `jobs::${queue}::pending`
+    await connection.hdel(dataKey, 'orphan-uuid-1')
+    await connection.zrem(pendingKey, 'orphan-uuid-1')
+
+    const before = await connection.get(dedupKey)
+    assert.equal(before, 'orphan-uuid-1', 'dedup pointer should still reference the orphaned id')
+
+    // A fresh dispatch should treat the orphan pointer as reclaimable and add
+    // a new job, repointing the dedup key to the new winner.
+    const second = await adapter.pushOn(queue, {
+      id: 'orphan-uuid-2',
+      name: 'TestJob',
+      payload: { version: 2 },
+      attempts: 0,
+      dedup: { id: 'TestJob::orphan-1' },
+    })
+
+    assert.equal(second && typeof second === 'object' && second.outcome, 'added')
+    assert.equal(second && typeof second === 'object' && second.jobId, 'orphan-uuid-2')
+
+    const after = await connection.get(dedupKey)
+    assert.equal(after, 'orphan-uuid-2', 'dedup pointer should be reclaimed for the new job')
+
+    const size = await adapter.sizeOf(queue)
+    assert.equal(size, 1)
+  })
 })
 
 test.group('Adapter | Knex (SQLite)', (group) => {
