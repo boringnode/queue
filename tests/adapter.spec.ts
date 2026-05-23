@@ -722,4 +722,91 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       await connection.raw(`DROP FUNCTION IF EXISTS ${barrierFunction}()`)
     }
   })
+
+  test('retryJob should not violate dedup unique index after active TTL expires', async ({
+    assert,
+  }) => {
+    const knexAdapter = new KnexAdapter({ connection, tableName, schedulesTableName })
+    knexAdapter.setWorkerId('worker-1')
+
+    const queue = 'pg-expired-active-retry-dedup-queue'
+    const dedupId = 'TestJob::pg-expired-active-retry'
+
+    await knexAdapter.pushOn(queue, {
+      id: 'pg-expired-active-retry-uuid-1',
+      name: 'TestJob',
+      payload: { n: 1 },
+      attempts: 0,
+      dedup: { id: dedupId, ttl: 30 },
+    })
+
+    const first = await knexAdapter.popFrom(queue)
+    assert.equal(first!.id, 'pg-expired-active-retry-uuid-1')
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const second = await knexAdapter.pushOn(queue, {
+      id: 'pg-expired-active-retry-uuid-2',
+      name: 'TestJob',
+      payload: { n: 2 },
+      attempts: 0,
+      dedup: { id: dedupId, ttl: 30 },
+    })
+
+    assert.equal(second && typeof second === 'object' && second.outcome, 'added')
+
+    await knexAdapter.retryJob(first!.id, queue)
+
+    const availableJobs = [await knexAdapter.popFrom(queue), await knexAdapter.popFrom(queue)]
+    const availableIds = availableJobs.map((job) => job?.id).sort()
+
+    assert.deepEqual(availableIds, [
+      'pg-expired-active-retry-uuid-1',
+      'pg-expired-active-retry-uuid-2',
+    ])
+  })
+
+  test('recoverStalledJobs should not violate dedup unique index after active TTL expires', async ({
+    assert,
+  }) => {
+    const knexAdapter = new KnexAdapter({ connection, tableName, schedulesTableName })
+    knexAdapter.setWorkerId('worker-1')
+
+    const queue = 'pg-expired-active-stalled-dedup-queue'
+    const dedupId = 'TestJob::pg-expired-active-stalled'
+
+    await knexAdapter.pushOn(queue, {
+      id: 'pg-expired-active-stalled-uuid-1',
+      name: 'TestJob',
+      payload: { n: 1 },
+      attempts: 0,
+      dedup: { id: dedupId, ttl: 30 },
+    })
+
+    const first = await knexAdapter.popFrom(queue)
+    assert.equal(first!.id, 'pg-expired-active-stalled-uuid-1')
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const second = await knexAdapter.pushOn(queue, {
+      id: 'pg-expired-active-stalled-uuid-2',
+      name: 'TestJob',
+      payload: { n: 2 },
+      attempts: 0,
+      dedup: { id: dedupId, ttl: 30 },
+    })
+
+    assert.equal(second && typeof second === 'object' && second.outcome, 'added')
+
+    const recovered = await knexAdapter.recoverStalledJobs(queue, 1, 1)
+    assert.equal(recovered, 1)
+
+    const availableJobs = [await knexAdapter.popFrom(queue), await knexAdapter.popFrom(queue)]
+    const availableIds = availableJobs.map((job) => job?.id).sort()
+
+    assert.deepEqual(availableIds, [
+      'pg-expired-active-stalled-uuid-1',
+      'pg-expired-active-stalled-uuid-2',
+    ])
+  })
 })

@@ -486,7 +486,7 @@ export class KnexAdapter implements Adapter {
         // its dedup identity is cleared. Retained history rows are excluded
         // from the partial unique index predicate, so no update needed there.
         const status = existing.status as JobStatus
-        if (status === 'pending' || status === 'delayed') {
+        if (status === 'pending' || status === 'delayed' || status === 'active') {
           await trx(this.#jobsTable)
             .where({ id: existing.id, queue })
             .update({ dedup_id: null, dedup_at: null, dedup_ttl: null })
