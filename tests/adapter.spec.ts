@@ -99,6 +99,9 @@ test.group('Adapter | Redis', (group) => {
       await adapter.updateSchedule(id, { nextRunAt: futureRunAt })
     }
 
+    // Warm the due-index backfill so it doesn't count against the spy
+    await adapter.claimDueSchedule()
+
     const { result: claimed, writes } = await withRedisWriteSpy({
       connection,
       run: () => adapter.claimDueSchedule(),

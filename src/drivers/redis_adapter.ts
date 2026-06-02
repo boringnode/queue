@@ -480,6 +480,7 @@ export class RedisAdapter implements Adapter {
   readonly #connection: Redis
   readonly #ownsConnection: boolean
   #workerId: string = ''
+  #dueIndexReady = false
 
   constructor(connection: Redis, ownsConnection: boolean = false) {
     this.#connection = connection
@@ -862,7 +863,15 @@ export class RedisAdapter implements Adapter {
       .exec()
   }
 
+  async #ensureDueIndex(): Promise<void> {
+    if (this.#dueIndexReady) return
+    await this.backfillDueIndex()
+    this.#dueIndexReady = true
+  }
+
   async claimDueSchedule(): Promise<ScheduleData | null> {
+    await this.#ensureDueIndex()
+
     const now = Date.now()
     const result = await this.#connection.eval(
       CLAIM_SCHEDULE_SCRIPT,
