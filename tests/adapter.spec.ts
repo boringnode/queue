@@ -416,6 +416,194 @@ test.group('Adapter | Redis', (group) => {
     const size = await adapter.sizeOf(queue)
     assert.equal(size, 1)
   })
+
+  test('retryJob should keep retrying legacy jobs without Redis metadata', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+    adapter.setWorkerId('worker-1')
+    const queue = 'legacy-retry-empty-array-payload-queue'
+
+    await adapter.pushOn(queue, {
+      id: 'legacy-retry-empty-array-uuid-1',
+      name: 'TestJob',
+      payload: {
+        empty: [],
+      },
+      attempts: 2,
+    })
+
+    const first = await adapter.popFrom(queue)
+    await adapter.retryJob(first!.id, queue)
+
+    const retried = await adapter.popFrom(queue)
+
+    assert.deepEqual(retried!.payload, {
+      empty: [],
+    })
+    assert.equal(retried!.attempts, 3)
+  })
+
+  test('retained Redis jobs keep metadata-backed payload overrides', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+    adapter.setWorkerId('worker-1')
+    const queue = 'metadata-retained-replace-queue'
+    const metadataKey = `jobs::${queue}::metadata`
+
+    await adapter.pushOn(queue, {
+      id: 'metadata-retained-uuid-1',
+      name: 'TestJob',
+      payload: { version: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::metadata-retained-1', ttl: 10_000, replace: true },
+    })
+
+    await adapter.pushOn(queue, {
+      id: 'metadata-retained-uuid-2',
+      name: 'TestJob',
+      payload: {
+        version: 2,
+        empty: [],
+      },
+      attempts: 0,
+      dedup: { id: 'TestJob::metadata-retained-1', ttl: 10_000, replace: true },
+    })
+
+    assert.exists(await connection.hget(metadataKey, 'metadata-retained-uuid-1'))
+
+    const job = await adapter.popFrom(queue)
+    await adapter.completeJob(job!.id, queue, false)
+
+    const record = await adapter.getJob('metadata-retained-uuid-1', queue)
+
+    assert.exists(await connection.hget(metadataKey, 'metadata-retained-uuid-1'))
+    assert.deepEqual(record!.data.payload, {
+      version: 2,
+      empty: [],
+    })
+  })
+
+  test('Redis metadata is removed when a job is completed without retention', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+    adapter.setWorkerId('worker-1')
+    const queue = 'metadata-clean-complete-queue'
+    const metadataKey = `jobs::${queue}::metadata`
+
+    await adapter.pushOn(queue, {
+      id: 'metadata-clean-uuid-1',
+      name: 'TestJob',
+      payload: { version: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::metadata-clean-1', ttl: 10_000, replace: true },
+    })
+
+    await adapter.pushOn(queue, {
+      id: 'metadata-clean-uuid-2',
+      name: 'TestJob',
+      payload: { version: 2 },
+      attempts: 0,
+      dedup: { id: 'TestJob::metadata-clean-1', ttl: 10_000, replace: true },
+    })
+
+    assert.exists(await connection.hget(metadataKey, 'metadata-clean-uuid-1'))
+
+    const job = await adapter.popFrom(queue)
+    await adapter.completeJob(job!.id, queue, true)
+
+    assert.isNull(await connection.hget(metadataKey, 'metadata-clean-uuid-1'))
+  })
+
+  test('Redis metadata is removed when retained history pruning removes a job', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+    adapter.setWorkerId('worker-1')
+    const queue = 'metadata-prune-history-queue'
+    const metadataKey = `jobs::${queue}::metadata`
+
+    await adapter.pushOn(queue, {
+      id: 'metadata-prune-uuid-1',
+      name: 'TestJob',
+      payload: { version: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::metadata-prune-1', ttl: 10_000, replace: true },
+    })
+
+    await adapter.pushOn(queue, {
+      id: 'metadata-prune-uuid-2',
+      name: 'TestJob',
+      payload: { version: 2 },
+      attempts: 0,
+      dedup: { id: 'TestJob::metadata-prune-1', ttl: 10_000, replace: true },
+    })
+
+    assert.exists(await connection.hget(metadataKey, 'metadata-prune-uuid-1'))
+
+    const first = await adapter.popFrom(queue)
+    await adapter.completeJob(first!.id, queue, { count: 1 })
+
+    await new Promise((resolve) => setTimeout(resolve, 5))
+
+    await adapter.pushOn(queue, {
+      id: 'metadata-prune-uuid-3',
+      name: 'TestJob',
+      payload: { version: 3 },
+      attempts: 0,
+      dedup: { id: 'TestJob::metadata-prune-2', ttl: 10_000, replace: true },
+    })
+
+    await adapter.pushOn(queue, {
+      id: 'metadata-prune-uuid-4',
+      name: 'TestJob',
+      payload: { version: 4 },
+      attempts: 0,
+      dedup: { id: 'TestJob::metadata-prune-2', ttl: 10_000, replace: true },
+    })
+
+    assert.exists(await connection.hget(metadataKey, 'metadata-prune-uuid-3'))
+
+    const second = await adapter.popFrom(queue)
+    await adapter.completeJob(second!.id, queue, { count: 1 })
+
+    assert.isNull(await connection.hget(metadataKey, 'metadata-prune-uuid-1'))
+    assert.exists(await connection.hget(metadataKey, 'metadata-prune-uuid-3'))
+  })
+
+  test('Redis metadata is removed when stalled recovery drops a permanently stalled job', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+    adapter.setWorkerId('worker-1')
+    const queue = 'metadata-stalled-clean-queue'
+    const metadataKey = `jobs::${queue}::metadata`
+
+    await adapter.pushOn(queue, {
+      id: 'metadata-stalled-uuid-1',
+      name: 'TestJob',
+      payload: { version: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::metadata-stalled-1', ttl: 10_000, replace: true },
+    })
+
+    await adapter.pushOn(queue, {
+      id: 'metadata-stalled-uuid-2',
+      name: 'TestJob',
+      payload: { version: 2 },
+      attempts: 0,
+      dedup: { id: 'TestJob::metadata-stalled-1', ttl: 10_000, replace: true },
+    })
+
+    assert.exists(await connection.hget(metadataKey, 'metadata-stalled-uuid-1'))
+
+    await adapter.popFrom(queue)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    const recovered = await adapter.recoverStalledJobs(queue, 10, 0)
+
+    assert.equal(recovered, 0)
+    assert.isNull(await connection.hget(metadataKey, 'metadata-stalled-uuid-1'))
+    assert.isNull(await adapter.getJob('metadata-stalled-uuid-1', queue))
+  })
 })
 
 test.group('Adapter | Knex (SQLite)', (group) => {

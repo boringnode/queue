@@ -13,6 +13,12 @@ import type {
   ScheduleListOptions,
 } from '../types/main.js'
 import { resolveRetention } from '../utils.js'
+import {
+  encodeRedisJobPayloadOverlay,
+  hydrateRedisJob,
+  REDIS_DEDUP_LUA,
+  REDIS_JOB_STORAGE_LUA,
+} from './redis_job_storage.js'
 
 const redisKey = 'jobs'
 const schedulesKey = 'schedules'
@@ -26,11 +32,14 @@ type RedisConfig = Redis | RedisOptions
 const PUSH_JOB_SCRIPT = `
   local data_key = KEYS[1]
   local pending_key = KEYS[2]
+  local overlay_key = KEYS[3]
   local job_id = ARGV[1]
   local job_data = ARGV[2]
   local score = tonumber(ARGV[3])
 
-  redis.call('HSET', data_key, job_id, job_data)
+${REDIS_JOB_STORAGE_LUA}
+
+  store_job_data(data_key, overlay_key, job_id, job_data)
   redis.call('ZADD', pending_key, score, job_id)
 
   return 1
@@ -58,50 +67,39 @@ const PUSH_JOB_SCRIPT = `
  */
 const PUSH_DEDUP_JOB_SCRIPT = `
   local data_key = KEYS[1]
-  local pending_key = KEYS[2]
+  local target_key = KEYS[2]
   local dedup_key = KEYS[3]
-  local delayed_key = KEYS[4]
+  local other_state_key = KEYS[4]
+  local overlay_key = KEYS[5]
   local job_id = ARGV[1]
   local job_data = ARGV[2]
   local score = tonumber(ARGV[3])
   local ttl = tonumber(ARGV[4])
   local extend = tonumber(ARGV[5])
   local replace = tonumber(ARGV[6])
+  local payload_data = ARGV[7]
+  local payload_is_undefined = tonumber(ARGV[8])
 
-  local existing = redis.call('GET', dedup_key)
-  if existing then
-    local existing_data = redis.call('HGET', data_key, existing)
-    if existing_data then
-      local in_pending = redis.call('ZSCORE', pending_key, existing)
-      local in_delayed = redis.call('ZSCORE', delayed_key, existing)
-      local replaceable = in_pending or in_delayed
-      local ok_e, existing_job = pcall(cjson.decode, existing_data)
-      local original_ttl = nil
-      if ok_e and type(existing_job) == 'table' and existing_job.dedup then
-        original_ttl = tonumber(existing_job.dedup.ttl)
-      end
-      if replace == 1 and replaceable then
-        local ok_n, new_job = pcall(cjson.decode, job_data)
-        if ok_e and ok_n and existing_job and new_job then
-          existing_job.payload = new_job.payload
-          redis.call('HSET', data_key, existing, cjson.encode(existing_job))
-          if extend == 1 and original_ttl and original_ttl > 0 then
-            redis.call('PEXPIRE', dedup_key, original_ttl)
-          end
-          return {'replaced', existing}
-        end
-        return {'skipped', existing}
-      end
-      if extend == 1 and original_ttl and original_ttl > 0 then
-        redis.call('PEXPIRE', dedup_key, original_ttl)
-        return {'extended', existing}
-      end
-      return {'skipped', existing}
-    end
+${REDIS_JOB_STORAGE_LUA}
+${REDIS_DEDUP_LUA}
+
+  local existing_result = resolve_dedup_existing_job(
+    data_key,
+    target_key,
+    other_state_key,
+    overlay_key,
+    dedup_key,
+    extend,
+    replace,
+    payload_data,
+    payload_is_undefined
+  )
+  if existing_result then
+    return existing_result
   end
 
-  redis.call('HSET', data_key, job_id, job_data)
-  redis.call('ZADD', pending_key, score, job_id)
+  store_job_data(data_key, overlay_key, job_id, job_data)
+  redis.call('ZADD', target_key, score, job_id)
   redis.call('SET', dedup_key, job_id)
   if ttl > 0 then
     redis.call('PEXPIRE', dedup_key, ttl)
@@ -116,71 +114,17 @@ const PUSH_DEDUP_JOB_SCRIPT = `
 const PUSH_DELAYED_JOB_SCRIPT = `
   local data_key = KEYS[1]
   local delayed_key = KEYS[2]
+  local overlay_key = KEYS[3]
   local job_id = ARGV[1]
   local job_data = ARGV[2]
   local execute_at = tonumber(ARGV[3])
 
-  redis.call('HSET', data_key, job_id, job_data)
+${REDIS_JOB_STORAGE_LUA}
+
+  store_job_data(data_key, overlay_key, job_id, job_data)
   redis.call('ZADD', delayed_key, execute_at, job_id)
 
   return 1
-`
-
-/**
- * Lua script for pushing a dedup delayed job.
- * Same semantics as PUSH_DEDUP_JOB_SCRIPT but adds to delayed ZSET.
- */
-const PUSH_DEDUP_DELAYED_JOB_SCRIPT = `
-  local data_key = KEYS[1]
-  local delayed_key = KEYS[2]
-  local dedup_key = KEYS[3]
-  local pending_key = KEYS[4]
-  local job_id = ARGV[1]
-  local job_data = ARGV[2]
-  local execute_at = tonumber(ARGV[3])
-  local ttl = tonumber(ARGV[4])
-  local extend = tonumber(ARGV[5])
-  local replace = tonumber(ARGV[6])
-
-  local existing = redis.call('GET', dedup_key)
-  if existing then
-    local existing_data = redis.call('HGET', data_key, existing)
-    if existing_data then
-      local in_pending = redis.call('ZSCORE', pending_key, existing)
-      local in_delayed = redis.call('ZSCORE', delayed_key, existing)
-      local replaceable = in_pending or in_delayed
-      local ok_e, existing_job = pcall(cjson.decode, existing_data)
-      local original_ttl = nil
-      if ok_e and type(existing_job) == 'table' and existing_job.dedup then
-        original_ttl = tonumber(existing_job.dedup.ttl)
-      end
-      if replace == 1 and replaceable then
-        local ok_n, new_job = pcall(cjson.decode, job_data)
-        if ok_e and ok_n and existing_job and new_job then
-          existing_job.payload = new_job.payload
-          redis.call('HSET', data_key, existing, cjson.encode(existing_job))
-          if extend == 1 and original_ttl and original_ttl > 0 then
-            redis.call('PEXPIRE', dedup_key, original_ttl)
-          end
-          return {'replaced', existing}
-        end
-        return {'skipped', existing}
-      end
-      if extend == 1 and original_ttl and original_ttl > 0 then
-        redis.call('PEXPIRE', dedup_key, original_ttl)
-        return {'extended', existing}
-      end
-      return {'skipped', existing}
-    end
-  end
-
-  redis.call('HSET', data_key, job_id, job_data)
-  redis.call('ZADD', delayed_key, execute_at, job_id)
-  redis.call('SET', dedup_key, job_id)
-  if ttl > 0 then
-    redis.call('PEXPIRE', dedup_key, ttl)
-  end
-  return {'added', job_id}
 `
 
 /**
@@ -195,8 +139,11 @@ const ACQUIRE_JOB_SCRIPT = `
   local pending_key = KEYS[2]
   local active_key = KEYS[3]
   local delayed_key = KEYS[4]
+  local overlay_key = KEYS[5]
   local worker_id = ARGV[1]
   local now = tonumber(ARGV[2])
+
+${REDIS_JOB_STORAGE_LUA}
 
   -- Process delayed jobs: move ready jobs to pending
   local ready_job_ids = redis.call('ZRANGEBYSCORE', delayed_key, 0, now)
@@ -233,10 +180,9 @@ const ACQUIRE_JOB_SCRIPT = `
   })
   redis.call('HSET', active_key, job_id, active_data)
 
-  -- Return job with acquiredAt
-  local job = cjson.decode(job_data)
-  job.acquiredAt = now
-  return cjson.encode(job)
+  return encode_job_result(job_data, overlay_key, job_id, {
+    acquiredAt = now
+  })
 `
 
 /**
@@ -246,8 +192,11 @@ const ACQUIRE_JOB_SCRIPT = `
 const REMOVE_JOB_SCRIPT = `
   local data_key = KEYS[1]
   local active_key = KEYS[2]
+  local overlay_key = KEYS[3]
   local job_id = ARGV[1]
   local dedup_prefix = ARGV[2]
+
+${REDIS_JOB_STORAGE_LUA}
 
   if redis.call('HEXISTS', active_key, job_id) == 0 then
     return 0
@@ -266,7 +215,7 @@ const REMOVE_JOB_SCRIPT = `
   end
 
   redis.call('HDEL', active_key, job_id)
-  redis.call('HDEL', data_key, job_id)
+  delete_job_data(data_key, overlay_key, job_id)
 
   return 1
 `
@@ -281,12 +230,15 @@ const FINALIZE_JOB_SCRIPT = `
   local active_key = KEYS[2]
   local history_key = KEYS[3]
   local index_key = KEYS[4]
+  local overlay_key = KEYS[5]
   local job_id = ARGV[1]
   local now = tonumber(ARGV[2])
   local max_age = tonumber(ARGV[3])
   local max_count = tonumber(ARGV[4])
   local error_message = ARGV[5]
   local dedup_prefix = ARGV[6]
+
+${REDIS_JOB_STORAGE_LUA}
 
   -- Verify job is active
   if redis.call('HEXISTS', active_key, job_id) == 0 then
@@ -330,7 +282,7 @@ const FINALIZE_JOB_SCRIPT = `
       delete_dedup_for(expired)
       redis.call('ZREM', index_key, unpack(expired))
       redis.call('HDEL', history_key, unpack(expired))
-      redis.call('HDEL', data_key, unpack(expired))
+      delete_jobs_data(data_key, overlay_key, expired)
     end
   end
 
@@ -344,7 +296,7 @@ const FINALIZE_JOB_SCRIPT = `
         delete_dedup_for(stale)
         redis.call('ZREM', index_key, unpack(stale))
         redis.call('HDEL', history_key, unpack(stale))
-        redis.call('HDEL', data_key, unpack(stale))
+        delete_jobs_data(data_key, overlay_key, stale)
       end
     end
   end
@@ -364,9 +316,12 @@ const RETRY_JOB_SCRIPT = `
   local active_key = KEYS[2]
   local pending_key = KEYS[3]
   local delayed_key = KEYS[4]
+  local overlay_key = KEYS[5]
   local job_id = ARGV[1]
   local retry_at = tonumber(ARGV[2])
   local now = tonumber(ARGV[3])
+
+${REDIS_JOB_STORAGE_LUA}
 
   -- Verify job is active
   if redis.call('HEXISTS', active_key, job_id) == 0 then
@@ -382,10 +337,11 @@ const RETRY_JOB_SCRIPT = `
   -- Remove from active
   redis.call('HDEL', active_key, job_id)
 
-  -- Increment attempts and update data
+  -- Increment attempts without rewriting opaque job JSON.
   local job = cjson.decode(job_data)
-  job.attempts = (job.attempts or 0) + 1
-  redis.call('HSET', data_key, job_id, cjson.encode(job))
+  local overlay = read_job_overlay(overlay_key, job_id)
+  overlay.attempts = (overlay.attempts or job.attempts or 0) + 1
+  write_job_overlay(overlay_key, job_id, overlay)
 
   -- Add back to pending or delayed
   if retry_at and retry_at > now then
@@ -412,10 +368,13 @@ const RECOVER_STALLED_JOBS_SCRIPT = `
   local data_key = KEYS[1]
   local active_key = KEYS[2]
   local pending_key = KEYS[3]
+  local overlay_key = KEYS[4]
   local now = tonumber(ARGV[1])
   local stalled_threshold = tonumber(ARGV[2])
   local max_stalled_count = tonumber(ARGV[3])
   local dedup_prefix = ARGV[4]
+
+${REDIS_JOB_STORAGE_LUA}
 
   local recovered = 0
   local stalled_cutoff = now - stalled_threshold
@@ -434,7 +393,8 @@ const RECOVER_STALLED_JOBS_SCRIPT = `
       local job_data = redis.call('HGET', data_key, job_id)
       if job_data then
         local job = cjson.decode(job_data)
-        local current_stalled_count = job.stalledCount or 0
+        local overlay = read_job_overlay(overlay_key, job_id)
+        local current_stalled_count = overlay.stalledCount or job.stalledCount or 0
 
         -- Remove from active hash
         redis.call('HDEL', active_key, job_id)
@@ -448,11 +408,11 @@ const RECOVER_STALLED_JOBS_SCRIPT = `
               redis.call('DEL', dkey)
             end
           end
-          redis.call('HDEL', data_key, job_id)
+          delete_job_data(data_key, overlay_key, job_id)
         else
-          -- Recover: increment stalledCount and put back in pending
-          job.stalledCount = current_stalled_count + 1
-          redis.call('HSET', data_key, job_id, cjson.encode(job))
+          -- Recover: increment stalledCount without rewriting opaque job JSON.
+          overlay.stalledCount = current_stalled_count + 1
+          write_job_overlay(overlay_key, job_id, overlay)
           -- Score = priority * 1e13 + timestamp
           local priority = job.priority or 5
           local score = priority * 10000000000000 + now
@@ -476,7 +436,10 @@ const GET_JOB_SCRIPT = `
   local active_key = KEYS[4]
   local completed_key = KEYS[5]
   local failed_key = KEYS[6]
+  local overlay_key = KEYS[7]
   local job_id = ARGV[1]
+
+${REDIS_JOB_STORAGE_LUA}
 
   local job_data = redis.call('HGET', data_key, job_id)
   if not job_data then
@@ -515,9 +478,8 @@ const GET_JOB_SCRIPT = `
     return nil
   end
 
-  return cjson.encode({
+  return encode_job_result(job_data, overlay_key, job_id, {
     status = status,
-    data = cjson.decode(job_data),
     finishedAt = finished_at,
     error = error_msg
   })
@@ -641,6 +603,7 @@ export class RedisAdapter implements Adapter {
       pending: `${redisKey}::${queue}::pending`,
       delayed: `${redisKey}::${queue}::delayed`,
       active: `${redisKey}::${queue}::active`,
+      overlay: `${redisKey}::${queue}::metadata`,
       completed: `${redisKey}::${queue}::completed`,
       completedIndex: `${redisKey}::${queue}::completed::index`,
       failed: `${redisKey}::${queue}::failed`,
@@ -676,11 +639,12 @@ export class RedisAdapter implements Adapter {
 
     const result = await this.#connection.eval(
       ACQUIRE_JOB_SCRIPT,
-      4,
+      5,
       keys.data,
       keys.pending,
       keys.active,
       keys.delayed,
+      keys.overlay,
       this.#workerId,
       now.toString()
     )
@@ -689,7 +653,13 @@ export class RedisAdapter implements Adapter {
       return null
     }
 
-    return JSON.parse(result as string)
+    const { data, overlay, acquiredAt } = JSON.parse(result as string) as {
+      data: string
+      overlay?: string
+      acquiredAt: number
+    }
+
+    return { ...hydrateRedisJob(data, overlay), acquiredAt }
   }
 
   async completeJob(jobId: string, queue: string, removeOnComplete?: JobRetention): Promise<void> {
@@ -698,17 +668,26 @@ export class RedisAdapter implements Adapter {
     const { keep, maxAge, maxCount } = resolveRetention(removeOnComplete)
 
     if (!keep) {
-      await this.#connection.eval(REMOVE_JOB_SCRIPT, 2, keys.data, keys.active, jobId, dedupPrefix)
+      await this.#connection.eval(
+        REMOVE_JOB_SCRIPT,
+        3,
+        keys.data,
+        keys.active,
+        keys.overlay,
+        jobId,
+        dedupPrefix
+      )
       return
     }
 
     await this.#connection.eval(
       FINALIZE_JOB_SCRIPT,
-      4,
+      5,
       keys.data,
       keys.active,
       keys.completed,
       keys.completedIndex,
+      keys.overlay,
       jobId,
       Date.now().toString(),
       maxAge.toString(),
@@ -729,17 +708,26 @@ export class RedisAdapter implements Adapter {
     const { keep, maxAge, maxCount } = resolveRetention(removeOnFail)
 
     if (!keep) {
-      await this.#connection.eval(REMOVE_JOB_SCRIPT, 2, keys.data, keys.active, jobId, dedupPrefix)
+      await this.#connection.eval(
+        REMOVE_JOB_SCRIPT,
+        3,
+        keys.data,
+        keys.active,
+        keys.overlay,
+        jobId,
+        dedupPrefix
+      )
       return
     }
 
     await this.#connection.eval(
       FINALIZE_JOB_SCRIPT,
-      4,
+      5,
       keys.data,
       keys.active,
       keys.failed,
       keys.failedIndex,
+      keys.overlay,
       jobId,
       Date.now().toString(),
       maxAge.toString(),
@@ -755,11 +743,12 @@ export class RedisAdapter implements Adapter {
 
     await this.#connection.eval(
       RETRY_JOB_SCRIPT,
-      4,
+      5,
       keys.data,
       keys.active,
       keys.pending,
       keys.delayed,
+      keys.overlay,
       jobId,
       retryAt ? retryAt.getTime().toString() : '0',
       now.toString()
@@ -771,13 +760,14 @@ export class RedisAdapter implements Adapter {
 
     const result = await this.#connection.eval(
       GET_JOB_SCRIPT,
-      6,
+      7,
       keys.data,
       keys.pending,
       keys.delayed,
       keys.active,
       keys.completed,
       keys.failed,
+      keys.overlay,
       jobId
     )
 
@@ -785,7 +775,12 @@ export class RedisAdapter implements Adapter {
       return null
     }
 
-    return JSON.parse(result as string)
+    const record = JSON.parse(result as string) as Omit<JobRecord, 'data'> & {
+      data: string
+      overlay?: string
+    }
+
+    return { ...record, data: hydrateRedisJob(record.data, record.overlay) }
   }
 
   push(jobData: JobData): Promise<PushResult | void> {
@@ -802,28 +797,33 @@ export class RedisAdapter implements Adapter {
 
     if (jobData.dedup) {
       const dedupKey = this.#getDedupKey(queue, jobData.dedup.id)
+      const [payloadData, payloadIsUndefined] = encodeRedisJobPayloadOverlay(jobData.payload)
       const result = (await this.#connection.eval(
-        PUSH_DEDUP_DELAYED_JOB_SCRIPT,
-        4,
+        PUSH_DEDUP_JOB_SCRIPT,
+        5,
         keys.data,
         keys.delayed,
         dedupKey,
         keys.pending,
+        keys.overlay,
         jobData.id,
         JSON.stringify(jobData),
         executeAt.toString(),
         (jobData.dedup.ttl ?? 0).toString(),
         jobData.dedup.extend ? '1' : '0',
-        jobData.dedup.replace ? '1' : '0'
+        jobData.dedup.replace ? '1' : '0',
+        payloadData,
+        payloadIsUndefined
       )) as [string, string]
       return { outcome: result[0] as DedupOutcome, jobId: result[1] }
     }
 
     await this.#connection.eval(
       PUSH_DELAYED_JOB_SCRIPT,
-      2,
+      3,
       keys.data,
       keys.delayed,
+      keys.overlay,
       jobData.id,
       JSON.stringify(jobData),
       executeAt.toString()
@@ -838,28 +838,33 @@ export class RedisAdapter implements Adapter {
 
     if (jobData.dedup) {
       const dedupKey = this.#getDedupKey(queue, jobData.dedup.id)
+      const [payloadData, payloadIsUndefined] = encodeRedisJobPayloadOverlay(jobData.payload)
       const result = (await this.#connection.eval(
         PUSH_DEDUP_JOB_SCRIPT,
-        4,
+        5,
         keys.data,
         keys.pending,
         dedupKey,
         keys.delayed,
+        keys.overlay,
         jobData.id,
         JSON.stringify(jobData),
         score.toString(),
         (jobData.dedup.ttl ?? 0).toString(),
         jobData.dedup.extend ? '1' : '0',
-        jobData.dedup.replace ? '1' : '0'
+        jobData.dedup.replace ? '1' : '0',
+        payloadData,
+        payloadIsUndefined
       )) as [string, string]
       return { outcome: result[0] as DedupOutcome, jobId: result[1] }
     }
 
     await this.#connection.eval(
       PUSH_JOB_SCRIPT,
-      2,
+      3,
       keys.data,
       keys.pending,
+      keys.overlay,
       jobData.id,
       JSON.stringify(jobData),
       score.toString()
@@ -884,6 +889,7 @@ export class RedisAdapter implements Adapter {
     for (const job of jobs) {
       const priority = job.priority ?? DEFAULT_PRIORITY
       const score = calculateScore(priority, now)
+      multi.hdel(keys.overlay, job.id)
       multi.hset(keys.data, job.id, JSON.stringify(job))
       multi.zadd(keys.pending, score, job.id)
     }
@@ -910,10 +916,11 @@ export class RedisAdapter implements Adapter {
 
     const recovered = await this.#connection.eval(
       RECOVER_STALLED_JOBS_SCRIPT,
-      3,
+      4,
       keys.data,
       keys.active,
       keys.pending,
+      keys.overlay,
       now.toString(),
       stalledThreshold.toString(),
       maxStalledCount.toString(),

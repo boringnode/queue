@@ -516,6 +516,38 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.deepEqual(nextJob!.payload, { foo: 'bar' })
   })
 
+  test('recoverStalledJobs should preserve empty arrays in the payload', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('test-queue', {
+      id: 'job-stalled-empty-array-payload',
+      name: 'TestJob',
+      payload: {
+        empty: [],
+        nested: {
+          items: [],
+        },
+      },
+      attempts: 0,
+      stalledCount: 0,
+    })
+
+    await adapter.popFrom('test-queue')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await adapter.recoverStalledJobs('test-queue', 10, 3)
+
+    const recovered = await adapter.popFrom('test-queue')
+
+    assert.deepEqual(recovered!.payload, {
+      empty: [],
+      nested: {
+        items: [],
+      },
+    })
+    assert.equal(recovered!.stalledCount, 1)
+  })
+
   test('recoverStalledJobs should increment stalledCount', async ({ assert }) => {
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')
@@ -1041,6 +1073,36 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     record = await adapter.getJob('job-retry-lifecycle', 'test-queue')
     assert.equal(record!.status, 'failed')
     assert.equal(record!.error, 'max retries')
+  })
+
+  test('retryJob should preserve empty arrays in the payload', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('test-queue', {
+      id: 'job-retry-empty-array-payload',
+      name: 'TestJob',
+      payload: {
+        empty: [],
+        nested: {
+          items: [],
+        },
+      },
+      attempts: 0,
+    })
+
+    const first = await adapter.popFrom('test-queue')
+    await adapter.retryJob(first!.id, 'test-queue')
+
+    const retried = await adapter.popFrom('test-queue')
+
+    assert.deepEqual(retried!.payload, {
+      empty: [],
+      nested: {
+        items: [],
+      },
+    })
+    assert.equal(retried!.attempts, 1)
   })
 
   test('delayed job becomes available after delay', async ({ assert }) => {
@@ -1677,6 +1739,25 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.deepEqual(job!.payload, { attempt: 1 })
   })
 
+  test('pushOn with dedup should accept an undefined payload', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('test-queue', {
+      id: 'dedup-undefined-payload',
+      name: 'TestJob',
+      payload: undefined,
+      attempts: 0,
+      dedup: { id: 'undefined-payload', ttl: 10_000 },
+    })
+
+    const job = await adapter.popFrom('test-queue')
+
+    assert.isNotNull(job)
+    assert.equal(job!.id, 'dedup-undefined-payload')
+    assert.isUndefined(job!.payload)
+  })
+
   test('pushOn without dedup should insert normally', async ({ assert }) => {
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')
@@ -1857,6 +1938,150 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const job = await adapter.popFrom('rep-queue')
     assert.equal(job!.id, 'rep-uuid-1')
     assert.deepEqual(job!.payload, { version: 2 })
+  })
+
+  test('dedup replace: accepts an undefined replacement payload', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('rep-undefined-queue', {
+      id: 'rep-undefined-uuid-1',
+      name: 'TestJob',
+      payload: { version: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::rep-undefined-1', ttl: 10_000, replace: true },
+    })
+
+    const second = await adapter.pushOn('rep-undefined-queue', {
+      id: 'rep-undefined-uuid-2',
+      name: 'TestJob',
+      payload: undefined,
+      attempts: 0,
+      dedup: { id: 'TestJob::rep-undefined-1', ttl: 10_000, replace: true },
+    })
+
+    const job = await adapter.popFrom('rep-undefined-queue')
+
+    assert.equal(second && typeof second === 'object' && second.outcome, 'replaced')
+    assert.equal(second && typeof second === 'object' && second.jobId, 'rep-undefined-uuid-1')
+    assert.isUndefined(job!.payload)
+  })
+
+  test('dedup replace: preserves empty arrays in the replacement payload', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('rep-empty-array-queue', {
+      id: 'rep-empty-array-uuid-1',
+      name: 'TestJob',
+      payload: {
+        version: 1,
+      },
+      attempts: 0,
+      priority: 1,
+      dedup: { id: 'TestJob::rep-empty-array-1', ttl: 10_000, replace: true },
+    })
+
+    const second = await adapter.pushOn('rep-empty-array-queue', {
+      id: 'rep-empty-array-uuid-2',
+      name: 'TestJob',
+      payload: {
+        empty: [],
+        nested: {
+          items: [],
+        },
+      },
+      attempts: 0,
+      priority: 9,
+      dedup: { id: 'TestJob::rep-empty-array-1', ttl: 10_000, replace: true },
+    })
+
+    const record = await adapter.getJob('rep-empty-array-uuid-1', 'rep-empty-array-queue')
+    const popped = await adapter.popFrom('rep-empty-array-queue')
+
+    assert.equal(second && typeof second === 'object' && second.outcome, 'replaced')
+    assert.equal(second && typeof second === 'object' && second.jobId, 'rep-empty-array-uuid-1')
+    assert.deepEqual(record!.data.payload, {
+      empty: [],
+      nested: {
+        items: [],
+      },
+    })
+    assert.deepEqual(popped!.payload, record!.data.payload)
+    assert.equal(popped!.priority, 1)
+  })
+
+  test('dedup replace: retry keeps replacement payload and increments attempts', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('rep-retry-queue', {
+      id: 'rep-retry-uuid-1',
+      name: 'TestJob',
+      payload: { version: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::rep-retry-1', ttl: 10_000, replace: true },
+    })
+
+    await adapter.pushOn('rep-retry-queue', {
+      id: 'rep-retry-uuid-2',
+      name: 'TestJob',
+      payload: {
+        version: 2,
+        empty: [],
+      },
+      attempts: 0,
+      dedup: { id: 'TestJob::rep-retry-1', ttl: 10_000, replace: true },
+    })
+
+    const first = await adapter.popFrom('rep-retry-queue')
+    await adapter.retryJob(first!.id, 'rep-retry-queue')
+
+    const retried = await adapter.popFrom('rep-retry-queue')
+
+    assert.equal(retried!.id, 'rep-retry-uuid-1')
+    assert.deepEqual(retried!.payload, {
+      version: 2,
+      empty: [],
+    })
+    assert.equal(retried!.attempts, 1)
+  })
+
+  test('dedup replace: retained completed job keeps replacement payload', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('rep-history-queue', {
+      id: 'rep-history-uuid-1',
+      name: 'TestJob',
+      payload: { version: 1 },
+      attempts: 0,
+      dedup: { id: 'TestJob::rep-history-1', ttl: 10_000, replace: true },
+    })
+
+    await adapter.pushOn('rep-history-queue', {
+      id: 'rep-history-uuid-2',
+      name: 'TestJob',
+      payload: {
+        version: 2,
+        empty: [],
+      },
+      attempts: 0,
+      dedup: { id: 'TestJob::rep-history-1', ttl: 10_000, replace: true },
+    })
+
+    const job = await adapter.popFrom('rep-history-queue')
+    await adapter.completeJob(job!.id, 'rep-history-queue', false)
+
+    const record = await adapter.getJob('rep-history-uuid-1', 'rep-history-queue')
+
+    assert.equal(record!.status, 'completed')
+    assert.deepEqual(record!.data.payload, {
+      version: 2,
+      empty: [],
+    })
   })
 
   test('dedup extend: duplicate within TTL resets the window', async ({ assert }) => {
