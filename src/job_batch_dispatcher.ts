@@ -165,7 +165,6 @@ export class JobBatchDispatcher<T> {
 
     const message: JobDispatchMessage = { jobs, queue: this.#queue }
 
-
     await dispatchChannel.tracePromise(async () => {
       await wrapInternal(() => adapter.pushManyOn(this.#queue, jobs))
     }, message)

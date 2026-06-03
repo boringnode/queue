@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { CronExpressionParser } from 'cron-parser'
-import type { Adapter, AcquiredJob } from '../contracts/adapter.js'
+import type { Adapter, AcquiredJob, PushResult } from '../contracts/adapter.js'
 import type {
   JobData,
   JobClass,
@@ -15,6 +15,14 @@ import type {
 import { DEFAULT_PRIORITY } from '../constants.js'
 import { parse } from '../utils.js'
 import { Job } from '../job.js'
+
+interface DedupEntry {
+  jobId: string
+  createdAt: number
+  ttl?: number
+  replace?: boolean
+  extend?: boolean
+}
 
 interface ActiveJob {
   job: JobData
@@ -71,6 +79,7 @@ export class FakeAdapter implements Adapter {
   #pendingTimeouts = new Set<NodeJS.Timeout>()
   #schedules = new Map<string, ScheduleData>()
   #pushedJobs: FakeJobRecord[] = []
+  #dedupIndex = new Map<string, Map<string, DedupEntry>>()
   #onDispose?: () => void
 
   /**
@@ -116,6 +125,7 @@ export class FakeAdapter implements Adapter {
     this.#failedJobs.clear()
     this.#schedules.clear()
     this.#pushedJobs = []
+    this.#dedupIndex.clear()
   }
 
   assertPushed(matcher: FakeJobMatcher, query?: FakeJobQuery): void {
@@ -155,24 +165,36 @@ export class FakeAdapter implements Adapter {
     return jobs.length
   }
 
-  async push(jobData: JobData): Promise<void> {
+  async push(jobData: JobData): Promise<PushResult | void> {
     return this.pushOn('default', jobData)
   }
 
-  async pushOn(queue: string, jobData: JobData): Promise<void> {
+  async pushOn(queue: string, jobData: JobData): Promise<PushResult | void> {
+    const deduped = await this.#applyDedup(queue, jobData)
+    if (deduped) return deduped
+
     this.#recordPush(queue, jobData)
     this.#enqueue(queue, jobData)
+
+    if (jobData.dedup) {
+      return { outcome: 'added', jobId: jobData.id }
+    }
   }
 
-  async pushLater(jobData: JobData, delay: number): Promise<void> {
+  async pushLater(jobData: JobData, delay: number): Promise<PushResult | void> {
     return this.pushLaterOn('default', jobData, delay)
   }
 
-  pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<void> {
+  async pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<PushResult | void> {
+    const deduped = await this.#applyDedup(queue, jobData)
+    if (deduped) return deduped
+
     this.#recordPush(queue, jobData, delay)
     this.#schedulePush(queue, jobData, delay)
 
-    return Promise.resolve()
+    if (jobData.dedup) {
+      return { outcome: 'added', jobId: jobData.id }
+    }
   }
 
   async pushMany(jobs: JobData[]): Promise<void> {
@@ -180,6 +202,10 @@ export class FakeAdapter implements Adapter {
   }
 
   async pushManyOn(queue: string, jobs: JobData[]): Promise<void> {
+    if (jobs.some((j) => j.dedup)) {
+      throw new Error('dedup is not supported in batch dispatch; use single dispatch')
+    }
+
     for (const job of jobs) {
       await this.pushOn(queue, job)
     }
@@ -226,6 +252,7 @@ export class FakeAdapter implements Adapter {
     this.#activeJobs.delete(jobId)
 
     if (removeOnComplete === undefined || removeOnComplete === true) {
+      this.#cleanupDedupForJob(queue, active.job)
       return
     }
 
@@ -244,6 +271,7 @@ export class FakeAdapter implements Adapter {
     this.#activeJobs.delete(jobId)
 
     if (removeOnFail === undefined || removeOnFail === true) {
+      this.#cleanupDedupForJob(queue, active.job)
       return
     }
 
@@ -298,6 +326,7 @@ export class FakeAdapter implements Adapter {
       if (currentStalledCount >= maxStalledCount) {
         // Fail permanently - just remove from active
         this.#activeJobs.delete(jobId)
+        this.#cleanupDedupForJob(active.queue, active.job)
         continue
       }
 
@@ -526,26 +555,131 @@ export class FakeAdapter implements Adapter {
     records.push(record)
 
     if (retention && retention !== true) {
-      this.#applyRetention(records, retention)
+      this.#applyRetention(records, retention, queue)
     }
   }
 
-  #applyRetention(records: JobRecord[], retention: JobRetention) {
+  #applyRetention(records: JobRecord[], retention: JobRetention, queue: string) {
     if (retention === false || retention === true) {
       return
     }
+
+    const pruned: JobRecord[] = []
 
     if (retention.age !== undefined) {
       const maxAgeMs = parse(retention.age)
       if (maxAgeMs > 0) {
         const cutoff = Date.now() - maxAgeMs
-        const filtered = records.filter((record) => (record.finishedAt ?? 0) >= cutoff)
-        records.splice(0, records.length, ...filtered)
+        const kept: JobRecord[] = []
+        for (const record of records) {
+          if ((record.finishedAt ?? 0) >= cutoff) {
+            kept.push(record)
+          } else {
+            pruned.push(record)
+          }
+        }
+        records.splice(0, records.length, ...kept)
       }
     }
 
     if (retention.count !== undefined && retention.count > 0 && records.length > retention.count) {
-      records.splice(0, records.length - retention.count)
+      const excess = records.length - retention.count
+      pruned.push(...records.slice(0, excess))
+      records.splice(0, excess)
+    }
+
+    for (const record of pruned) {
+      this.#cleanupDedupForJob(queue, record.data)
+    }
+  }
+
+  #applyDedup(queue: string, jobData: JobData): PushResult | null {
+    if (!jobData.dedup) return null
+
+    const dedupId = jobData.dedup.id
+    const now = Date.now()
+    const entry = this.#getDedupEntry(queue, dedupId)
+
+    if (entry) {
+      const withinTtl = !entry.ttl || now - entry.createdAt < entry.ttl
+      if (withinTtl) {
+        const existing = this.#findJobById(queue, entry.jobId)
+        if (existing) {
+          const replaceable = existing.location === 'pending' || existing.location === 'delayed'
+          if (jobData.dedup.replace && replaceable) {
+            existing.job.payload = structuredClone(jobData.payload)
+            if (jobData.dedup.extend && entry.ttl) {
+              entry.createdAt = now
+            }
+            return { outcome: 'replaced', jobId: entry.jobId }
+          }
+          if (jobData.dedup.extend && entry.ttl) {
+            entry.createdAt = now
+            return { outcome: 'extended', jobId: entry.jobId }
+          }
+          return { outcome: 'skipped', jobId: entry.jobId }
+        }
+      }
+    }
+
+    this.#setDedupEntry(queue, dedupId, {
+      jobId: jobData.id,
+      createdAt: now,
+      ttl: jobData.dedup.ttl,
+      replace: jobData.dedup.replace,
+      extend: jobData.dedup.extend,
+    })
+
+    return null
+  }
+
+  #findJobById(
+    queue: string,
+    jobId: string
+  ): {
+    job: JobData
+    location: 'pending' | 'delayed' | 'active' | 'completed' | 'failed'
+  } | null {
+    const active = this.#activeJobs.get(jobId)
+    if (active && active.queue === queue) {
+      return { job: active.job, location: 'active' }
+    }
+    const pending = this.#queues.get(queue)?.find((j) => j.id === jobId)
+    if (pending) {
+      return { job: pending, location: 'pending' }
+    }
+    const delayed = this.#delayedJobs.get(queue)?.get(jobId)
+    if (delayed) {
+      return { job: delayed.job, location: 'delayed' }
+    }
+    const completed = this.#findHistory(this.#completedJobs, queue, jobId)
+    if (completed) {
+      return { job: completed.data, location: 'completed' }
+    }
+    const failed = this.#findHistory(this.#failedJobs, queue, jobId)
+    if (failed) {
+      return { job: failed.data, location: 'failed' }
+    }
+    return null
+  }
+
+  #getDedupEntry(queue: string, dedupId: string): DedupEntry | undefined {
+    return this.#dedupIndex.get(queue)?.get(dedupId)
+  }
+
+  #setDedupEntry(queue: string, dedupId: string, entry: DedupEntry): void {
+    if (!this.#dedupIndex.has(queue)) {
+      this.#dedupIndex.set(queue, new Map())
+    }
+    this.#dedupIndex.get(queue)!.set(dedupId, entry)
+  }
+
+  #cleanupDedupForJob(queue: string, job: JobData): void {
+    if (!job.dedup) return
+    const entry = this.#getDedupEntry(queue, job.dedup.id)
+    // Only delete if the entry points to THIS job (replace may have re-pointed it elsewhere)
+    if (entry && entry.jobId === job.id) {
+      this.#dedupIndex.get(queue)?.delete(job.dedup.id)
     }
   }
 

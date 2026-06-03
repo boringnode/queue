@@ -91,6 +91,64 @@ test.group('FakeAdapter', () => {
     await adapter.destroy()
   })
 
+  test('should skip duplicate pushOn when dedup is set', async ({ assert }) => {
+    const adapter = fake()()
+
+    await adapter.pushOn('default', {
+      id: 'TestJob::order-1',
+      name: 'TestJob',
+      payload: { attempt: 1 },
+      attempts: 0,
+      dedup: { id: 'order-1' },
+    })
+
+    await adapter.pushOn('default', {
+      id: 'TestJob::order-1',
+      name: 'TestJob',
+      payload: { attempt: 2 },
+      attempts: 0,
+      dedup: { id: 'order-1' },
+    })
+
+    const size = await adapter.size()
+    assert.equal(size, 1)
+    adapter.assertPushedCount(1)
+
+    await adapter.destroy()
+  })
+
+  test('should skip duplicate pushLaterOn when dedup is set', async () => {
+    const adapter = fake()()
+
+    await adapter.pushLaterOn(
+      'default',
+      {
+        id: 'TestJob::delayed-1',
+        name: 'TestJob',
+        payload: { attempt: 1 },
+        attempts: 0,
+        dedup: { id: 'delayed-1' },
+      },
+      5000
+    )
+
+    await adapter.pushLaterOn(
+      'default',
+      {
+        id: 'TestJob::delayed-1',
+        name: 'TestJob',
+        payload: { attempt: 2 },
+        attempts: 0,
+        dedup: { id: 'delayed-1' },
+      },
+      5000
+    )
+
+    adapter.assertPushedCount(1)
+
+    await adapter.destroy()
+  })
+
   test('should support job class matchers', async ({ assert }) => {
     const adapter = fake()()
 
@@ -128,5 +186,4 @@ test.group('FakeAdapter', () => {
 
     await adapter.destroy()
   })
-
 })

@@ -22,13 +22,17 @@ function makeJob(overrides: Partial<AcquiredJob> = {}): AcquiredJob {
  * Creates an instrumentation with a fake QueueManager,
  * captures the injected wrappers from the patched init.
  */
-async function setupWithWrappers(config: ConstructorParameters<typeof QueueInstrumentation>[0] = {}) {
+async function setupWithWrappers(
+  config: ConstructorParameters<typeof QueueInstrumentation>[0] = {}
+) {
   const instrumentation = new QueueInstrumentation(config)
   instrumentation.enable()
 
   let capturedConfig: any
   const fakeManager = {
-    init: async (cfg: any) => { capturedConfig = cfg },
+    init: async (cfg: any) => {
+      capturedConfig = cfg
+    },
   }
 
   instrumentation.manuallyRegister({ QueueManager: fakeManager })
@@ -37,13 +41,21 @@ async function setupWithWrappers(config: ConstructorParameters<typeof QueueInstr
   return {
     instrumentation,
     fakeManager,
-    executionWrapper: capturedConfig.executionWrapper as <T>(fn: () => Promise<T>, job: AcquiredJob, queue: string) => Promise<T>,
-    internalOperationWrapper: capturedConfig.internalOperationWrapper as <T>(fn: () => Promise<T>) => Promise<T>,
+    executionWrapper: capturedConfig.executionWrapper as <T>(
+      fn: () => Promise<T>,
+      job: AcquiredJob,
+      queue: string
+    ) => Promise<T>,
+    internalOperationWrapper: capturedConfig.internalOperationWrapper as <T>(
+      fn: () => Promise<T>
+    ) => Promise<T>,
   }
 }
 
 test.group('QueueInstrumentation | lifecycle', (group) => {
-  group.setup(() => { setupTracing() })
+  group.setup(() => {
+    setupTracing()
+  })
   group.each.setup(() => resetSpans())
 
   test('enable() is idempotent', ({ assert }) => {
@@ -80,7 +92,9 @@ test.group('QueueInstrumentation | lifecycle', (group) => {
 })
 
 test.group('QueueInstrumentation | dispatch via DC', (group) => {
-  group.setup(() => { setupTracing() })
+  group.setup(() => {
+    setupTracing()
+  })
   group.each.setup(() => resetSpans())
 
   test('creates PRODUCER span when no active span', async ({ assert }) => {
@@ -120,7 +134,10 @@ test.group('QueueInstrumentation | dispatch via DC', (group) => {
     assert.isDefined(parentSpan)
     assert.isDefined(producerSpan)
     assert.equal(producerSpan!.parentSpanContext?.spanId, parentSpan!.spanContext().spanId)
-    assert.equal(jobData.traceContext?.traceparent?.split('-')[2], producerSpan!.spanContext().spanId)
+    assert.equal(
+      jobData.traceContext?.traceparent?.split('-')[2],
+      producerSpan!.spanContext().spanId
+    )
 
     instrumentation.disable()
   })
@@ -188,7 +205,9 @@ test.group('QueueInstrumentation | dispatch via DC', (group) => {
 })
 
 test.group('QueueInstrumentation | execute via executionWrapper', (group) => {
-  group.setup(() => { setupTracing() })
+  group.setup(() => {
+    setupTracing()
+  })
   group.each.setup(() => resetSpans())
 
   test('creates CONSUMER span with semconv attributes', async ({ assert }) => {
@@ -321,10 +340,21 @@ test.group('QueueInstrumentation | execute via executionWrapper', (group) => {
   test('queue_time_ms end-to-end via dispatch then execute', async ({ assert }) => {
     const { instrumentation, executionWrapper } = await setupWithWrappers()
 
-    const jobData: JobData = { id: 'e2e-qt-1', name: 'E2EQueueTimeJob', payload: {}, attempts: 0, createdAt: Date.now() }
+    const jobData: JobData = {
+      id: 'e2e-qt-1',
+      name: 'E2EQueueTimeJob',
+      payload: {},
+      attempts: 0,
+      createdAt: Date.now(),
+    }
     await dispatchChannel.tracePromise(async () => {}, { jobs: [jobData], queue: 'default' })
 
-    const job = makeJob({ id: 'e2e-qt-1', name: 'E2EQueueTimeJob', createdAt: jobData.createdAt, traceContext: jobData.traceContext })
+    const job = makeJob({
+      id: 'e2e-qt-1',
+      name: 'E2EQueueTimeJob',
+      createdAt: jobData.createdAt,
+      traceContext: jobData.traceContext,
+    })
     const message: JobExecuteMessage = { job, queue: 'default', status: 'completed' }
 
     await executeChannel.tracePromise(async () => {
@@ -347,11 +377,15 @@ test.group('QueueInstrumentation | execute via executionWrapper', (group) => {
     const message: JobExecuteMessage = { job, queue: 'default', status: 'completed' }
 
     await executeChannel.tracePromise(async () => {
-      await executionWrapper(async () => {
-        const tracer = trace.getTracer('test-child')
-        const childSpan = tracer.startSpan('child-operation')
-        childSpan.end()
-      }, job, 'default')
+      await executionWrapper(
+        async () => {
+          const tracer = trace.getTracer('test-child')
+          const childSpan = tracer.startSpan('child-operation')
+          childSpan.end()
+        },
+        job,
+        'default'
+      )
     }, message)
 
     const spans = getFinishedSpans()
@@ -367,7 +401,9 @@ test.group('QueueInstrumentation | execute via executionWrapper', (group) => {
 })
 
 test.group('QueueInstrumentation | trace linking', (group) => {
-  group.setup(() => { setupTracing() })
+  group.setup(() => {
+    setupTracing()
+  })
   group.each.setup(() => resetSpans())
 
   test('link mode links consumer to dispatch trace', async ({ assert }) => {
@@ -394,7 +430,9 @@ test.group('QueueInstrumentation | trace linking', (group) => {
   })
 
   test('parent mode makes consumer child of dispatch', async ({ assert }) => {
-    const { instrumentation, executionWrapper } = await setupWithWrappers({ executionSpanLinkMode: 'parent' })
+    const { instrumentation, executionWrapper } = await setupWithWrappers({
+      executionSpanLinkMode: 'parent',
+    })
 
     const jobData: JobData = { id: 'parent-1', name: 'ParentedJob', payload: {}, attempts: 0 }
     await dispatchChannel.tracePromise(async () => {}, { jobs: [jobData], queue: 'default' })
@@ -417,7 +455,9 @@ test.group('QueueInstrumentation | trace linking', (group) => {
 })
 
 test.group('QueueInstrumentation | manuallyRegister', (group) => {
-  group.setup(() => { setupTracing() })
+  group.setup(() => {
+    setupTracing()
+  })
   group.each.setup(() => resetSpans())
 
   test('patches init to inject wrappers', async ({ assert }) => {
@@ -448,7 +488,9 @@ test.group('QueueInstrumentation | manuallyRegister', (group) => {
 })
 
 test.group('QueueInstrumentation | custom config', (group) => {
-  group.setup(() => { setupTracing() })
+  group.setup(() => {
+    setupTracing()
+  })
   group.each.setup(() => resetSpans())
 
   test('custom messagingSystem attribute', async ({ assert }) => {

@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import KnexPkg from 'knex'
 import type { Knex } from 'knex'
-import type { Adapter, AcquiredJob } from '../contracts/adapter.js'
+import type { Adapter, AcquiredJob, PushResult } from '../contracts/adapter.js'
 import type {
+  DedupOutcome,
   JobData,
   JobRecord,
   JobRetention,
@@ -117,9 +118,7 @@ export class KnexAdapter implements Adapter {
 
       // Update job to active status
       // For SQLite (no SKIP LOCKED), add status='pending' guard to prevent double-claim
-      const updateQuery = trx(this.#jobsTable)
-        .where('id', job.id)
-        .where('queue', queue)
+      const updateQuery = trx(this.#jobsTable).where('id', job.id).where('queue', queue)
 
       if (!this.#supportsSkipLocked()) {
         updateQuery.where('status', 'pending')
@@ -178,14 +177,11 @@ export class KnexAdapter implements Adapter {
         const priority = jobData.priority ?? DEFAULT_PRIORITY
         const score = calculateScore(priority, now)
 
-        await trx(this.#jobsTable)
-          .where('id', job.id)
-          .where('queue', queue)
-          .update({
-            status: 'pending',
-            score,
-            execute_at: null,
-          })
+        await trx(this.#jobsTable).where('id', job.id).where('queue', queue).update({
+          status: 'pending',
+          score,
+          execute_at: null,
+        })
       }
     })
   }
@@ -331,44 +327,48 @@ export class KnexAdapter implements Adapter {
 
     if (retryAt && retryAt.getTime() > now) {
       // Move to delayed
-      await this.#connection(this.#jobsTable)
-        .where('id', jobId)
-        .where('queue', queue)
-        .update({
-          status: 'delayed',
-          data: updatedData,
-          worker_id: null,
-          acquired_at: null,
-          score: null,
-          execute_at: retryAt.getTime(),
-        })
+      await this.#connection(this.#jobsTable).where('id', jobId).where('queue', queue).update({
+        status: 'delayed',
+        data: updatedData,
+        worker_id: null,
+        acquired_at: null,
+        score: null,
+        execute_at: retryAt.getTime(),
+      })
     } else {
       // Move back to pending
       const priority = jobData.priority ?? DEFAULT_PRIORITY
       const score = calculateScore(priority, now)
 
-      await this.#connection(this.#jobsTable)
-        .where('id', jobId)
-        .where('queue', queue)
-        .update({
-          status: 'pending',
-          data: updatedData,
-          worker_id: null,
-          acquired_at: null,
-          score,
-          execute_at: null,
-        })
+      await this.#connection(this.#jobsTable).where('id', jobId).where('queue', queue).update({
+        status: 'pending',
+        data: updatedData,
+        worker_id: null,
+        acquired_at: null,
+        score,
+        execute_at: null,
+      })
     }
   }
 
-  async push(jobData: JobData): Promise<void> {
+  async push(jobData: JobData): Promise<PushResult | void> {
     return this.pushOn('default', jobData)
   }
 
-  async pushOn(queue: string, jobData: JobData): Promise<void> {
+  async pushOn(queue: string, jobData: JobData): Promise<PushResult | void> {
     const priority = jobData.priority ?? DEFAULT_PRIORITY
     const timestamp = Date.now()
     const score = calculateScore(priority, timestamp)
+
+    if (jobData.dedup) {
+      return this.#pushWithDedup(queue, jobData, {
+        id: jobData.id,
+        queue,
+        status: 'pending',
+        data: JSON.stringify(jobData),
+        score,
+      })
+    }
 
     await this.#connection(this.#jobsTable).insert({
       id: jobData.id,
@@ -379,12 +379,22 @@ export class KnexAdapter implements Adapter {
     })
   }
 
-  async pushLater(jobData: JobData, delay: number): Promise<void> {
+  async pushLater(jobData: JobData, delay: number): Promise<PushResult | void> {
     return this.pushLaterOn('default', jobData, delay)
   }
 
-  async pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<void> {
+  async pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<PushResult | void> {
     const executeAt = Date.now() + delay
+
+    if (jobData.dedup) {
+      return this.#pushWithDedup(queue, jobData, {
+        id: jobData.id,
+        queue,
+        status: 'delayed',
+        data: JSON.stringify(jobData),
+        execute_at: executeAt,
+      })
+    }
 
     await this.#connection(this.#jobsTable).insert({
       id: jobData.id,
@@ -395,12 +405,148 @@ export class KnexAdapter implements Adapter {
     })
   }
 
+  async #pushWithDedup(
+    queue: string,
+    jobData: JobData,
+    insertRow: Record<string, unknown>
+  ): Promise<PushResult> {
+    const dedup = jobData.dedup!
+
+    try {
+      return await this.#pushWithDedupTxn(queue, jobData, insertRow, dedup)
+    } catch (err) {
+      if (this.#isMissingDedupColumn(err)) {
+        throw new Error(
+          `Dedup columns missing on "${this.#jobsTable}". Run QueueSchemaService.addDedupColumns() on your jobs table before dispatching jobs with .dedup().`,
+          { cause: err }
+        )
+      }
+      throw err
+    }
+  }
+
+  #isMissingDedupColumn(err: unknown): boolean {
+    if (!err || typeof err !== 'object') return false
+    const message = (err as { message?: string }).message
+    if (!message) return false
+    // Postgres: 'column "dedup_id" does not exist'
+    // SQLite: 'no such column: dedup_id'
+    // MySQL: "Unknown column 'dedup_id' in 'where clause'"
+    return (
+      /dedup_id/.test(message) && /(does not exist|no such column|Unknown column)/i.test(message)
+    )
+  }
+
+  #pushWithDedupTxn(
+    queue: string,
+    jobData: JobData,
+    insertRow: Record<string, unknown>,
+    dedup: NonNullable<JobData['dedup']>
+  ): Promise<PushResult> {
+    return this.#connection.transaction(async (trx) => {
+      const existing = await trx(this.#jobsTable)
+        .where('queue', queue)
+        .where('dedup_id', dedup.id)
+        .orderBy('dedup_at', 'desc')
+        .forUpdate()
+        .first()
+
+      const now = Date.now()
+
+      if (existing) {
+        const dedupAt = existing.dedup_at != null ? Number(existing.dedup_at) : null
+        const dedupTtl = existing.dedup_ttl != null ? Number(existing.dedup_ttl) : null
+        const withinTtl = dedupTtl === null || (dedupAt !== null && now - dedupAt < dedupTtl)
+
+        if (withinTtl) {
+          const status = existing.status as JobStatus
+          const replaceable = status === 'pending' || status === 'delayed'
+
+          if (dedup.replace && replaceable) {
+            const storedData =
+              typeof existing.data === 'string' ? JSON.parse(existing.data) : existing.data
+            const newData = { ...storedData, payload: jobData.payload }
+            const updates: Record<string, unknown> = { data: JSON.stringify(newData) }
+            if (dedup.extend && dedupTtl) {
+              updates.dedup_at = now
+            }
+            await trx(this.#jobsTable).where({ id: existing.id, queue }).update(updates)
+            return { outcome: 'replaced' as DedupOutcome, jobId: existing.id as string }
+          }
+
+          if (dedup.extend && dedupTtl) {
+            await trx(this.#jobsTable).where({ id: existing.id, queue }).update({ dedup_at: now })
+            return { outcome: 'extended' as DedupOutcome, jobId: existing.id as string }
+          }
+
+          return { outcome: 'skipped' as DedupOutcome, jobId: existing.id as string }
+        }
+        // TTL expired — release the dedup slot from the old row so the new
+        // insert can claim it. The old job keeps running to completion; only
+        // its dedup identity is cleared. Retained history rows are excluded
+        // from the partial unique index predicate, so no update needed there.
+        const status = existing.status as JobStatus
+        if (status === 'pending' || status === 'delayed' || status === 'active') {
+          await trx(this.#jobsTable)
+            .where({ id: existing.id, queue })
+            .update({ dedup_id: null, dedup_at: null, dedup_ttl: null })
+        }
+      }
+
+      let raceLost = false
+      try {
+        await trx.transaction(async (sp) => {
+          await sp(this.#jobsTable).insert({
+            ...insertRow,
+            dedup_id: dedup.id,
+            dedup_at: now,
+            dedup_ttl: dedup.ttl ?? null,
+          })
+        })
+      } catch (err) {
+        if (this.#isUniqueViolation(err)) {
+          raceLost = true
+        } else {
+          throw err
+        }
+      }
+
+      if (raceLost) {
+        const winner = await trx(this.#jobsTable)
+          .where('queue', queue)
+          .where('dedup_id', dedup.id)
+          .whereIn('status', ['pending', 'delayed'])
+          .orderBy('dedup_at', 'desc')
+          .first()
+        if (winner) {
+          return { outcome: 'skipped' as DedupOutcome, jobId: winner.id as string }
+        }
+      }
+
+      return { outcome: 'added' as DedupOutcome, jobId: jobData.id }
+    })
+  }
+
+  #isUniqueViolation(err: unknown): boolean {
+    if (!err || typeof err !== 'object') return false
+    const e = err as { code?: string; message?: string }
+    return (
+      e.code === '23505' ||
+      e.code === 'SQLITE_CONSTRAINT_UNIQUE' ||
+      /UNIQUE constraint/i.test(e.message ?? '')
+    )
+  }
+
   async pushMany(jobs: JobData[]): Promise<void> {
     return this.pushManyOn('default', jobs)
   }
 
   async pushManyOn(queue: string, jobs: JobData[]): Promise<void> {
     if (jobs.length === 0) return
+
+    if (jobs.some((j) => j.dedup)) {
+      throw new Error('dedup is not supported in batch dispatch; use single dispatch')
+    }
 
     const now = Date.now()
     const rows = jobs.map((job) => ({
@@ -458,10 +604,7 @@ export class KnexAdapter implements Adapter {
 
         if (currentStalledCount >= maxStalledCount) {
           // Fail permanently - remove the job
-          await trx(this.#jobsTable)
-            .where('id', row.id)
-            .where('queue', queue)
-            .delete()
+          await trx(this.#jobsTable).where('id', row.id).where('queue', queue).delete()
         } else {
           // Recover: increment stalledCount and put back in pending
           jobData.stalledCount = currentStalledCount + 1
@@ -534,9 +677,9 @@ export class KnexAdapter implements Adapter {
   }
 
   async getSchedule(id: string): Promise<ScheduleData | null> {
-    const row = (await this.#connection(this.#schedulesTable)
-      .where('id', id)
-      .first()) as ScheduleRow | undefined
+    const row = (await this.#connection(this.#schedulesTable).where('id', id).first()) as
+      | ScheduleRow
+      | undefined
     if (!row) return null
 
     return this.#rowToScheduleData(row)
@@ -565,16 +708,12 @@ export class KnexAdapter implements Adapter {
     if (updates.runCount !== undefined) data.run_count = updates.runCount
 
     if (Object.keys(data).length > 0) {
-      await this.#connection(this.#schedulesTable)
-        .where('id', id)
-        .update(data)
+      await this.#connection(this.#schedulesTable).where('id', id).update(data)
     }
   }
 
   async deleteSchedule(id: string): Promise<void> {
-    await this.#connection(this.#schedulesTable)
-      .where('id', id)
-      .delete()
+    await this.#connection(this.#schedulesTable).where('id', id).delete()
   }
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
@@ -629,13 +768,11 @@ export class KnexAdapter implements Adapter {
       }
 
       // Update atomically
-      await trx(this.#schedulesTable)
-        .where('id', row.id)
-        .update({
-          next_run_at: nextRunAt,
-          last_run_at: now,
-          run_count: newRunCount,
-        })
+      await trx(this.#schedulesTable).where('id', row.id).update({
+        next_run_at: nextRunAt,
+        last_run_at: now,
+        run_count: newRunCount,
+      })
 
       // Return schedule data (before update state for payload)
       return this.#rowToScheduleData(row)

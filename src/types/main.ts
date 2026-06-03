@@ -55,9 +55,20 @@ export type JobStatus = 'pending' | 'active' | 'delayed' | 'completed' | 'failed
  * console.log(`Dispatched job: ${jobId}`)
  * ```
  */
+/**
+ * Outcome of a dedup-enabled dispatch.
+ * - `added`: new job was inserted
+ * - `skipped`: duplicate found within TTL, skipped silently
+ * - `replaced`: duplicate found within TTL, existing job's payload was replaced
+ * - `extended`: duplicate found within TTL, TTL window was reset
+ */
+export type DedupOutcome = 'added' | 'skipped' | 'replaced' | 'extended'
+
 export interface DispatchResult {
   /** Unique identifier for this specific job instance */
   jobId: string
+  /** Dedup outcome (only present when `.dedup()` was used). */
+  deduped?: DedupOutcome
 }
 
 /**
@@ -145,6 +156,41 @@ export interface JobData {
    * Injected by OTel plugin at dispatch time.
    */
   traceContext?: Record<string, string>
+
+  /**
+   * Deduplication configuration for this job.
+   * When set, adapters apply dedup semantics keyed on `dedup.id`.
+   * Set automatically when `.dedup()` is called on the dispatcher.
+   */
+  dedup?: {
+    /**
+     * Dedup key, prefixed with the job name (e.g. `SendInvoiceJob::order-123`).
+     * The combined `<jobName>::<id>` length is capped at 510 characters by the
+     * Knex storage column. Dispatcher validates this at `.dedup()` time.
+     */
+    id: string
+    /**
+     * TTL in milliseconds (must be positive). When set, dedup lock auto-expires
+     * after TTL. After expiry, the same dedup id produces a brand-new job
+     * (coexists with prior). Omit `ttl` entirely for a no-expiry lock that
+     * persists until the job is removed.
+     */
+    ttl?: number
+    /**
+     * Reset the TTL clock when a duplicate arrives within the window.
+     * The window length stays at the original ttl — passing a different
+     * `ttl` on the duplicating dispatch does not resize the window.
+     */
+    extend?: boolean
+    /**
+     * Swap the payload of the existing pending or delayed job when a
+     * duplicate arrives within the TTL window. Active jobs and retained
+     * completed/failed jobs return `'skipped'` without mutation. Only
+     * `payload` is swapped — priority, queue, delay, and groupId of the
+     * existing job are preserved.
+     */
+    replace?: boolean
+  }
 }
 
 /**

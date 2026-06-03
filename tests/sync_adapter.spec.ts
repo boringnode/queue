@@ -58,9 +58,7 @@ test.group('SyncAdapter', (group) => {
     assert.deepEqual(contextJobIds, Array(contextJobIds.length).fill(jobId))
   })
 
-  test('should log delayed sync job failures without unhandled rejections', async ({
-    assert,
-  }) => {
+  test('should log delayed sync job failures without unhandled rejections', async ({ assert }) => {
     const logger = new MemoryLogger()
     let unhandledError: unknown
     const onUnhandledRejection = (error: unknown) => {
@@ -116,5 +114,33 @@ test.group('SyncAdapter', (group) => {
     assert.equal(logger.logs[0].obj?.queue, 'default')
     assert.instanceOf(logger.logs[0].obj?.err, Error)
     assert.equal((logger.logs[0].obj?.err as Error).message, 'failed hook exploded')
+  })
+
+  test('should ignore .dedup() and execute every dispatch inline', async ({ assert }) => {
+    const executedPayloads: Array<{ n: number }> = []
+
+    class DedupIgnoredSyncJob extends Job<{ n: number }> {
+      async execute() {
+        executedPayloads.push(this.payload)
+      }
+    }
+
+    await QueueManager.init({
+      default: 'sync',
+      adapters: { sync: sync() },
+    })
+
+    Locator.register('DedupIgnoredSyncJob', DedupIgnoredSyncJob)
+
+    const first = await DedupIgnoredSyncJob.dispatch({ n: 1 }).dedup({ id: 'sync-dedup-1' }).run()
+    const second = await DedupIgnoredSyncJob.dispatch({ n: 2 }).dedup({ id: 'sync-dedup-1' }).run()
+    const third = await DedupIgnoredSyncJob.dispatch({ n: 3 })
+      .dedup({ id: 'sync-dedup-1', ttl: 10_000, replace: true })
+      .run()
+
+    assert.deepEqual(executedPayloads, [{ n: 1 }, { n: 2 }, { n: 3 }])
+    assert.isUndefined(first.deduped)
+    assert.isUndefined(second.deduped)
+    assert.isUndefined(third.deduped)
   })
 })

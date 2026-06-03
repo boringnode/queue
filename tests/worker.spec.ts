@@ -549,7 +549,9 @@ test.group('Worker', () => {
     const controller = new AbortController()
     const originalTimeout = AbortSignal.timeout
     const originalAddEventListener = controller.signal.addEventListener.bind(controller.signal)
-    const originalRemoveEventListener = controller.signal.removeEventListener.bind(controller.signal)
+    const originalRemoveEventListener = controller.signal.removeEventListener.bind(
+      controller.signal
+    )
 
     let addedAbortListeners = 0
     let removedAbortListeners = 0

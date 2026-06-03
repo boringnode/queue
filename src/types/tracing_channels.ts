@@ -6,7 +6,7 @@
  */
 
 import type { AcquiredJob } from '../contracts/adapter.js'
-import type { JobData } from './main.js'
+import type { DedupOutcome, JobData } from './main.js'
 
 /**
  * Tracing data structure for job dispatch events.
@@ -20,6 +20,13 @@ export type JobDispatchMessage = {
 
   /** Delay in milliseconds before the job becomes available */
   delay?: number
+
+  /**
+   * Deduplication outcome when the job used `.dedup()`. Allows OTel/tracing
+   * consumers to distinguish added vs skipped/replaced/extended dispatches.
+   * Populated by the dispatcher after the push call completes.
+   */
+  dedupOutcome?: DedupOutcome
 
   /** Error that caused the dispatch to fail */
   error?: Error

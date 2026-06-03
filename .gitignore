@@ -15,6 +15,9 @@ coverage
 npm-debug.log
 yarn-error.log
 
+# OS specific
+.DS_Store
+
 # Editors specific
 .fleet
 .idea

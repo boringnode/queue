@@ -26,13 +26,65 @@ export class QueueSchemaService {
       table.bigint('execute_at').unsigned().nullable()
       table.bigint('finished_at').unsigned().nullable()
       table.text('error').nullable()
+      table.string('dedup_id', 510).nullable()
+      table.bigint('dedup_at').unsigned().nullable()
+      table.bigint('dedup_ttl').unsigned().nullable()
       table.primary(['id', 'queue'])
       table.index(['queue', 'status', 'score'])
       table.index(['queue', 'status', 'execute_at'])
       table.index(['queue', 'status', 'finished_at'])
+      table.index(['queue', 'dedup_id'])
 
       extend?.(table)
     })
+
+    await this.#createDedupActiveUniqueIndex(tableName)
+  }
+
+  /**
+   * Idempotent migration: adds dedup columns (dedup_id, dedup_at, dedup_ttl)
+   * and a (queue, dedup_id) index to an existing jobs table.
+   *
+   * Safe to run multiple times. Uses hasColumn checks so it won't fail on re-runs.
+   * For large Postgres tables, consider pausing workers during the run.
+   */
+  async addDedupColumns(tableName: string = 'queue_jobs'): Promise<void> {
+    const hasDedupId = await this.#connection.schema.hasColumn(tableName, 'dedup_id')
+    const hasDedupAt = await this.#connection.schema.hasColumn(tableName, 'dedup_at')
+    const hasDedupTtl = await this.#connection.schema.hasColumn(tableName, 'dedup_ttl')
+
+    if (!hasDedupId || !hasDedupAt || !hasDedupTtl) {
+      await this.#connection.schema.alterTable(tableName, (table) => {
+        if (!hasDedupId) table.string('dedup_id', 510).nullable()
+        if (!hasDedupAt) table.bigint('dedup_at').unsigned().nullable()
+        if (!hasDedupTtl) table.bigint('dedup_ttl').unsigned().nullable()
+      })
+    }
+
+    if (!hasDedupId) {
+      await this.#connection.schema.alterTable(tableName, (table) => {
+        table.index(['queue', 'dedup_id'])
+      })
+    }
+
+    await this.#createDedupActiveUniqueIndex(tableName)
+  }
+
+  /**
+   * Partial unique index on (queue, dedup_id) for active dedup slots.
+   * Prevents two concurrent inserts with the same dedup_id from both succeeding.
+   * Only PG and SQLite support partial unique indexes; MySQL is skipped.
+   */
+  async #createDedupActiveUniqueIndex(tableName: string): Promise<void> {
+    const client = this.#connection.client.config.client
+    if (client !== 'pg' && client !== 'better-sqlite3' && client !== 'sqlite3') return
+
+    const indexName = `${tableName}_dedup_active_uidx`
+    await this.#connection.raw(
+      `CREATE UNIQUE INDEX IF NOT EXISTS ?? ON ?? ("queue", "dedup_id") ` +
+        `WHERE "dedup_id" IS NOT NULL AND "status" IN ('pending', 'delayed')`,
+      [indexName, tableName]
+    )
   }
 
   /**
@@ -57,10 +109,7 @@ export class QueueSchemaService {
       table.integer('run_count').unsigned().notNullable().defaultTo(0)
       table.timestamp('next_run_at').nullable()
       table.timestamp('last_run_at').nullable()
-      table
-        .timestamp('created_at')
-        .notNullable()
-        .defaultTo(this.#connection.fn.now())
+      table.timestamp('created_at').notNullable().defaultTo(this.#connection.fn.now())
       table.index(['status', 'next_run_at'])
 
       extend?.(table)
