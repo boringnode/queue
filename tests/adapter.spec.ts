@@ -99,9 +99,6 @@ test.group('Adapter | Redis', (group) => {
       await adapter.updateSchedule(id, { nextRunAt: futureRunAt })
     }
 
-    // Warm the due-index backfill so it doesn't count against the spy
-    await adapter.claimDueSchedule()
-
     const { result: claimed, writes } = await withRedisWriteSpy({
       connection,
       run: () => adapter.claimDueSchedule(),
@@ -606,6 +603,92 @@ test.group('Adapter | Redis', (group) => {
     assert.equal(recovered, 0)
     assert.isNull(await connection.hget(metadataKey, 'metadata-stalled-uuid-1'))
     assert.isNull(await adapter.getJob('metadata-stalled-uuid-1', queue))
+  })
+
+  test('backfillDueIndex populates ZSET for pre-existing schedules', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+
+    // Simulate pre-upgrade schedule data: write hash + index directly, skip ZSET
+    const id = 'pre-existing-schedule'
+    const pastRunAt = (Date.now() - 5_000).toString()
+    await connection
+      .multi()
+      .hset(`schedules::${id}`, {
+        id,
+        name: 'LegacyJob',
+        payload: '{}',
+        status: 'active',
+        every_ms: '60000',
+        timezone: 'UTC',
+        next_run_at: pastRunAt,
+        last_run_at: '',
+        run_count: '0',
+        created_at: Date.now().toString(),
+      })
+      .sadd('schedules::index', id)
+      .exec()
+
+    // Without backfill, ZSET has no entry so claim returns null
+    const beforeBackfill = await adapter.claimDueSchedule()
+    assert.isNull(beforeBackfill)
+
+    await adapter.backfillDueIndex()
+
+    const afterBackfill = await adapter.claimDueSchedule()
+    assert.isNotNull(afterBackfill)
+    assert.equal(afterBackfill!.id, id)
+  })
+
+  test('backfillDueIndex is idempotent', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+
+    await adapter.upsertSchedule({
+      id: 'idempotent-schedule',
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+    await adapter.updateSchedule('idempotent-schedule', {
+      nextRunAt: new Date(Date.now() + 30_000),
+    })
+
+    // Clear the ZSET so backfill has work to do
+    await connection.del('schedules::due')
+
+    const first = await adapter.backfillDueIndex()
+    const second = await adapter.backfillDueIndex()
+
+    assert.isAbove(first, 0)
+    assert.equal(second, first)
+
+    const score = await connection.zscore('schedules::due', 'idempotent-schedule')
+    assert.isNotNull(score)
+  })
+
+  test('stale ZSET score is self-healed during claim', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+    const id = 'stale-score-schedule'
+    const futureRunAt = Date.now() + 60_000
+
+    await adapter.upsertSchedule({
+      id,
+      name: 'StaleJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+    await adapter.updateSchedule(id, { nextRunAt: new Date(futureRunAt) })
+
+    // Corrupt the ZSET score to a past value while hash still says future
+    await connection.zadd('schedules::due', Date.now() - 10_000, id)
+
+    const claimed = await adapter.claimDueSchedule()
+    assert.isNull(claimed, 'should not claim when hash says schedule is not due yet')
+
+    // ZSET score should have been repaired to match the hash
+    const repairedScore = await connection.zscore('schedules::due', id)
+    assert.equal(Number(repairedScore), futureRunAt)
   })
 })
 

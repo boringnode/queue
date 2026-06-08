@@ -1,4 +1,4 @@
-import { REDIS_DEDUP_LUA, REDIS_JOB_STORAGE_LUA } from './redis_job_storage.js';
+import { REDIS_DEDUP_LUA, REDIS_JOB_STORAGE_LUA } from './redis_job_storage.js'
 
 /**
  * Lua script for pushing a job to the queue.
@@ -18,7 +18,7 @@ ${REDIS_JOB_STORAGE_LUA}
   redis.call('ZADD', pending_key, score, job_id)
 
   return 1
-`;
+`
 
 /**
  * Lua script for pushing a dedup job.
@@ -80,7 +80,7 @@ ${REDIS_DEDUP_LUA}
     redis.call('PEXPIRE', dedup_key, ttl)
   end
   return {'added', job_id}
-`;
+`
 
 /**
  * Lua script for pushing a delayed job.
@@ -100,7 +100,7 @@ ${REDIS_JOB_STORAGE_LUA}
   redis.call('ZADD', delayed_key, execute_at, job_id)
 
   return 1
-`;
+`
 
 /**
  * Lua script for atomic job acquisition.
@@ -158,7 +158,7 @@ ${REDIS_JOB_STORAGE_LUA}
   return encode_job_result(job_data, overlay_key, job_id, {
     acquiredAt = now
   })
-`;
+`
 
 /**
  * Lua script for removing a job completely (no history).
@@ -193,7 +193,7 @@ ${REDIS_JOB_STORAGE_LUA}
   delete_job_data(data_key, overlay_key, job_id)
 
   return 1
-`;
+`
 
 /**
  * Lua script for finalizing a job in history.
@@ -277,7 +277,7 @@ ${REDIS_JOB_STORAGE_LUA}
   end
 
   return 1
-`;
+`
 
 /**
  * Lua script for retrying a job.
@@ -330,7 +330,7 @@ ${REDIS_JOB_STORAGE_LUA}
   end
 
   return 1
-`;
+`
 
 /**
  * Lua script for recovering stalled jobs.
@@ -399,7 +399,7 @@ ${REDIS_JOB_STORAGE_LUA}
   end
 
   return recovered
-`;
+`
 
 /**
  * Lua script for getting a job record with its status.
@@ -458,7 +458,7 @@ ${REDIS_JOB_STORAGE_LUA}
     finishedAt = finished_at,
     error = error_msg
   })
-`;
+`
 
 /**
  * Lua script for atomically claiming a due schedule using a sorted set index.
@@ -505,6 +505,14 @@ export const CLAIM_SCHEDULE_SCRIPT = `
       if schedule.status ~= 'active' then
         redis.call('ZREM', due_key, id)
       else
+        -- Hash is the source of truth for next_run_at.
+        -- If the ZSET score is stale, repair it and skip this candidate.
+        local hash_nra = schedule.next_run_at
+        if not hash_nra or hash_nra == '' then
+          redis.call('ZREM', due_key, id)
+        elseif tonumber(hash_nra) > now then
+          redis.call('ZADD', due_key, tonumber(hash_nra), id)
+        else
         local run_count = tonumber(schedule.run_count or '0')
         local run_limit = schedule.run_limit and tonumber(schedule.run_limit) or nil
         local to_date = schedule.to_date and tonumber(schedule.to_date) or nil
@@ -550,7 +558,8 @@ export const CLAIM_SCHEDULE_SCRIPT = `
           -- Return the schedule data (before update) as JSON
           return cjson.encode(schedule)
         end
+        end
       end
     end
   end
-`;
+`
