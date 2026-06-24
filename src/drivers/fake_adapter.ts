@@ -345,6 +345,21 @@ export class FakeAdapter implements Adapter {
     return recovered
   }
 
+  async renewJobs(queue: string, jobIds: string[]): Promise<number> {
+    const now = Date.now()
+    let renewed = 0
+
+    for (const jobId of jobIds) {
+      const active = this.#activeJobs.get(jobId)
+      if (active && active.queue === queue) {
+        active.acquiredAt = now
+        renewed++
+      }
+    }
+
+    return renewed
+  }
+
   async getJob(jobId: string, queue: string): Promise<JobRecord | null> {
     const active = this.#activeJobs.get(jobId)
     if (active && active.queue === queue) {

@@ -110,6 +110,11 @@ export class SyncAdapter implements Adapter {
     return Promise.resolve(0)
   }
 
+  renewJobs(_queue: string, _jobIds: string[]): Promise<number> {
+    // SyncAdapter executes jobs immediately - there is nothing to renew
+    return Promise.resolve(0)
+  }
+
   getJob(_jobId: string, _queue: string): Promise<null> {
     return Promise.resolve(null)
   }

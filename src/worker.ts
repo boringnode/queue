@@ -75,6 +75,8 @@ export class Worker {
   #pool?: JobPool
   #lastStalledCheck = 0
   #shutdownHandler?: () => Promise<void>
+  #heartbeatTimer?: NodeJS.Timeout
+  #renewingJobs = false
 
   /** Unique identifier for this worker instance */
   get id() {
@@ -193,6 +195,13 @@ export class Worker {
       await this.#pool.drain()
     }
 
+    // Stop the heartbeat only after draining, so jobs that are still finishing
+    // keep being renewed until they actually complete. The process() generator
+    // also clears it in its `finally`, but clearing here guarantees prompt and
+    // deterministic cleanup regardless of how the worker was driven (start() vs
+    // processCycle()).
+    this.#stopHeartbeat()
+
     this.#removeShutdownHandlers()
   }
 
@@ -267,48 +276,53 @@ export class Worker {
    */
   async *process(queues: string[]): AsyncGenerator<WorkerCycle, void, unknown> {
     this.#pool = new JobPool()
+    this.#startHeartbeat(queues)
 
-    while (this.#running) {
-      try {
-        // Check for stalled jobs periodically
-        await this.#checkStalledJobs(queues)
+    try {
+      while (this.#running) {
+        try {
+          // Check for stalled jobs periodically
+          await this.#checkStalledJobs(queues)
 
-        // Dispatch any due scheduled jobs
-        await this.#dispatchDueSchedules()
+          // Dispatch any due scheduled jobs
+          await this.#dispatchDueSchedules()
 
-        yield* this.#fillPool(queues)
+          yield* this.#fillPool(queues)
 
-        if (this.#pool.isEmpty()) {
-          yield { type: 'idle', suggestedDelay: this.#idleDelay }
-          continue
-        }
+          if (this.#pool.isEmpty()) {
+            yield { type: 'idle', suggestedDelay: this.#idleDelay }
+            continue
+          }
 
-        const hasCapacity = this.#pool.hasCapacity(this.#concurrency)
+          const hasCapacity = this.#pool.hasCapacity(this.#concurrency)
 
-        // If we have capacity, don't block indefinitely waiting for a completion;
-        // wake up periodically to try to acquire newly enqueued jobs.
-        const result = await Promise.race([
-          this.#pool
-            .waitForNextCompletion()
-            .then((completed) => ({ kind: 'completed' as const, completed })),
-          ...(hasCapacity
-            ? [setTimeout(this.#idleDelay).then(() => ({ kind: 'tick' as const }))]
-            : []),
-        ])
+          // If we have capacity, don't block indefinitely waiting for a completion;
+          // wake up periodically to try to acquire newly enqueued jobs.
+          const result = await Promise.race([
+            this.#pool
+              .waitForNextCompletion()
+              .then((completed) => ({ kind: 'completed' as const, completed })),
+            ...(hasCapacity
+              ? [setTimeout(this.#idleDelay).then(() => ({ kind: 'tick' as const }))]
+              : []),
+          ])
 
-        if (result.kind === 'tick') {
-          // No completion yet, but we woke up to check the queue again
-          continue
-        }
+          if (result.kind === 'tick') {
+            // No completion yet, but we woke up to check the queue again
+            continue
+          }
 
-        yield { type: 'completed', queue: result.completed.queue, job: result.completed.job }
-      } catch (error) {
-        yield {
-          type: 'error',
-          error: error as Error,
-          suggestedDelay: parse(DEFAULT_ERROR_RETRY_DELAY),
+          yield { type: 'completed', queue: result.completed.queue, job: result.completed.job }
+        } catch (error) {
+          yield {
+            type: 'error',
+            error: error as Error,
+            suggestedDelay: parse(DEFAULT_ERROR_RETRY_DELAY),
+          }
         }
       }
+    } finally {
+      this.#stopHeartbeat()
     }
   }
 
@@ -499,6 +513,76 @@ export class Worker {
       if (recovered > 0) {
         debug('worker %s: recovered %d stalled jobs from queue %s', this.#id, recovered, queue)
       }
+    }
+  }
+
+  /**
+   * Start the heartbeat timer that periodically renews the acquired timestamp
+   * of in-flight jobs.
+   *
+   * Renewal cannot piggyback on the main process loop: at full concurrency the
+   * loop blocks on `waitForNextCompletion()` with no idle tick, so exactly when
+   * long-running jobs are in flight the loop is not cycling. A dedicated timer
+   * guarantees healthy jobs are refreshed before `recoverStalledJobs` would
+   * consider them stalled and re-deliver them.
+   *
+   * The interval is half the stalled threshold so a job is renewed at least
+   * once within every stalled window.
+   */
+  #startHeartbeat(queues: string[]) {
+    // Never leave a previous timer running if the loop is somehow re-entered.
+    this.#stopHeartbeat()
+
+    const interval = Math.max(Math.floor(this.#stalledThreshold / 2), 1)
+
+    this.#heartbeatTimer = setInterval(() => {
+      void this.#renewActiveJobs(queues)
+    }, interval)
+
+    // Don't let the heartbeat keep the event loop alive on its own.
+    this.#heartbeatTimer.unref?.()
+  }
+
+  #stopHeartbeat() {
+    if (this.#heartbeatTimer) {
+      clearInterval(this.#heartbeatTimer)
+      this.#heartbeatTimer = undefined
+    }
+  }
+
+  /**
+   * Renew the acquired timestamp of the jobs currently in the pool so that
+   * long-running handlers are not treated as stalled while they are still
+   * running. Only jobs still active in the adapter are renewed.
+   */
+  async #renewActiveJobs(queues: string[]): Promise<void> {
+    // Guard against overlapping runs if a renewal takes longer than the interval.
+    if (this.#renewingJobs || !this.#pool || this.#pool.isEmpty()) {
+      return
+    }
+
+    this.#renewingJobs = true
+
+    try {
+      const jobIdsByQueue = this.#pool.activeJobIdsByQueue()
+
+      for (const queue of queues) {
+        const jobIds = jobIdsByQueue.get(queue)
+
+        if (!jobIds || jobIds.length === 0) {
+          continue
+        }
+
+        try {
+          await this.#wrapInternal(() => this.#adapter.renewJobs(queue, jobIds))
+        } catch (error) {
+          // A failed heartbeat must never crash the worker; the job will simply
+          // be considered stalled if renewals keep failing.
+          debug('worker %s: failed to renew jobs on queue %s: %O', this.#id, queue, error)
+        }
+      }
+    } finally {
+      this.#renewingJobs = false
     }
   }
 

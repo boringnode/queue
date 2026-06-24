@@ -1022,6 +1022,155 @@ test.group('Worker', () => {
     assert.equal(executionCount, 1, 'Job should have been executed once')
   })
 
+  test('heartbeat keeps a long-running job from being recovered as stalled', async ({
+    assert,
+    cleanup,
+  }) => {
+    let executionCount = 0
+    let started: () => void = () => {}
+    const jobStarted = new Promise<void>((resolve) => {
+      started = resolve
+    })
+
+    class LongJob extends Job {
+      async execute() {
+        executionCount++
+        started()
+        // Run well beyond the stalled threshold. While this handler runs the
+        // worker is at full capacity, so its main loop is blocked on the single
+        // in-flight job and only the dedicated heartbeat timer keeps refreshing
+        // the job's acquired timestamp.
+        await setTimeout(400)
+      }
+    }
+
+    const sharedAdapter = memory()()
+
+    const localConfig = {
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      worker: {
+        concurrency: 1,
+        idleDelay: 20,
+        stalledThreshold: 100,
+        // Large so the worker's own periodic check never fires during the test;
+        // we drive recovery manually to simulate another worker (or the checker)
+        // looking for stalled jobs while this one is still running.
+        stalledInterval: 10_000,
+        maxStalledCount: 1,
+        gracefulShutdown: false,
+      },
+    }
+
+    Locator.register('LongJob', LongJob)
+
+    const worker = new Worker(localConfig)
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+      await QueueManager.destroy()
+    })
+
+    await sharedAdapter.pushOn('default', {
+      id: 'long-running-job',
+      name: 'LongJob',
+      payload: {},
+      attempts: 0,
+    })
+
+    // Run the worker in the background; start() blocks until the worker stops.
+    const running = worker.start(['default'])
+    await jobStarted
+
+    // Repeatedly run a stalled check while the handler is still executing past
+    // the stalled threshold. The heartbeat keeps acquiredAt fresh, so there is
+    // never anything to recover. Without the heartbeat this would recover the
+    // job back to pending and it would run a second time.
+    for (let i = 0; i < 3; i++) {
+      await setTimeout(80)
+      const recovered = await sharedAdapter.recoverStalledJobs('default', 100, 1)
+      assert.equal(recovered, 0, 'Heartbeat should keep the running job from being recovered')
+    }
+
+    // Let the job finish and the worker go idle before stopping, so stop() does
+    // not race with an in-flight job.
+    await setTimeout(300)
+    await worker.stop()
+    await running
+
+    assert.equal(executionCount, 1, 'Long-running job should execute exactly once')
+  })
+
+  test('stops the heartbeat once the worker is stopped', async ({ assert, cleanup }) => {
+    let renewCalls = 0
+    let started: () => void = () => {}
+    const jobStarted = new Promise<void>((resolve) => {
+      started = resolve
+    })
+
+    class LongJob extends Job {
+      async execute() {
+        started()
+        await setTimeout(200)
+      }
+    }
+
+    const sharedAdapter = memory()()
+    const originalRenew = sharedAdapter.renewJobs.bind(sharedAdapter)
+    sharedAdapter.renewJobs = async (queue: string, jobIds: string[]) => {
+      renewCalls++
+      return originalRenew(queue, jobIds)
+    }
+
+    const localConfig = {
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      worker: {
+        concurrency: 1,
+        idleDelay: 20,
+        // Small threshold -> ~20ms heartbeat interval so it fires several times
+        // within the test window.
+        stalledThreshold: 40,
+        stalledInterval: 10_000,
+        maxStalledCount: 1,
+        gracefulShutdown: false,
+      },
+    }
+
+    Locator.register('LongJob', LongJob)
+
+    const worker = new Worker(localConfig)
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+      await QueueManager.destroy()
+    })
+
+    await sharedAdapter.pushOn('default', {
+      id: 'hb-job',
+      name: 'LongJob',
+      payload: {},
+      attempts: 0,
+    })
+
+    const running = worker.start(['default'])
+    await jobStarted
+
+    // The heartbeat should renew the in-flight job while it runs.
+    await setTimeout(120)
+    assert.isAbove(renewCalls, 0, 'Heartbeat should renew while a job is in flight')
+
+    await worker.stop()
+    await running
+
+    // Once stopped, the heartbeat timer must be cleared: no further renewals.
+    const callsAtStop = renewCalls
+    await setTimeout(150)
+    assert.equal(renewCalls, callsAtStop, 'Heartbeat must not fire after stop()')
+  })
+
   test('should fail stalled job permanently after maxStalledCount exceeded', async ({
     assert,
     cleanup,
