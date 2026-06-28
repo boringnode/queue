@@ -33,7 +33,7 @@
   "dependencies": {
     "@lukeed/ms": "^2.0.2",
     "@poppinss/utils": "^7.0.1",
-    "cron-parser": "^5.5.0"
+    "cron-parser": "^5.6.1"
   },
   "devDependencies": {
     "@adonisjs/tsconfig": "^2.0.0",
@@ -41,26 +41,26 @@
     "@japa/expect-type": "^2.0.4",
     "@japa/file-system": "^3.0.0",
     "@japa/runner": "^5.3.0",
-    "@opentelemetry/api": "^1.9.0",
-    "@opentelemetry/context-async-hooks": "^2.6.0",
-    "@opentelemetry/core": "^2.6.0",
-    "@opentelemetry/instrumentation": "^0.213.0",
-    "@opentelemetry/sdk-trace-base": "^2.6.0",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/context-async-hooks": "^2.8.0",
+    "@opentelemetry/core": "^2.8.0",
+    "@opentelemetry/instrumentation": "^0.219.0",
+    "@opentelemetry/sdk-trace-base": "^2.8.0",
     "@poppinss/ts-exec": "^1.4.4",
     "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^25.5.0",
+    "@types/node": "^25.9.4",
     "@types/pg": "^8.20.0",
-    "better-sqlite3": "^12.8.0",
-    "bullmq": "^5.71.0",
+    "better-sqlite3": "^12.11.1",
+    "bullmq": "^5.79.2",
     "c8": "^11.0.0",
     "del-cli": "^7.0.0",
-    "ioredis": "^5.10.1",
+    "ioredis": "^5.11.1",
     "knex": "3.1.0",
-    "oxfmt": "^0.41.0",
-    "oxlint": "^1.56.0",
-    "oxlint-tsgolint": "^0.17.1",
-    "pg": "^8.20.0",
-    "release-it": "^19.2.4",
+    "oxfmt": "^0.56.0",
+    "oxlint": "^1.71.0",
+    "oxlint-tsgolint": "^0.17.4",
+    "pg": "^8.22.0",
+    "release-it": "^20.2.1",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3"
   },
@@ -125,7 +125,7 @@
       "skipChecks": true
     }
   },
-  "packageManager": "yarn@4.17.0+sha512.c2957de2f9025ab14d63b24d0d8be1f1655810e22c341042c27f7ecd017b180ec12db73d69ac366d71b304ef9f069349ce462de96f04f8f1da317f4f762c95ae",
+  "packageManager": "yarn@4.17.0",
   "engines": {
     "node": ">=24.0.0"
   }
