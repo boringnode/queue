@@ -402,6 +402,37 @@ ${REDIS_JOB_STORAGE_LUA}
 `
 
 /**
+ * Lua script for renewing the acquired timestamp of in-flight jobs (heartbeat).
+ * Only entries still present in the active hash AND still owned by the calling
+ * worker are renewed, so a job that was already recovered, finalized, or
+ * re-acquired by another worker is never resurrected by a late heartbeat.
+ * Preserves the existing worker info, updating only acquiredAt.
+ * Returns the number of jobs renewed.
+ */
+export const RENEW_JOBS_SCRIPT = `
+  local active_key = KEYS[1]
+  local now = tonumber(ARGV[1])
+  local worker_id = ARGV[2]
+
+  local renewed = 0
+  for i = 3, #ARGV do
+    local job_id = ARGV[i]
+    local active_data = redis.call('HGET', active_key, job_id)
+    if active_data then
+      local active = cjson.decode(active_data)
+      -- Only the worker that currently owns the lease may renew it.
+      if active.workerId == worker_id then
+        active.acquiredAt = now
+        redis.call('HSET', active_key, job_id, cjson.encode(active))
+        renewed = renewed + 1
+      end
+    end
+  end
+
+  return renewed
+`
+
+/**
  * Lua script for getting a job record with its status.
  */
 export const GET_JOB_SCRIPT = `

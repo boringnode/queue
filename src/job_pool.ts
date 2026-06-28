@@ -68,6 +68,30 @@ export class JobPool {
   }
 
   /**
+   * Get the ids of all currently running jobs, grouped by the queue they
+   * came from.
+   *
+   * Used by the worker heartbeat to renew the acquired timestamp of in-flight
+   * jobs so long-running handlers are not mistaken for stalled jobs.
+   *
+   * @returns A map of queue name to the job ids running for that queue
+   */
+  activeJobIdsByQueue(): Map<string, string[]> {
+    const byQueue = new Map<string, string[]>()
+
+    for (const { job, queue } of this.#activeJobs.values()) {
+      const ids = byQueue.get(queue)
+      if (ids) {
+        ids.push(job.id)
+      } else {
+        byQueue.set(queue, [job.id])
+      }
+    }
+
+    return byQueue
+  }
+
+  /**
    * Wait for the next job to complete and return it.
    *
    * Uses `Promise.race()` internally, so the fastest job wins.

@@ -630,6 +630,26 @@ export class KnexAdapter implements Adapter {
     })
   }
 
+  async renewJobs(queue: string, jobIds: string[]): Promise<number> {
+    if (jobIds.length === 0) {
+      return 0
+    }
+
+    const now = Date.now()
+
+    // Only renew jobs that are still active AND still owned by this worker; a
+    // job that was already recovered, finalized, or re-acquired by another
+    // worker will not match and is therefore never resurrected.
+    const renewed = await this.#connection(this.#jobsTable)
+      .where('queue', queue)
+      .where('status', 'active')
+      .where('worker_id', this.#workerId)
+      .whereIn('id', jobIds)
+      .update({ acquired_at: now })
+
+    return renewed
+  }
+
   async upsertSchedule(config: ScheduleConfig): Promise<string> {
     const id = config.id ?? randomUUID()
 

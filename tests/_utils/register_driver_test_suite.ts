@@ -691,6 +691,91 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.equal(recoveredJobB!.id, 'job-stalled-b')
   })
 
+  test('renewJobs should keep an active job from being recovered as stalled', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('test-queue', {
+      id: 'long-running',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+    })
+
+    const job = await adapter.popFrom('test-queue')
+    assert.isNotNull(job)
+
+    // Keep renewing the job while it "runs" longer than the stalled threshold.
+    for (let i = 0; i < 5; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      const renewed = await adapter.renewJobs('test-queue', ['long-running'])
+      assert.equal(renewed, 1)
+
+      // Even though more than 30ms has elapsed in total, the job is never
+      // stalled because each renewal refreshes its acquired timestamp.
+      const recovered = await adapter.recoverStalledJobs('test-queue', 30, 1)
+      assert.equal(recovered, 0)
+    }
+
+    // Still active, not back in pending.
+    const pending = await adapter.popFrom('test-queue')
+    assert.isNull(pending)
+  })
+
+  test('renewJobs should only renew jobs that are still active', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('test-queue', {
+      id: 'job-1',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+    })
+
+    const job = await adapter.popFrom('test-queue')
+    assert.isNotNull(job)
+
+    // Let it stall and recover it back to pending.
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    const recovered = await adapter.recoverStalledJobs('test-queue', 10, 1)
+    assert.equal(recovered, 1)
+
+    // A late heartbeat for the (no longer active) job must not resurrect it.
+    const renewed = await adapter.renewJobs('test-queue', ['job-1'])
+    assert.equal(renewed, 0)
+
+    // The recovered job is still pending and can be acquired exactly once.
+    const reacquired = await adapter.popFrom('test-queue')
+    assert.isNotNull(reacquired)
+    assert.equal(reacquired!.id, 'job-1')
+  })
+
+  test('renewJobs should only renew jobs on the targeted queue', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('queue-a', { id: 'job-a', name: 'TestJob', payload: null, attempts: 0 })
+    await adapter.pushOn('queue-b', { id: 'job-b', name: 'TestJob', payload: null, attempts: 0 })
+
+    await adapter.popFrom('queue-a')
+    await adapter.popFrom('queue-b')
+
+    // job-b is active on queue-b, so renewing it on queue-a renews nothing.
+    const renewed = await adapter.renewJobs('queue-a', ['job-b'])
+    assert.equal(renewed, 0)
+  })
+
+  test('renewJobs should return 0 when given no job ids', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    const renewed = await adapter.renewJobs('test-queue', [])
+    assert.equal(renewed, 0)
+  })
+
   test('completeJob with undefined retention should remove job (default behavior)', async ({
     assert,
   }) => {
@@ -1193,6 +1278,33 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       assert.isNotNull(job1)
       assert.isNotNull(job2)
       assert.notEqual(job1!.id, job2!.id, 'Workers should acquire different jobs')
+    })
+
+    test('renewJobs should not renew a job owned by another worker', async ({ assert }) => {
+      const adapter1 = await options.createAdapter()
+      const adapter2 = await options.createAdapter()
+
+      adapter1.setWorkerId('worker-1')
+      adapter2.setWorkerId('worker-2')
+
+      await adapter1.pushOn('test-queue', {
+        id: 'job-1',
+        name: 'TestJob',
+        payload: {},
+        attempts: 0,
+      })
+
+      // worker-1 acquires the job, so worker-2 does not own its lease.
+      const job = await adapter1.popFrom('test-queue')
+      assert.equal(job!.id, 'job-1')
+
+      // worker-2 must not be able to renew a job it doesn't own.
+      const renewedByOther = await adapter2.renewJobs('test-queue', ['job-1'])
+      assert.equal(renewedByOther, 0)
+
+      // The legitimate owner can still renew it.
+      const renewedByOwner = await adapter1.renewJobs('test-queue', ['job-1'])
+      assert.equal(renewedByOwner, 1)
     })
   }
 

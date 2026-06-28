@@ -91,6 +91,24 @@ export interface Adapter {
   ): Promise<number>
 
   /**
+   * Renew the acquired timestamp of in-flight jobs (heartbeat).
+   *
+   * A worker calls this periodically for the jobs it is actively processing
+   * so that long-running handlers are not mistaken for stalled jobs and
+   * re-delivered while they are still running. Only jobs that are still active
+   * AND still owned by the calling worker (the one set via setWorkerId) are
+   * renewed; jobs that have already been recovered/completed, or have since
+   * been re-acquired by another worker, are skipped. This prevents a slow
+   * worker from resurrecting a job or sabotaging the recovery of the worker
+   * that legitimately owns it now with a late heartbeat.
+   *
+   * @param queue - The queue the jobs belong to
+   * @param jobIds - The ids of the jobs currently being processed
+   * @returns Number of jobs whose timestamp was renewed
+   */
+  renewJobs(queue: string, jobIds: string[]): Promise<number>
+
+  /**
    * Mark a job as completed and remove it from the queue.
    *
    * @param jobId - The job ID to complete

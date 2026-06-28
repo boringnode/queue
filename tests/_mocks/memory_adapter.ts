@@ -14,6 +14,7 @@ interface ActiveJob {
   job: JobData
   acquiredAt: number
   queue: string
+  workerId: string
 }
 
 interface DelayedJob {
@@ -42,8 +43,11 @@ export class MemoryAdapter implements Adapter {
   #pendingTimeouts: Set<NodeJS.Timeout> = new Set()
   #schedules: Map<string, ScheduleData> = new Map()
   #dedupIndex: Map<string, Map<string, DedupEntry>> = new Map()
+  #workerId: string = ''
 
-  setWorkerId(_workerId: string): void {}
+  setWorkerId(workerId: string): void {
+    this.#workerId = workerId
+  }
 
   async size(): Promise<number> {
     return this.sizeOf('default')
@@ -148,7 +152,7 @@ export class MemoryAdapter implements Adapter {
     }
 
     const acquiredAt = Date.now()
-    this.#activeJobs.set(job.id, { job, acquiredAt, queue })
+    this.#activeJobs.set(job.id, { job, acquiredAt, queue, workerId: this.#workerId })
 
     return { ...job, acquiredAt }
   }
@@ -251,6 +255,21 @@ export class MemoryAdapter implements Adapter {
     }
 
     return recovered
+  }
+
+  async renewJobs(queue: string, jobIds: string[]): Promise<number> {
+    const now = Date.now()
+    let renewed = 0
+
+    for (const jobId of jobIds) {
+      const active = this.#activeJobs.get(jobId)
+      if (active && active.queue === queue && active.workerId === this.#workerId) {
+        active.acquiredAt = now
+        renewed++
+      }
+    }
+
+    return renewed
   }
 
   async getJob(jobId: string, queue: string): Promise<JobRecord | null> {
