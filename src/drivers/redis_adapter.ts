@@ -418,6 +418,7 @@ export class RedisAdapter implements Adapter {
       1,
       keys.active,
       now.toString(),
+      this.#workerId,
       ...jobIds
     )
 

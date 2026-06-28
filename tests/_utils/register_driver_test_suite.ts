@@ -1279,6 +1279,33 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       assert.isNotNull(job2)
       assert.notEqual(job1!.id, job2!.id, 'Workers should acquire different jobs')
     })
+
+    test('renewJobs should not renew a job owned by another worker', async ({ assert }) => {
+      const adapter1 = await options.createAdapter()
+      const adapter2 = await options.createAdapter()
+
+      adapter1.setWorkerId('worker-1')
+      adapter2.setWorkerId('worker-2')
+
+      await adapter1.pushOn('test-queue', {
+        id: 'job-1',
+        name: 'TestJob',
+        payload: {},
+        attempts: 0,
+      })
+
+      // worker-1 acquires the job, so worker-2 does not own its lease.
+      const job = await adapter1.popFrom('test-queue')
+      assert.equal(job!.id, 'job-1')
+
+      // worker-2 must not be able to renew a job it doesn't own.
+      const renewedByOther = await adapter2.renewJobs('test-queue', ['job-1'])
+      assert.equal(renewedByOther, 0)
+
+      // The legitimate owner can still renew it.
+      const renewedByOwner = await adapter1.renewJobs('test-queue', ['job-1'])
+      assert.equal(renewedByOwner, 1)
+    })
   }
 
   test('upsertSchedule should create a new schedule', async ({ assert }) => {

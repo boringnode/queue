@@ -637,11 +637,13 @@ export class KnexAdapter implements Adapter {
 
     const now = Date.now()
 
-    // Only renew jobs that are still active; a job that was already recovered
-    // or finalized will not match and is therefore never resurrected.
+    // Only renew jobs that are still active AND still owned by this worker; a
+    // job that was already recovered, finalized, or re-acquired by another
+    // worker will not match and is therefore never resurrected.
     const renewed = await this.#connection(this.#jobsTable)
       .where('queue', queue)
       .where('status', 'active')
+      .where('worker_id', this.#workerId)
       .whereIn('id', jobIds)
       .update({ acquired_at: now })
 

@@ -28,6 +28,7 @@ interface ActiveJob {
   job: JobData
   acquiredAt: number
   queue: string
+  workerId: string
 }
 
 interface DelayedJob {
@@ -81,6 +82,7 @@ export class FakeAdapter implements Adapter {
   #pushedJobs: FakeJobRecord[] = []
   #dedupIndex = new Map<string, Map<string, DedupEntry>>()
   #onDispose?: () => void
+  #workerId: string = ''
 
   /**
    * Set the function to call when the fake is disposed
@@ -94,7 +96,9 @@ export class FakeAdapter implements Adapter {
     this.#onDispose?.()
   }
 
-  setWorkerId(_workerId: string): void {}
+  setWorkerId(workerId: string): void {
+    this.#workerId = workerId
+  }
 
   getPushedJobs(): FakeJobRecord[] {
     return [...this.#pushedJobs]
@@ -240,7 +244,7 @@ export class FakeAdapter implements Adapter {
     }
 
     const acquiredAt = Date.now()
-    this.#activeJobs.set(job.id, { job, acquiredAt, queue })
+    this.#activeJobs.set(job.id, { job, acquiredAt, queue, workerId: this.#workerId })
 
     return { ...job, acquiredAt }
   }
@@ -351,7 +355,7 @@ export class FakeAdapter implements Adapter {
 
     for (const jobId of jobIds) {
       const active = this.#activeJobs.get(jobId)
-      if (active && active.queue === queue) {
+      if (active && active.queue === queue && active.workerId === this.#workerId) {
         active.acquiredAt = now
         renewed++
       }
