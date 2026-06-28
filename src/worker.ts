@@ -74,7 +74,12 @@ export class Worker {
   #generator?: AsyncGenerator<WorkerCycle, void, unknown>
   #pool?: JobPool
   #lastStalledCheck = 0
-  #shutdownHandler?: () => Promise<void>
+  #shutdownHandlers?: {
+    SIGINT: () => void
+    SIGTERM: () => void
+  }
+  #shutdownInProgress = false
+  #sigtermReceived = false
 
   /** Unique identifier for this worker instance */
   get id() {
@@ -507,25 +512,59 @@ export class Worker {
       return
     }
 
-    this.#shutdownHandler = async () => {
-      debug('received shutdown signal, stopping worker...')
-
-      if (this.#onShutdownSignal) {
-        await this.#onShutdownSignal()
-      }
-
-      await this.stop()
+    this.#shutdownInProgress = false
+    this.#sigtermReceived = false
+    this.#shutdownHandlers = {
+      SIGINT: () => void this.#handleShutdownSignal('SIGINT'),
+      SIGTERM: () => void this.#handleShutdownSignal('SIGTERM'),
     }
 
-    process.on('SIGINT', this.#shutdownHandler)
-    process.on('SIGTERM', this.#shutdownHandler)
+    process.on('SIGINT', this.#shutdownHandlers.SIGINT)
+    process.on('SIGTERM', this.#shutdownHandlers.SIGTERM)
+  }
+
+  async #handleShutdownSignal(signal: NodeJS.Signals): Promise<void> {
+    const logger = QueueManager.getLogger()
+
+    if (signal === 'SIGTERM') {
+      if (this.#sigtermReceived) {
+        logger.warn(
+          { workerId: this.#id, signal },
+          'Received SIGTERM while shutdown is already in progress. Sending SIGKILL.'
+        )
+        process.kill(process.pid, 'SIGKILL')
+        return
+      }
+
+      this.#sigtermReceived = true
+
+      logger.info(
+        { workerId: this.#id, signal, runningJobs: this.#pool?.size ?? 0 },
+        'Received SIGTERM. Waiting for running jobs to drain before shutdown. ' +
+          'If shutdown never completes, a job may be blocked.'
+      )
+    }
+
+    if (this.#shutdownInProgress) {
+      return
+    }
+
+    this.#shutdownInProgress = true
+
+    debug('received shutdown signal, stopping worker...')
+
+    if (this.#onShutdownSignal) {
+      await this.#onShutdownSignal()
+    }
+
+    await this.stop()
   }
 
   #removeShutdownHandlers() {
-    if (this.#shutdownHandler) {
-      process.off('SIGINT', this.#shutdownHandler)
-      process.off('SIGTERM', this.#shutdownHandler)
-      this.#shutdownHandler = undefined
+    if (this.#shutdownHandlers) {
+      process.off('SIGINT', this.#shutdownHandlers.SIGINT)
+      process.off('SIGTERM', this.#shutdownHandlers.SIGTERM)
+      this.#shutdownHandlers = undefined
     }
   }
 

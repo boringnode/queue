@@ -2,6 +2,7 @@ import { test } from '@japa/runner'
 import { setTimeout } from 'node:timers/promises'
 import { Worker } from '../src/worker.js'
 import { MemoryAdapter, memory } from './_mocks/memory_adapter.js'
+import { MemoryLogger } from './_mocks/memory_logger.js'
 import { ChaosAdapter } from './_mocks/chaos_adapter.js'
 import type { QueueManagerConfig } from '../src/types/main.js'
 import { Locator } from '../src/locator.js'
@@ -1267,6 +1268,154 @@ test.group('Worker', () => {
     await Promise.race([startPromise, setTimeout(500)])
 
     assert.isTrue(callbackInvoked, 'onShutdownSignal should be called on SIGINT')
+  })
+
+  test('logs when SIGTERM starts draining jobs', async ({ assert, cleanup }) => {
+    let markStarted: () => void = () => {}
+    let releaseJob: () => void = () => {}
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    const release = new Promise<void>((resolve) => {
+      releaseJob = resolve
+    })
+
+    class DrainingJob extends Job {
+      async execute() {
+        markStarted()
+        await release
+      }
+    }
+
+    const logger = new MemoryLogger()
+    const sharedAdapter = memory()()
+
+    const localConfig = {
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      logger,
+      worker: {
+        gracefulShutdown: true,
+      },
+    }
+
+    Locator.register('DrainingJob', DrainingJob)
+
+    const worker = new Worker(localConfig)
+    let startPromise: Promise<void> = Promise.resolve()
+
+    cleanup(async () => {
+      releaseJob()
+      Locator.clear()
+      await Promise.race([startPromise, setTimeout(500)])
+    })
+
+    await sharedAdapter.push({
+      id: 'draining-job-1',
+      name: 'DrainingJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    startPromise = worker.start(['default'])
+    await started
+
+    process.emit('SIGTERM')
+
+    const stoppedBeforeDrain = await Promise.race([
+      startPromise.then(() => true),
+      setTimeout(30).then(() => false),
+    ])
+
+    const log = logger.logs.find((entry) => entry.level === 'info')
+    assert.exists(log)
+    assert.include(log!.message, 'Received SIGTERM')
+    assert.include(log!.message, 'Waiting for running jobs to drain before shutdown')
+    assert.include(log!.message, 'a job may be blocked')
+    assert.equal(log!.obj?.signal, 'SIGTERM')
+    assert.equal(log!.obj?.runningJobs, 1)
+    assert.isFalse(stoppedBeforeDrain)
+
+    releaseJob()
+    await Promise.race([startPromise, setTimeout(500)])
+  })
+
+  test('forces process exit when SIGTERM is received during shutdown', async ({
+    assert,
+    cleanup,
+  }) => {
+    let markStarted: () => void = () => {}
+    let releaseJob: () => void = () => {}
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    const release = new Promise<void>((resolve) => {
+      releaseJob = resolve
+    })
+
+    class BlockingJob extends Job {
+      async execute() {
+        markStarted()
+        await release
+      }
+    }
+
+    const logger = new MemoryLogger()
+    const sharedAdapter = memory()()
+    const localConfig = {
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      logger,
+      worker: {
+        gracefulShutdown: true,
+      },
+    }
+
+    Locator.register('BlockingJob', BlockingJob)
+
+    const worker = new Worker(localConfig)
+    const originalKill = process.kill
+    let killed: { pid: number; signal?: string | number } | undefined
+    let startPromise: Promise<void> = Promise.resolve()
+
+    process.kill = ((pid: number, signal?: string | number) => {
+      killed = { pid, signal }
+      return true
+    }) as typeof process.kill
+
+    cleanup(async () => {
+      process.kill = originalKill
+      releaseJob()
+      Locator.clear()
+      await Promise.race([startPromise, setTimeout(500)])
+    })
+
+    await sharedAdapter.push({
+      id: 'blocking-job-1',
+      name: 'BlockingJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    startPromise = worker.start(['default'])
+    await started
+
+    process.emit('SIGTERM')
+    await setTimeout(10)
+
+    process.emit('SIGTERM')
+
+    assert.deepEqual(killed, { pid: process.pid, signal: 'SIGKILL' })
+
+    const warning = logger.logs.find((entry) => entry.level === 'warn')
+    assert.exists(warning)
+    assert.include(warning!.message, 'Sending SIGKILL')
+
+    releaseJob()
+    process.kill = originalKill
+    await Promise.race([startPromise, setTimeout(500)])
   })
 })
 
