@@ -4,6 +4,7 @@ import { Locator } from './locator.js'
 import { consoleLogger, type Logger } from './logger.js'
 import { FakeAdapter } from './drivers/fake_adapter.js'
 import { QueueConfigResolver } from './queue_config_resolver.js'
+import { JobExecutionRuntime } from './job_runtime.js'
 import type { Adapter } from './contracts/adapter.js'
 import type { AdapterFactory, JobFactory, QueueManagerConfig } from './types/main.js'
 
@@ -383,6 +384,22 @@ class QueueManagerSingleton {
     }
 
     return this.#configResolver
+  }
+
+  /**
+   * Create the configured in-process Job execution runtime.
+   */
+  getJobExecutionRuntime(): JobExecutionRuntime {
+    if (!this.#initialized) {
+      throw new errors.E_QUEUE_NOT_INITIALIZED()
+    }
+
+    return new JobExecutionRuntime({
+      resolveJob: (jobName) => Locator.resolveOrThrow(jobName),
+      configResolver: this.#configResolver,
+      jobFactory: this.#jobFactory,
+      executionWrapper: this.#executionWrapper,
+    })
   }
 
   #validateConfig(config: QueueManagerConfig): void {
