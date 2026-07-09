@@ -453,7 +453,7 @@ export class Worker {
     payload: unknown
   }> {
     try {
-      const JobClass = Locator.getOrThrow(job.name)
+      const JobClass = await Locator.resolveOrThrow(job.name)
 
       const context: JobContext = {
         jobId: job.id,
@@ -637,7 +637,7 @@ export class Worker {
       )
 
       // Get the job class to determine the target queue
-      const JobClass = Locator.get(schedule.name)
+      const JobClass = await Locator.resolve(schedule.name)
       const queue = JobClass?.options?.queue ?? 'default'
 
       const jobData = {

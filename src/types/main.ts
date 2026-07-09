@@ -708,6 +708,19 @@ export interface QueueManagerConfig {
   autoLoadJobs?: boolean
 
   /**
+   * Whether jobs discovered from `locations` should be resolved from their
+   * module on each execution.
+   *
+   * This is intended for development with Hot Hook (or a framework such as
+   * AdonisJS that already installs Hot Hook). The queue does not start or
+   * depend on Hot Hook itself; it only keeps the dynamic import boundary needed
+   * for Hot Hook to return the latest job module.
+   *
+   * @default false
+   */
+  hotReload?: boolean
+
+  /**
    * Logger used by the queue runtime.
    *
    * Defaults to the console logger.

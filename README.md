@@ -32,6 +32,7 @@ npm install @boringnode/queue
 - **Job History**: Retain completed/failed jobs for debugging
 - **Scheduled Jobs**: Cron or interval-based recurring jobs
 - **Auto-Discovery**: Automatically register jobs from specified locations
+- **Development Hot Reload**: Run the latest job implementation without restarting workers
 
 ## Quick Start
 
@@ -98,6 +99,74 @@ import { Worker } from '@boringnode/queue'
 const worker = new Worker(config)
 await worker.start(['default', 'email'])
 ```
+
+## Hot Reloading Jobs
+
+During development, jobs discovered from `locations` can be reloaded before each execution. This
+allows a long-running worker to use the latest saved job implementation without restarting.
+
+Hot reload support integrates with [Hot Hook](https://github.com/Julien-R44/hot-hook). Install and
+initialize Hot Hook in your application, then enable `hotReload` on the queue manager.
+
+```bash
+npm install --save-dev hot-hook
+```
+
+```typescript
+await QueueManager.init({
+  default: 'redis',
+  adapters: {
+    redis: redis({ host: 'localhost', port: 6379 }),
+  },
+  locations: ['./app/jobs/**/*.ts'],
+  hotReload: process.env.NODE_ENV === 'development',
+})
+```
+
+The process executing the jobs must be running with Hot Hook. For example, AdonisJS applications
+can start their development server with HMR enabled:
+
+```bash
+node ace serve --hmr
+```
+
+If the worker runs in a separate process, that worker process must also initialize Hot Hook. Enabling
+HMR only in the HTTP server does not affect jobs executed by another process. Follow the
+[Hot Hook initialization guide](https://github.com/Julien-R44/hot-hook#initialization) when using it
+outside the AdonisJS development server.
+
+### How it works
+
+Jobs loaded from `locations` are registered normally during `QueueManager.init()`. With
+`hotReload: true`, the worker dynamically imports the job module again before every execution. Hot
+Hook invalidates changed modules and their reloadable dependencies, allowing the dynamic import to
+return the latest job class. The queue marks these imports as Hot Hook boundaries, so jobs do not
+need to be repeated in Hot Hook's `boundaries` configuration. The queue does not install,
+initialize, or run Hot Hook itself.
+
+`Locator.registerFromGlob()` can also enable this behavior directly:
+
+```typescript
+import { Locator } from '@boringnode/queue'
+
+await Locator.registerFromGlob(['./app/jobs/**/*.ts'], { hotReload: true })
+
+const JobClass = await Locator.resolve('SendEmailJob')
+```
+
+### Limitations
+
+- Use `hotReload` during development only. Leave it disabled in production.
+- Only jobs discovered from `locations`, or registered with `Locator.registerFromGlob()`, can be
+  reloaded. Jobs registered manually with `Locator.register()` do not have a module path to reload.
+- A running job instance keeps the version it started with. The latest version is used by the next
+  execution.
+- Adding, deleting, moving, or renaming a job requires a process restart so the job registry can be
+  rebuilt.
+- Changing a job's configured `name` also requires a restart. Already queued jobs continue to refer
+  to the name stored when they were dispatched.
+- Avoid import-time side effects in job modules, since their module code may execute again after an
+  invalidation.
 
 ## Bulk Dispatch
 

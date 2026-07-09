@@ -161,7 +161,7 @@ export class SyncAdapter implements Adapter {
   }
 
   async #execute(jobData: JobData, queue: string = 'default'): Promise<void> {
-    const JobClass = Locator.get(jobData.name)
+    const JobClass = await Locator.resolve(jobData.name)
 
     if (!JobClass) {
       throw new Error(`Job class ${jobData.name} not found.`)
