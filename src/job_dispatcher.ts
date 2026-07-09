@@ -1,10 +1,5 @@
-import debug from './debug.js'
-import { randomUUID } from 'node:crypto'
-import { QueueManager } from './queue_manager.js'
-import { dispatchChannel } from './tracing_channels.js'
-import type { Adapter } from './contracts/adapter.js'
-import type { DispatchResult, Duration } from './types/main.js'
-import type { JobDispatchMessage } from './types/tracing_channels.js'
+import { jobDispatchRuntime } from './job_dispatch_runtime.js'
+import type { AdapterSelector, DispatchResult, Duration, JobOptions } from './types/main.js'
 import { parse } from './utils.js'
 
 /**
@@ -43,8 +38,9 @@ import { parse } from './utils.js'
 export class JobDispatcher<T> {
   readonly #name: string
   readonly #payload: T
-  #queue: string = 'default'
-  #adapter?: string | (() => Adapter)
+  readonly #jobOptions?: () => JobOptions
+  #queue?: string
+  #adapter?: AdapterSelector
   #delay?: Duration
   #priority?: number
   #groupId?: string
@@ -61,9 +57,10 @@ export class JobDispatcher<T> {
    * @param name - The job class name (used to locate the class at runtime)
    * @param payload - The data to pass to the job
    */
-  constructor(name: string, payload: T) {
+  constructor(name: string, payload: T, jobOptions?: () => JobOptions) {
     this.#name = name
     this.#payload = payload
+    this.#jobOptions = jobOptions
   }
 
   /**
@@ -207,7 +204,8 @@ export class JobDispatcher<T> {
     // adapter storage limit (Knex column is VARCHAR(510)). Reject long
     // combinations early so the failure surfaces at dispatch time rather
     // than at insert.
-    const prefixedLength = this.#name.length + 2 + options.id.length
+    const jobName = this.#jobOptions?.().name ?? this.#name
+    const prefixedLength = jobName.length + 2 + options.id.length
     if (prefixedLength > 510) {
       throw new Error(
         `Dedup ID combined with job name exceeds 510 characters ` +
@@ -252,7 +250,7 @@ export class JobDispatcher<T> {
    * await Job.dispatch(payload).with(() => new CustomAdapter())
    * ```
    */
-  with(adapter: string | (() => Adapter)) {
+  with(adapter: AdapterSelector) {
     this.#adapter = adapter
 
     return this
@@ -270,58 +268,22 @@ export class JobDispatcher<T> {
    * ```
    */
   async run(): Promise<DispatchResult> {
-    const id = randomUUID()
-    const dedupId = this.#dedup ? `${this.#name}::${this.#dedup.id}` : undefined
+    const jobOptions = this.#jobOptions?.()
 
-    debug('dispatching job %s with id %s using payload %s', this.#name, id, this.#payload)
-
-    const adapter = this.#getAdapterInstance()
-    const wrapInternal = QueueManager.getInternalOperationWrapper()
-    const parsedDelay = this.#delay ? parse(this.#delay) : undefined
-
-    const jobData = {
-      id,
-      name: this.#name,
+    return jobDispatchRuntime.dispatch({
+      kind: 'single',
+      name: jobOptions?.name ?? this.#name,
       payload: this.#payload,
-      attempts: 0,
-      priority: this.#priority,
-      groupId: this.#groupId,
-      createdAt: Date.now(),
-      ...(dedupId
-        ? {
-            dedup: {
-              id: dedupId,
-              ttl: this.#dedup!.ttl,
-              extend: this.#dedup!.extend,
-              replace: this.#dedup!.replace,
-            },
-          }
-        : {}),
-    }
-
-    const message: JobDispatchMessage = { jobs: [jobData], queue: this.#queue, delay: parsedDelay }
-
-    let pushResult: { outcome: DispatchResult['deduped']; jobId: string } | undefined
-    await dispatchChannel.tracePromise(async () => {
-      const result =
-        parsedDelay !== undefined
-          ? await wrapInternal(() => adapter.pushLaterOn(this.#queue, jobData, parsedDelay))
-          : await wrapInternal(() => adapter.pushOn(this.#queue, jobData))
-
-      if (result && typeof result === 'object' && 'outcome' in result) {
-        pushResult = { outcome: result.outcome, jobId: result.jobId }
-        message.dedupOutcome = result.outcome
-      }
-    }, message)
-
-    if (pushResult && this.#dedup) {
-      return {
-        jobId: pushResult.jobId,
-        deduped: pushResult.outcome,
-      }
-    }
-
-    return { jobId: id }
+      jobOptions,
+      overrides: {
+        queue: this.#queue,
+        adapter: this.#adapter,
+        delay: this.#delay,
+        priority: this.#priority,
+        groupId: this.#groupId,
+        dedup: this.#dedup,
+      },
+    })
   }
 
   /**
@@ -338,17 +300,5 @@ export class JobDispatcher<T> {
     onRejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
   ): Promise<TResult1 | TResult2> {
     return this.run().then(onFulfilled, onRejected)
-  }
-
-  #getAdapterInstance(): Adapter {
-    if (!this.#adapter) {
-      return QueueManager.use()
-    }
-
-    if (typeof this.#adapter === 'string') {
-      return QueueManager.use(this.#adapter)
-    }
-
-    return this.#adapter()
   }
 }

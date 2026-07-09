@@ -20,6 +20,9 @@ export type { Logger }
  */
 export type Duration = number | string
 
+/** Registered Adapter name or factory used to select an Adapter. */
+export type AdapterSelector = string | (() => Adapter)
+
 /**
  * Retention policy for completed/failed jobs.
  *
@@ -145,6 +148,9 @@ export interface JobData {
    */
   groupId?: string
 
+  /** Schedule that caused this Job to be dispatched, when applicable. */
+  scheduleId?: string
+
   /**
    * Timestamp (ms) when the job was dispatched.
    * Used to compute queue wait time in OTel instrumentation.
@@ -247,7 +253,7 @@ export interface JobOptions {
    *
    * Defaults to the queue manager's configured default adapter.
    */
-  adapter?: string | (() => Adapter)
+  adapter?: AdapterSelector
 
   /**
    * Maximum retry attempts before permanent failure.
@@ -340,6 +346,9 @@ export interface JobContext {
 
   /** Number of times this job has been recovered from stalled state */
   stalledCount: number
+
+  /** Schedule that caused this Job to be dispatched, when applicable. */
+  scheduleId?: string
 }
 
 /**
@@ -460,6 +469,12 @@ export interface QueueConfig {
  * Runtime options for workers that poll queues and execute jobs.
  */
 export interface WorkerConfig {
+  /**
+   * Registered Adapter this Worker listens on.
+   * Falls back to the queue manager's default Adapter.
+   */
+  adapter?: string
+
   /**
    * Maximum number of jobs to process concurrently.
    * @default 1
@@ -640,6 +655,11 @@ export interface ScheduleData {
 export interface ScheduleResult {
   /** Unique identifier for the schedule */
   scheduleId: string
+}
+
+/** Selects the Adapter used to access persisted Schedules. */
+export interface ScheduleAccessOptions {
+  adapter?: AdapterSelector
 }
 
 /**

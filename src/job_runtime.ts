@@ -173,6 +173,7 @@ export class JobExecutionRuntime {
       priority: job.priority ?? DEFAULT_PRIORITY,
       acquiredAt: new Date(job.acquiredAt),
       stalledCount: job.stalledCount ?? 0,
+      ...(job.scheduleId ? { scheduleId: job.scheduleId } : {}),
     }
   }
 

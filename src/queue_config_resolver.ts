@@ -98,6 +98,13 @@ export class QueueConfigResolver {
   }
 
   /**
+   * Return the Adapter configured for a queue, if any.
+   */
+  getQueueAdapter(queue: string): string | undefined {
+    return this.#queueConfigs.get(queue)?.adapter
+  }
+
+  /**
    * Normalize job retry settings so top-level `maxRetries` participates in the
    * merge like `retry.maxRetries`.
    */

@@ -1,10 +1,5 @@
-import debug from './debug.js'
-import { randomUUID } from 'node:crypto'
-import { QueueManager } from './queue_manager.js'
-import { dispatchChannel } from './tracing_channels.js'
-import type { Adapter } from './contracts/adapter.js'
-import type { DispatchManyResult } from './types/main.js'
-import type { JobDispatchMessage } from './types/tracing_channels.js'
+import { jobDispatchRuntime } from './job_dispatch_runtime.js'
+import type { AdapterSelector, DispatchManyResult, JobOptions } from './types/main.js'
 
 /**
  * Fluent builder for dispatching multiple jobs to the queue in a single batch.
@@ -40,8 +35,9 @@ import type { JobDispatchMessage } from './types/tracing_channels.js'
 export class JobBatchDispatcher<T> {
   readonly #name: string
   readonly #payloads: T[]
-  #queue: string = 'default'
-  #adapter?: string | (() => Adapter)
+  readonly #jobOptions?: () => JobOptions
+  #queue?: string
+  #adapter?: AdapterSelector
   #priority?: number
   #groupId?: string
 
@@ -51,9 +47,10 @@ export class JobBatchDispatcher<T> {
    * @param name - The job class name (used to locate the class at runtime)
    * @param payloads - Array of data to pass to each job
    */
-  constructor(name: string, payloads: T[]) {
+  constructor(name: string, payloads: T[], jobOptions?: () => JobOptions) {
     this.#name = name
     this.#payloads = payloads
+    this.#jobOptions = jobOptions
   }
 
   /**
@@ -127,7 +124,7 @@ export class JobBatchDispatcher<T> {
    * await Job.dispatchMany(payloads).with('redis')
    * ```
    */
-  with(adapter: string | (() => Adapter)) {
+  with(adapter: AdapterSelector) {
     this.#adapter = adapter
 
     return this
@@ -145,31 +142,20 @@ export class JobBatchDispatcher<T> {
    * ```
    */
   async run(): Promise<DispatchManyResult> {
-    if (this.#payloads.length === 0) return { jobIds: [] }
+    const jobOptions = this.#jobOptions?.()
 
-    debug('dispatching %d jobs of type %s', this.#payloads.length, this.#name)
-
-    const adapter = this.#getAdapterInstance()
-    const wrapInternal = QueueManager.getInternalOperationWrapper()
-
-    const now = Date.now()
-    const jobs = this.#payloads.map((payload) => ({
-      id: randomUUID(),
-      name: this.#name,
-      payload,
-      attempts: 0,
-      priority: this.#priority,
-      groupId: this.#groupId,
-      createdAt: now,
-    }))
-
-    const message: JobDispatchMessage = { jobs, queue: this.#queue }
-
-    await dispatchChannel.tracePromise(async () => {
-      await wrapInternal(() => adapter.pushManyOn(this.#queue, jobs))
-    }, message)
-
-    return { jobIds: jobs.map((job) => job.id) }
+    return jobDispatchRuntime.dispatch({
+      kind: 'batch',
+      name: jobOptions?.name ?? this.#name,
+      payloads: this.#payloads,
+      jobOptions,
+      overrides: {
+        queue: this.#queue,
+        adapter: this.#adapter,
+        priority: this.#priority,
+        groupId: this.#groupId,
+      },
+    })
   }
 
   /**
@@ -186,17 +172,5 @@ export class JobBatchDispatcher<T> {
     onRejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
   ): Promise<TResult1 | TResult2> {
     return this.run().then(onFulfilled, onRejected)
-  }
-
-  #getAdapterInstance(): Adapter {
-    if (!this.#adapter) {
-      return QueueManager.use()
-    }
-
-    if (typeof this.#adapter === 'string') {
-      return QueueManager.use(this.#adapter)
-    }
-
-    return this.#adapter()
   }
 }

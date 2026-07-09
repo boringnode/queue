@@ -559,6 +559,7 @@ async execute(): Promise<void> {
   console.log(this.context.priority)    // Priority value
   console.log(this.context.acquiredAt)  // When acquired
   console.log(this.context.stalledCount) // Stall recoveries
+  console.log(this.context.scheduleId)  // Originating Schedule, when applicable
 }
 ```
 
@@ -573,6 +574,7 @@ await MetricsJob.schedule({ endpoint: '/health' }).every('10s')
 // Cron schedule
 await CleanupJob.schedule({ days: 30 })
   .id('daily-cleanup')
+  .with('redis')
   .cron('0 0 * * *') // Midnight daily
   .timezone('Europe/Paris')
 ```
@@ -593,6 +595,10 @@ await schedule.delete()
 // List schedules
 const all = await Schedule.list()
 const active = await Schedule.list({ status: 'active' })
+
+// Access schedules stored on a non-default Adapter
+const redisSchedule = await Schedule.find('daily-cleanup', { adapter: 'redis' })
+const redisSchedules = await Schedule.list({}, { adapter: 'redis' })
 ```
 
 **Schedule options:**
@@ -606,6 +612,10 @@ const active = await Schedule.list({ status: 'active' })
 | `.from(date)`       | Start boundary                    |
 | `.to(date)`         | End boundary                      |
 | `.limit(n)`         | Maximum runs                      |
+| `.with(adapter)`    | Adapter that owns the Schedule    |
+
+A Schedule and every Job it dispatches stay on the same Adapter. Start a Worker for each Adapter
+that owns Schedules.
 
 </details>
 
@@ -648,6 +658,7 @@ export default class SendEmailJob extends Job<SendEmailPayload> {
 ```typescript
 const config = {
   worker: {
+    adapter: 'redis', // Registered Adapter listened to by this Worker
     concurrency: 5, // Parallel jobs
     idleDelay: '2s', // Poll interval when idle
     timeout: '1m', // Default job timeout

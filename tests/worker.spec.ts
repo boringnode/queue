@@ -62,6 +62,46 @@ test.group('Worker', () => {
     assert.isNumber(cycle.suggestedDelay)
   })
 
+  test('should listen on the configured Worker Adapter', async ({ assert, cleanup }) => {
+    let executed = false
+
+    class AdapterWorkerJob extends Job {
+      async execute() {
+        executed = true
+      }
+    }
+
+    const defaultAdapter = memory()()
+    const workerAdapter = memory()()
+    const worker = new Worker({
+      default: 'default',
+      adapters: {
+        default: () => defaultAdapter,
+        worker: () => workerAdapter,
+      },
+      worker: { adapter: 'worker' },
+    })
+
+    Locator.register('AdapterWorkerJob', AdapterWorkerJob)
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await workerAdapter.push({
+      id: 'worker-adapter-job',
+      name: 'AdapterWorkerJob',
+      payload: {},
+      attempts: 0,
+    })
+
+    await worker.processCycle(['default'])
+    await worker.processCycle(['default'])
+
+    assert.isTrue(executed)
+    assert.equal(await defaultAdapter.size(), 0)
+  })
+
   test('should yield error when an exception occurs', async ({ assert, cleanup }) => {
     const chaosAdapter = new ChaosAdapter()
     chaosAdapter.alwaysThrow()
@@ -2050,6 +2090,100 @@ test.group('Worker | Scheduler Integration', () => {
     await worker.processCycle(['scheduled-queue']) // completed
 
     assert.equal(executedOnQueue, 'scheduled-queue')
+  })
+
+  test('should dispatch due Schedules with Job options and provenance', async ({
+    assert,
+    cleanup,
+  }) => {
+    let executedScheduleId: string | undefined
+
+    class ProvenanceScheduledJob extends Job {
+      static options = { queue: 'scheduled-queue', priority: 2 }
+
+      async execute() {
+        executedScheduleId = this.context.scheduleId
+      }
+    }
+
+    const sharedAdapter = memory()()
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+    })
+
+    Locator.register('ProvenanceScheduledJob', ProvenanceScheduledJob)
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await sharedAdapter.upsertSchedule({
+      id: 'provenance-schedule',
+      name: 'ProvenanceScheduledJob',
+      payload: {},
+      everyMs: 60000,
+      timezone: 'UTC',
+    })
+    await sharedAdapter.updateSchedule('provenance-schedule', {
+      nextRunAt: new Date(Date.now() - 1000),
+    })
+
+    const cycle = await worker.processCycle(['scheduled-queue'])
+
+    assert.equal(cycle?.type, 'started')
+    if (cycle?.type !== 'started') return
+    assert.equal(cycle.job.priority, 2)
+    assert.equal(cycle.job.scheduleId, 'provenance-schedule')
+    assert.isNumber(cycle.job.createdAt)
+
+    await worker.processCycle(['scheduled-queue'])
+    assert.equal(executedScheduleId, 'provenance-schedule')
+  })
+
+  test('should keep a due Schedule occurrence consumed when dispatch fails', async ({
+    assert,
+    cleanup,
+  }) => {
+    class FailingScheduleAdapter extends MemoryAdapter {
+      override async pushOn(): Promise<void> {
+        throw new Error('dispatch failed')
+      }
+    }
+
+    class FailingScheduledJob extends Job {
+      async execute() {}
+    }
+
+    const adapter = new FailingScheduleAdapter()
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => adapter },
+    })
+
+    Locator.register('FailingScheduledJob', FailingScheduledJob)
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await adapter.upsertSchedule({
+      id: 'failed-occurrence',
+      name: 'FailingScheduledJob',
+      payload: {},
+      everyMs: 60000,
+      timezone: 'UTC',
+    })
+    await adapter.updateSchedule('failed-occurrence', {
+      nextRunAt: new Date(Date.now() - 1000),
+    })
+
+    const cycle = await worker.processCycle(['default'])
+    const schedule = await adapter.getSchedule('failed-occurrence')
+
+    assert.equal(cycle?.type, 'error')
+    assert.equal(schedule?.runCount, 1)
+    assert.isTrue(schedule!.nextRunAt!.getTime() > Date.now())
   })
 
   test('should not dispatch paused schedules', async ({ assert, cleanup }) => {

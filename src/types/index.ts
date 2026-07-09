@@ -1,5 +1,6 @@
 export type {
   AdapterFactory,
+  AdapterSelector,
   BackoffConfig,
   BackoffStrategy,
   DispatchManyResult,
@@ -17,6 +18,7 @@ export type {
   QueueManagerConfig,
   RetryConfig,
   ScheduleConfig,
+  ScheduleAccessOptions,
   ScheduleData,
   ScheduleListOptions,
   ScheduleResult,

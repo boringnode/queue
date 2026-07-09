@@ -1,6 +1,12 @@
-import { QueueManager } from './queue_manager.js'
-import { JobDispatcher } from './job_dispatcher.js'
-import type { ScheduleData, ScheduleListOptions, ScheduleStatus } from './types/main.js'
+import { jobDispatchRuntime, resolveAdapterSelector } from './job_dispatch_runtime.js'
+import { Locator } from './locator.js'
+import type { Adapter } from './contracts/adapter.js'
+import type {
+  ScheduleAccessOptions,
+  ScheduleData,
+  ScheduleListOptions,
+  ScheduleStatus,
+} from './types/main.js'
 
 /**
  * Represents a persisted job schedule.
@@ -23,9 +29,11 @@ import type { ScheduleData, ScheduleListOptions, ScheduleStatus } from './types/
  */
 export class Schedule {
   readonly #data: ScheduleData
+  readonly #adapter?: Adapter
 
-  constructor(data: ScheduleData) {
+  constructor(data: ScheduleData, adapter?: Adapter) {
     this.#data = data
+    this.#adapter = adapter
   }
 
   get id(): string {
@@ -90,13 +98,13 @@ export class Schedule {
    * @param id - The schedule ID
    * @returns The schedule instance, or null if not found
    */
-  static async find(id: string): Promise<Schedule | null> {
-    const adapter = QueueManager.use()
+  static async find(id: string, access?: ScheduleAccessOptions): Promise<Schedule | null> {
+    const adapter = Schedule.#resolveAdapter(access)
     const data = await adapter.getSchedule(id)
 
     if (!data) return null
 
-    return new Schedule(data)
+    return new Schedule(data, adapter)
   }
 
   /**
@@ -105,11 +113,14 @@ export class Schedule {
    * @param options - Optional filters for listing
    * @returns Array of schedule instances
    */
-  static async list(options?: ScheduleListOptions): Promise<Schedule[]> {
-    const adapter = QueueManager.use()
+  static async list(
+    options?: ScheduleListOptions,
+    access?: ScheduleAccessOptions
+  ): Promise<Schedule[]> {
+    const adapter = Schedule.#resolveAdapter(access)
     const schedules = await adapter.listSchedules(options)
 
-    return schedules.map((data) => new Schedule(data))
+    return schedules.map((data) => new Schedule(data, adapter))
   }
 
   /**
@@ -117,8 +128,7 @@ export class Schedule {
    * No jobs will be dispatched while paused.
    */
   async pause(): Promise<void> {
-    const adapter = QueueManager.use()
-    await adapter.updateSchedule(this.#data.id, { status: 'paused' })
+    await this.#getAdapter().updateSchedule(this.#data.id, { status: 'paused' })
     this.#data.status = 'paused'
   }
 
@@ -127,8 +137,7 @@ export class Schedule {
    * Jobs will be dispatched according to the schedule.
    */
   async resume(): Promise<void> {
-    const adapter = QueueManager.use()
-    await adapter.updateSchedule(this.#data.id, { status: 'active' })
+    await this.#getAdapter().updateSchedule(this.#data.id, { status: 'active' })
     this.#data.status = 'active'
   }
 
@@ -136,8 +145,7 @@ export class Schedule {
    * Delete this schedule permanently.
    */
   async delete(): Promise<void> {
-    const adapter = QueueManager.use()
-    await adapter.deleteSchedule(this.#data.id)
+    await this.#getAdapter().deleteSchedule(this.#data.id)
   }
 
   /**
@@ -154,11 +162,16 @@ export class Schedule {
       return
     }
 
-    const adapter = QueueManager.use()
-
-    // Dispatch the job
-    const dispatcher = new JobDispatcher(this.#data.name, payload ?? this.#data.payload)
-    await dispatcher.run()
+    const adapter = this.#getAdapter()
+    const JobClass = await Locator.resolve(this.#data.name)
+    await jobDispatchRuntime.dispatch({
+      kind: 'single',
+      name: this.#data.name,
+      payload: payload ?? this.#data.payload,
+      jobOptions: JobClass?.options,
+      overrides: { adapter: () => adapter },
+      scheduleId: this.#data.id,
+    })
 
     // Update run metadata
     const now = new Date()
@@ -171,5 +184,13 @@ export class Schedule {
 
     this.#data.runCount = newRunCount
     this.#data.lastRunAt = now
+  }
+
+  static #resolveAdapter(access?: ScheduleAccessOptions): Adapter {
+    return resolveAdapterSelector(access?.adapter)
+  }
+
+  #getAdapter(): Adapter {
+    return this.#adapter ?? resolveAdapterSelector()
   }
 }

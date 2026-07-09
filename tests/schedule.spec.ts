@@ -261,6 +261,33 @@ test.group('Schedule', (group) => {
     assert.isTrue(schedules.every((s) => s instanceof Schedule))
   })
 
+  test('Schedule.find() should retain the selected Adapter for later changes', async ({
+    assert,
+  }) => {
+    const defaultAdapter = memory()()
+    const scheduleAdapter = memory()()
+
+    await QueueManager.init({
+      default: 'default',
+      adapters: {
+        default: () => defaultAdapter,
+        schedules: () => scheduleAdapter,
+      },
+    })
+
+    await new ScheduleBuilder('OwnedJob', {})
+      .with('schedules')
+      .id('owned-schedule')
+      .every('1h')
+      .run()
+
+    const schedule = await Schedule.find('owned-schedule', { adapter: 'schedules' })
+    await schedule!.pause()
+
+    assert.equal((await scheduleAdapter.getSchedule('owned-schedule'))?.status, 'paused')
+    assert.isNull(await defaultAdapter.getSchedule('owned-schedule'))
+  })
+
   test('Schedule.list() should filter by status', async ({ assert }) => {
     await new ScheduleBuilder('Job1', {}).id('active-schedule').every('5m').run()
 
@@ -321,6 +348,30 @@ test.group('Schedule', (group) => {
     assert.isNotNull(job)
     assert.equal(job!.name, 'TriggerJob')
     assert.deepEqual(job!.payload, { immediate: true })
+  })
+
+  test('schedule.trigger() should apply Job options and record provenance', async ({
+    assert,
+    cleanup,
+  }) => {
+    class StaticTriggerJob extends Job {
+      static options = { queue: 'manual', priority: 3 }
+
+      async execute() {}
+    }
+
+    Locator.register('StaticTriggerJob', StaticTriggerJob)
+    cleanup(() => Locator.clear())
+
+    await new ScheduleBuilder('StaticTriggerJob', {}).id('manual-trigger').every('1h').run()
+
+    const schedule = await Schedule.find('manual-trigger')
+    await schedule!.trigger()
+
+    const job = await sharedAdapter.popFrom('manual')
+    assert.equal(job?.priority, 3)
+    assert.equal(job?.scheduleId, 'manual-trigger')
+    assert.isNumber(job?.createdAt)
   })
 
   test('schedule.trigger() should update lastRunAt and runCount', async ({ assert }) => {
@@ -459,6 +510,35 @@ test.group('Job.schedule()', (group) => {
 
     const schedule = await Schedule.find(scheduleId)
     assert.equal(schedule!.everyMs, 60 * 60 * 1000)
+  })
+
+  test('Job.schedule() should store the Schedule on the resolved queue Adapter', async ({
+    assert,
+  }) => {
+    const defaultAdapter = memory()()
+    const scheduleAdapter = memory()()
+
+    class RoutedScheduleJob extends Job {
+      static options = { queue: 'scheduled' }
+
+      async execute() {}
+    }
+
+    await QueueManager.init({
+      default: 'default',
+      adapters: {
+        default: () => defaultAdapter,
+        schedules: () => scheduleAdapter,
+      },
+      queues: {
+        scheduled: { adapter: 'schedules' },
+      },
+    })
+
+    await RoutedScheduleJob.schedule({}).id('routed').every('1h').run()
+
+    assert.isNotNull(await scheduleAdapter.getSchedule('routed'))
+    assert.isNull(await defaultAdapter.getSchedule('routed'))
   })
 })
 

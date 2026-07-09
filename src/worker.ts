@@ -5,10 +5,9 @@ import { parse } from './utils.js'
 import { QueueManager } from './queue_manager.js'
 import { JobPool } from './job_pool.js'
 import { Locator } from './locator.js'
-import { dispatchChannel } from './tracing_channels.js'
+import { jobDispatchRuntime } from './job_dispatch_runtime.js'
 import type { Adapter, AcquiredJob } from './contracts/adapter.js'
 import type { QueueManagerConfig, WorkerCycle } from './types/main.js'
-import type { JobDispatchMessage } from './types/tracing_channels.js'
 import type { JobExecutionOutcome, JobExecutionRuntime } from './job_runtime.js'
 import {
   DEFAULT_IDLE_DELAY,
@@ -111,7 +110,7 @@ export class Worker {
 
     await QueueManager.init(this.#config)
 
-    this.#adapter = QueueManager.use()
+    this.#adapter = QueueManager.use(this.#config.worker?.adapter)
     this.#adapter.setWorkerId(this.#id)
     this.#jobExecutionRuntime = QueueManager.getJobExecutionRuntime()
     this.#wrapInternal = QueueManager.getInternalOperationWrapper()
@@ -554,22 +553,19 @@ export class Worker {
         schedule.runCount + 1
       )
 
-      // Get the job class to determine the target queue
       const JobClass = await Locator.resolve(schedule.name)
-      const queue = JobClass?.options?.queue ?? 'default'
 
-      const jobData = {
-        id: randomUUID(),
+      // A claimed occurrence stays consumed if dispatch throws. Rolling it back after an
+      // ambiguous push could produce a duplicate. An idempotent enqueue protocol would
+      // have to span every Adapter and is not justified by the current Schedule semantics.
+      await jobDispatchRuntime.dispatch({
+        kind: 'single',
         name: schedule.name,
         payload: schedule.payload,
-        attempts: 0,
-        priority: JobClass?.options?.priority,
-      }
-
-      const message: JobDispatchMessage = { jobs: [jobData], queue }
-      await dispatchChannel.tracePromise(async () => {
-        await this.#wrapInternal(() => this.#adapter.pushOn(queue, jobData))
-      }, message)
+        jobOptions: JobClass?.options,
+        overrides: { adapter: () => this.#adapter },
+        scheduleId: schedule.id,
+      })
     }
   }
 }
