@@ -32,7 +32,7 @@ export interface AcquiredJob extends JobData {
  * Adapter interface for queue storage backends.
  *
  * Implementations handle job persistence, atomic operations, and
- * concurrency control. Built-in adapters: Redis, Knex (PostgreSQL/SQLite).
+ * concurrency control. Built-in adapters: Redis, Knex, Kysely, and Sync.
  *
  * @example
  * ```typescript

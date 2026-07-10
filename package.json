@@ -57,6 +57,8 @@
     "hot-hook": "^1.0.0",
     "ioredis": "^5.11.1",
     "knex": "3.1.0",
+    "kysely": "^0.29.2",
+    "mysql2": "^3.0.0",
     "oxfmt": "^0.56.0",
     "oxlint": "^1.71.0",
     "oxlint-tsgolint": "^0.17.4",
@@ -70,7 +72,8 @@
     "@opentelemetry/core": "^1.30.0 || ^2.0.0",
     "@opentelemetry/instrumentation": "^0.200.0",
     "ioredis": "^5.0.0",
-    "knex": "^3.0.0"
+    "knex": "^3.0.0",
+    "kysely": "^0.29.0"
   },
   "peerDependenciesMeta": {
     "@opentelemetry/api": {
@@ -86,6 +89,9 @@
       "optional": true
     },
     "knex": {
+      "optional": true
+    },
+    "kysely": {
       "optional": true
     }
   },

@@ -65,6 +65,8 @@ __metadata:
     hot-hook: "npm:^1.0.0"
     ioredis: "npm:^5.11.1"
     knex: "npm:3.1.0"
+    kysely: "npm:^0.29.2"
+    mysql2: "npm:^3.0.0"
     oxfmt: "npm:^0.56.0"
     oxlint: "npm:^1.71.0"
     oxlint-tsgolint: "npm:^0.17.4"
@@ -78,6 +80,7 @@ __metadata:
     "@opentelemetry/instrumentation": ^0.200.0
     ioredis: ^5.0.0
     knex: ^3.0.0
+    kysely: ^0.29.0
   peerDependenciesMeta:
     "@opentelemetry/api":
       optional: true
@@ -88,6 +91,8 @@ __metadata:
     ioredis:
       optional: true
     knex:
+      optional: true
+    kysely:
       optional: true
   languageName: unknown
   linkType: soft
@@ -1923,6 +1928,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"aws-ssl-profiles@npm:^1.1.2":
+  version: 1.1.2
+  resolution: "aws-ssl-profiles@npm:1.1.2"
+  checksum: 10c0/e5f59a4146fe3b88ad2a84f814886c788557b80b744c8cbcb1cbf8cf5ba19cc006a7a12e88819adc614ecda9233993f8f1d1f3b612cbc2f297196df9e8f4f66e
+  languageName: node
+  linkType: hard
+
 "balanced-match@npm:^4.0.2":
   version: 4.0.4
   resolution: "balanced-match@npm:4.0.4"
@@ -2912,6 +2924,15 @@ __metadata:
   languageName: node
   linkType: hard
 
+"generate-function@npm:^2.3.1":
+  version: 2.3.1
+  resolution: "generate-function@npm:2.3.1"
+  dependencies:
+    is-property: "npm:^1.0.2"
+  checksum: 10c0/4645cf1da90375e46a6f1dc51abc9933e5eafa4cd1a44c2f7e3909a30a4e9a1a08c14cd7d5b32da039da2dba2a085e1ed4597b580c196c3245b2d35d8bc0de5d
+  languageName: node
+  linkType: hard
+
 "get-caller-file@npm:^2.0.5":
   version: 2.0.5
   resolution: "get-caller-file@npm:2.0.5"
@@ -3297,6 +3318,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"is-property@npm:^1.0.2":
+  version: 1.0.2
+  resolution: "is-property@npm:1.0.2"
+  checksum: 10c0/33ab65a136e4ba3f74d4f7d9d2a013f1bd207082e11cedb160698e8d5394644e873c39668d112a402175ccbc58a087cef87198ed46829dbddb479115a0257283
+  languageName: node
+  linkType: hard
+
 "is-ssh@npm:^1.4.0":
   version: 1.4.1
   resolution: "is-ssh@npm:1.4.1"
@@ -3458,6 +3486,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"kysely@npm:^0.29.2":
+  version: 0.29.3
+  resolution: "kysely@npm:0.29.3"
+  checksum: 10c0/ab23e82f67c4ed17fce1ed14573ea806944b8516f57d837c3dd3bf2df6eef9d2bc12300525007a865506e595ec1da3d7cd372b8c17029313b5c9e8976a3147f2
+  languageName: node
+  linkType: hard
+
 "lilconfig@npm:^3.1.1":
   version: 3.1.3
   resolution: "lilconfig@npm:3.1.3"
@@ -3561,6 +3596,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"long@npm:^5.3.2":
+  version: 5.3.2
+  resolution: "long@npm:5.3.2"
+  checksum: 10c0/7130fe1cbce2dca06734b35b70d380ca3f70271c7f8852c922a7c62c86c4e35f0c39290565eca7133c625908d40e126ac57c02b1b1a4636b9457d77e1e60b981
+  languageName: node
+  linkType: hard
+
 "lru-cache@npm:^11.0.0":
   version: 11.5.1
   resolution: "lru-cache@npm:11.5.1"
@@ -3579,6 +3621,13 @@ __metadata:
   version: 7.18.3
   resolution: "lru-cache@npm:7.18.3"
   checksum: 10c0/b3a452b491433db885beed95041eb104c157ef7794b9c9b4d647be503be91769d11206bb573849a16b4cc0d03cbd15ffd22df7960997788b74c1d399ac7a4fed
+  languageName: node
+  linkType: hard
+
+"lru.min@npm:^1.1.0, lru.min@npm:^1.1.4":
+  version: 1.1.4
+  resolution: "lru.min@npm:1.1.4"
+  checksum: 10c0/d9cce4d9988ced2b2dd199f47016adefda27e8405a7f63b86a54e574d254bb0099ff9e91846b0c20379348e7a03d6f4de8b8f8cdfd5265b36eb3ec07bcf72f96
   languageName: node
   linkType: hard
 
@@ -3790,6 +3839,24 @@ __metadata:
   languageName: node
   linkType: hard
 
+"mysql2@npm:^3.0.0":
+  version: 3.22.6
+  resolution: "mysql2@npm:3.22.6"
+  dependencies:
+    aws-ssl-profiles: "npm:^1.1.2"
+    denque: "npm:^2.1.0"
+    generate-function: "npm:^2.3.1"
+    iconv-lite: "npm:^0.7.2"
+    long: "npm:^5.3.2"
+    lru.min: "npm:^1.1.4"
+    named-placeholders: "npm:^1.1.6"
+    sql-escaper: "npm:^1.4.0"
+  peerDependencies:
+    "@types/node": ">= 8"
+  checksum: 10c0/b0b61c55cacc6b5c3518970dec9613fe7877b62dcc5d97c5f2bf8f0e4a46c3d6bd4a34f5b47b4c67c21d513d60f259a4fddb255e964ac582b23fa221e0d6dbff
+  languageName: node
+  linkType: hard
+
 "mz@npm:^2.7.0":
   version: 2.7.0
   resolution: "mz@npm:2.7.0"
@@ -3798,6 +3865,15 @@ __metadata:
     object-assign: "npm:^4.0.1"
     thenify-all: "npm:^1.0.0"
   checksum: 10c0/103114e93f87362f0b56ab5b2e7245051ad0276b646e3902c98397d18bb8f4a77f2ea4a2c9d3ad516034ea3a56553b60d3f5f78220001ca4c404bd711bd0af39
+  languageName: node
+  linkType: hard
+
+"named-placeholders@npm:^1.1.6":
+  version: 1.1.6
+  resolution: "named-placeholders@npm:1.1.6"
+  dependencies:
+    lru.min: "npm:^1.1.0"
+  checksum: 10c0/65b7ffaf932a371602e4153808601e8f377d7fc85fa15b491ee821418e52ab4950155b840803a6eaf3d5b94d6e8aedc1bee723475541cb4713feb3544dca9336
   languageName: node
   linkType: hard
 
@@ -5145,6 +5221,13 @@ __metadata:
   version: 4.2.0
   resolution: "split2@npm:4.2.0"
   checksum: 10c0/b292beb8ce9215f8c642bb68be6249c5a4c7f332fc8ecadae7be5cbdf1ea95addc95f0459ef2e7ad9d45fd1064698a097e4eb211c83e772b49bc0ee423e91534
+  languageName: node
+  linkType: hard
+
+"sql-escaper@npm:^1.4.0":
+  version: 1.4.0
+  resolution: "sql-escaper@npm:1.4.0"
+  checksum: 10c0/46f9b2b4a63074ec173bc8cab49c23e155903fa73e564d1246e4b5899d014fd0b36094c75294875558e24cdcd467fa684dddb1a13cf6317d7daea4fa5ce9f37d
   languageName: node
   linkType: hard
 

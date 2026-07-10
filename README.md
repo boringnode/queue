@@ -20,7 +20,7 @@ npm install @boringnode/queue
 
 ## Features
 
-- **Multiple Queue Adapters**: Redis, Knex (PostgreSQL, MySQL, SQLite), and Sync
+- **Multiple Queue Adapters**: Redis, Knex, Kysely (PostgreSQL, MySQL, SQLite), and Sync
 - **Type-Safe Jobs**: TypeScript classes with typed payloads
 - **Delayed Jobs**: Schedule jobs to run after a delay
 - **Priority Queues**: Process high-priority jobs first
@@ -267,18 +267,18 @@ const { jobId, deduped } = await SaveDraftJob.dispatch({ content: '...' })
 - `retryJob` does not touch the dedup entry — a retried job continues to occupy the dedup slot. TTL runs on wall-clock time, so long-running retries may outlive the TTL window. Use a generous TTL or no TTL if retries must stay deduped.
 - Atomic and race-free:
   - **Redis**: a single Lua script per dispatch performs the dedup-key lookup, state check (pending/delayed ZSCORE), payload swap, and TTL refresh atomically.
-  - **Knex**: transactional `SELECT ... FOR UPDATE` + insert/update inside a transaction. A nested savepoint catches unique-constraint violations under concurrent inserts and returns `{ deduped: 'skipped' }` pointing at the winner.
+  - **Knex/Kysely**: transactional `SELECT ... FOR UPDATE` + insert/update inside a transaction. A savepoint catches unique-constraint violations under concurrent inserts and returns `{ deduped: 'skipped' }` pointing at the winner.
   - **SyncAdapter**: executes inline, no dedup support.
 
 ### Caveats
 
 - Without `.dedup()`, jobs use auto-generated UUIDs and are never deduplicated.
-- The **Sync adapter** ignores `.dedup()` entirely — every dispatch executes inline and `deduped` is always `undefined` on the result. Use Redis or Knex if you need real deduplication.
+- The **Sync adapter** ignores `.dedup()` entirely — every dispatch executes inline and `deduped` is always `undefined` on the result. Use Redis, Knex, or Kysely if you need real deduplication.
 - `.dedup()` is only available on single dispatch. `dispatchMany` / `pushManyOn` reject jobs with a `dedup` field.
 - Scheduled jobs (`.schedule()`) do not support dedup — each cron/interval fire is an independent dispatch.
 - With no `ttl`, dedup persists until the job is removed (completed/failed without retention). When retention keeps the record, re-dispatch stays blocked until the record is pruned.
 - With `ttl`, dedup expires after the window — a new job (new UUID) is created. The old job still runs.
-- Knex MySQL concurrent race: MySQL does not support partial unique indexes, so two `pushOn` calls with the same dedup id firing at the exact same instant can both succeed. Serialize at the app layer if strict guarantees are required, or use Postgres / SQLite / Redis (all of which serialize correctly via the partial unique index or Lua atomicity).
+- Knex/Kysely MySQL concurrent race: MySQL does not support partial unique indexes, so two `pushOn` calls with the same dedup id firing at the exact same instant can both succeed. Serialize at the app layer if strict guarantees are required, or use Postgres / SQLite / Redis (all of which serialize correctly via the partial unique index or Lua atomicity).
 
 ## Job History & Retention
 
@@ -401,6 +401,43 @@ export default class extends BaseSchema {
     await schemaService.dropJobsTable()
   }
 }
+```
+
+</details>
+
+### Kysely (PostgreSQL, MySQL, SQLite)
+
+Pass the application-owned Kysely instance to the adapter factory.
+
+```typescript
+import {
+  kysely,
+  KyselyQueueSchemaService,
+  type QueueDatabase,
+} from '@boringnode/queue/drivers/kysely_adapter'
+
+interface Database extends QueueDatabase {
+  orders: OrderTable
+}
+
+const adapter = kysely<Database>(db, { dialect: 'postgres' })
+```
+
+The adapter never destroys the application-owned Kysely instance. Use `tableName` and
+`schedulesTableName` in the options when your migration uses custom names.
+
+<details>
+<summary><strong>Database setup with KyselyQueueSchemaService</strong></summary>
+
+```typescript
+const schema = new KyselyQueueSchemaService(db, { dialect: 'postgres' })
+
+await schema.createJobsTable()
+await schema.createSchedulesTable()
+
+// down
+await schema.dropSchedulesTable()
+await schema.dropJobsTable()
 ```
 
 </details>

@@ -10,6 +10,12 @@ interface DriverTestSuiteOptions {
    * @default true
    */
   supportsConcurrency?: boolean
+  /**
+   * Whether concurrent dispatches have an atomic dedup constraint.
+   * MySQL has no partial unique indexes, matching the documented Knex limitation.
+   * @default true
+   */
+  supportsAtomicDedup?: boolean
 }
 
 export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
@@ -2602,48 +2608,50 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.equal(third && typeof third === 'object' && third.jobId, 'active-ext-uuid-1')
   })
 
-  test('dedup: concurrent pushOn with same id - only one wins, rest skipped', async ({
-    assert,
-  }) => {
-    const adapter = await options.createAdapter()
-    adapter.setWorkerId('worker-1')
+  if (options.supportsAtomicDedup !== false) {
+    test('dedup: concurrent pushOn with same id - only one wins, rest skipped', async ({
+      assert,
+    }) => {
+      const adapter = await options.createAdapter()
+      adapter.setWorkerId('worker-1')
 
-    const dispatches = Array.from({ length: 5 }, (_, i) =>
-      adapter.pushOn('concurrent-dedup-queue', {
-        id: `concurrent-uuid-${i}`,
-        name: 'TestJob',
-        payload: { n: i },
-        attempts: 0,
-        dedup: { id: 'TestJob::concurrent-1' },
-      })
-    )
+      const dispatches = Array.from({ length: 5 }, (_, i) =>
+        adapter.pushOn('concurrent-dedup-queue', {
+          id: `concurrent-uuid-${i}`,
+          name: 'TestJob',
+          payload: { n: i },
+          attempts: 0,
+          dedup: { id: 'TestJob::concurrent-1' },
+        })
+      )
 
-    const results = await Promise.all(dispatches)
-    const outcomes = results.map((r) => (r && typeof r === 'object' ? r.outcome : undefined))
+      const results = await Promise.all(dispatches)
+      const outcomes = results.map((r) => (r && typeof r === 'object' ? r.outcome : undefined))
 
-    assert.equal(
-      outcomes.filter((o) => o === 'added').length,
-      1,
-      `Expected exactly one 'added' outcome, got ${JSON.stringify(outcomes)}`
-    )
-    assert.equal(
-      outcomes.filter((o) => o === 'skipped').length,
-      4,
-      `Expected four 'skipped' outcomes, got ${JSON.stringify(outcomes)}`
-    )
+      assert.equal(
+        outcomes.filter((o) => o === 'added').length,
+        1,
+        `Expected exactly one 'added' outcome, got ${JSON.stringify(outcomes)}`
+      )
+      assert.equal(
+        outcomes.filter((o) => o === 'skipped').length,
+        4,
+        `Expected four 'skipped' outcomes, got ${JSON.stringify(outcomes)}`
+      )
 
-    const size = await adapter.sizeOf('concurrent-dedup-queue')
-    assert.equal(size, 1)
+      const size = await adapter.sizeOf('concurrent-dedup-queue')
+      assert.equal(size, 1)
 
-    // All skipped results must point at the same winner job id.
-    const winners = results
-      .filter((r) => r && typeof r === 'object' && r.outcome === 'added')
-      .map((r) => (r as { jobId: string }).jobId)
-    const skippedJobIds = results
-      .filter((r) => r && typeof r === 'object' && r.outcome === 'skipped')
-      .map((r) => (r as { jobId: string }).jobId)
-    for (const id of skippedJobIds) {
-      assert.equal(id, winners[0], 'skipped dispatch should reference the winning job id')
-    }
-  })
+      // All skipped results must point at the same winner job id.
+      const winners = results
+        .filter((r) => r && typeof r === 'object' && r.outcome === 'added')
+        .map((r) => (r as { jobId: string }).jobId)
+      const skippedJobIds = results
+        .filter((r) => r && typeof r === 'object' && r.outcome === 'skipped')
+        .map((r) => (r as { jobId: string }).jobId)
+      for (const id of skippedJobIds) {
+        assert.equal(id, winners[0], 'skipped dispatch should reference the winning job id')
+      }
+    })
+  }
 }
