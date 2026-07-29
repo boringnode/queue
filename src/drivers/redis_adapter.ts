@@ -33,6 +33,10 @@ const schedulesKey = 'schedules'
 const schedulesIndexKey = 'schedules::index'
 type RedisConfig = Redis | RedisOptions
 
+function isRedisConnection(config?: RedisConfig): config is Redis {
+  return !!config && 'defineCommand' in config && typeof config.defineCommand === 'function'
+}
+
 /**
  * Create a new Redis adapter factory.
  * Accepts either a Redis instance or Redis options.
@@ -45,7 +49,7 @@ type RedisConfig = Redis | RedisOptions
  */
 export function redis(config?: RedisConfig) {
   return () => {
-    if (config instanceof Redis) {
+    if (isRedisConnection(config)) {
       return new RedisAdapter(config, false)
     }
 
