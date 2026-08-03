@@ -113,6 +113,9 @@ export class Worker {
    * Initialize the worker (called automatically by `start()`).
    *
    * Sets up the QueueManager and adapter connection.
+   * Concurrent calls share the same initialization operation. Keeping that
+   * operation observable also lets `stop()` wait until QueueManager has finished
+   * mutating shared state before shutdown completes.
    */
   async init() {
     if (this.#initialized) {
@@ -217,7 +220,14 @@ export class Worker {
   /**
    * Stop the worker gracefully.
    *
-   * Waits for all running jobs to complete before stopping job consumption.
+   * Invalidates active processing loops first, then waits for every operation
+   * that may still create or own work: initialization, queue acquisitions, job
+   * execution, and heartbeat renewal. The heartbeat remains active while jobs
+   * drain so long-running handlers cannot be recovered as stalled during
+   * shutdown.
+   *
+   * Once this method resolves, the worker has reached quiescence: it can no
+   * longer acquire, execute, finalize, or renew jobs.
    * Adapter cleanup remains the responsibility of `QueueManager.destroy()`.
    * Called automatically on SIGINT/SIGTERM if gracefulShutdown is enabled.
    */
@@ -468,6 +478,18 @@ export class Worker {
     }
   }
 
+  /**
+   * Acquire enough jobs to fill the available concurrency slots.
+   *
+   * Acquisitions run concurrently, but each successful job is executed and
+   * added to the pool immediately instead of waiting for its siblings. From
+   * that point onward the pool owns the job, so heartbeat renewal and shutdown
+   * draining can see it even when another adapter call remains pending.
+   *
+   * The method itself still waits for every acquisition to settle. This gives
+   * `stop()` one operation it can await before draining the complete pool.
+   * Cycles and errors retain acquisition order for deterministic consumption.
+   */
   async #fillPool(queues: string[]): Promise<PoolFillResult> {
     const slotsAvailable = this.#concurrency - this.#pool!.size
 
@@ -607,6 +629,10 @@ export class Worker {
    *
    * The interval is half the stalled threshold so a job is renewed at least
    * once within every stalled window.
+   *
+   * During shutdown, `stop()` keeps this timer alive until the pool has drained,
+   * then clears it and awaits the last renewal. On any other processing-loop
+   * exit, the generator owns timer cleanup.
    */
   #startHeartbeat(queues: string[]) {
     // Never leave a previous timer running if the loop is somehow re-entered.

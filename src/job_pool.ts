@@ -59,14 +59,16 @@ export class JobPool {
   /**
    * Add a job to the pool.
    *
+   * The pool observes execution failures as soon as ownership is registered.
+   * This prevents an unhandled rejection when a cycle consumer pauses before
+   * asking for the next completion. The original promise is stored unchanged,
+   * so completion waits and shutdown draining still observe its final state.
+   *
    * @param job - The acquired job data
    * @param queue - The queue the job came from
    * @param promise - Promise that resolves when the job completes
    */
   add(job: AcquiredJob, queue: string, promise: Promise<void>) {
-    // Observe failures immediately so a consumer may pause after the `started`
-    // cycle without exposing the process to an unhandled rejection. The original
-    // promise remains rejected for waitForNextCompletion() and drain().
     void promise.catch(() => {})
     this.#activeJobs.set(job.id, { promise, job, queue })
   }
