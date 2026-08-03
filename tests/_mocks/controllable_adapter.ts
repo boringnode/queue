@@ -98,6 +98,7 @@ export class ControllableAdapter extends MemoryAdapter {
   readonly acquisitions = new OperationController()
   readonly finalizations = new OperationController()
   readonly stalledChecks = new OperationController()
+  readonly renewals = new OperationController()
   readonly destruction = new OperationController()
   readonly polledQueues: string[] = []
 
@@ -124,6 +125,10 @@ export class ControllableAdapter extends MemoryAdapter {
     return this.stalledChecks.run(() => super.recoverStalledJobs(...args))
   }
 
+  override async renewJobs(...args: Parameters<MemoryAdapter['renewJobs']>): Promise<number> {
+    return this.renewals.run(() => super.renewJobs(...args))
+  }
+
   override async destroy(): Promise<void> {
     return this.destruction.run(() => super.destroy())
   }
@@ -132,6 +137,7 @@ export class ControllableAdapter extends MemoryAdapter {
     this.acquisitions.releaseAll()
     this.finalizations.releaseAll()
     this.stalledChecks.releaseAll()
+    this.renewals.releaseAll()
     this.destruction.releaseAll()
   }
 }

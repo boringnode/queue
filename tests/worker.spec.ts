@@ -887,6 +887,112 @@ test.group('Worker', () => {
     assert.isNull(await fixture.adapter.getJob('second-late-acquired-job', 'default'))
   })
 
+  test('should execute an acquired job while a sibling acquisition is still pending', async ({
+    assert,
+    cleanup,
+  }) => {
+    const executionStarted = Promise.withResolvers<void>()
+
+    class ImmediateJob extends Job {
+      async execute() {
+        executionStarted.resolve()
+      }
+    }
+
+    const fixture = createWorkerFixture({ worker: { concurrency: 2 } })
+    fixture.adapter.acquisitions.block(1, 2)
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(ImmediateJob, { id: 'immediately-owned-job' })
+
+    const startPromise = fixture.start()
+    await fixture.adapter.acquisitions.waitForStarted(2)
+
+    const execution = trackPromise(executionStarted.promise)
+    fixture.adapter.acquisitions.release(1)
+    await fixture.adapter.acquisitions.waitForSettled(1)
+    await setTimeout(0)
+
+    assert.isTrue(execution.settled, 'Successful acquisitions must be owned immediately')
+
+    fixture.adapter.acquisitions.release(2)
+    await fixture.worker.stop()
+    await startPromise
+  })
+
+  test('should keep renewing a late-acquired job while stopping', async ({ assert, cleanup }) => {
+    const executionStarted = Promise.withResolvers<void>()
+    const executionGate = Promise.withResolvers<void>()
+
+    class LateLongJob extends Job {
+      async execute() {
+        executionStarted.resolve()
+        await executionGate.promise
+      }
+    }
+
+    const fixture = createWorkerFixture({ worker: { stalledThreshold: 20 } })
+    fixture.adapter.acquisitions.block(1)
+    cleanup(async () => {
+      executionGate.resolve()
+      await fixture.cleanup()
+    })
+
+    await fixture.push(LateLongJob, { id: 'renewed-during-stop' })
+
+    const startPromise = fixture.start()
+    await fixture.adapter.acquisitions.waitForStarted()
+
+    const stopPromise = fixture.worker.stop()
+    fixture.adapter.acquisitions.release(1)
+    await executionStarted.promise
+
+    const renewal = trackPromise(fixture.adapter.renewals.waitForStarted())
+    await setTimeout(50)
+    assert.isTrue(renewal.settled, 'Heartbeat must remain active while stop drains jobs')
+
+    executionGate.resolve()
+    await Promise.all([stopPromise, startPromise])
+  })
+
+  test('should wait for an in-flight heartbeat renewal before stopping', async ({
+    assert,
+    cleanup,
+  }) => {
+    const executionStarted = Promise.withResolvers<void>()
+    const executionGate = Promise.withResolvers<void>()
+
+    class RenewedJob extends Job {
+      async execute() {
+        executionStarted.resolve()
+        await executionGate.promise
+      }
+    }
+
+    const fixture = createWorkerFixture({ worker: { stalledThreshold: 20 } })
+    fixture.adapter.renewals.block(1)
+    cleanup(async () => {
+      executionGate.resolve()
+      await fixture.cleanup()
+    })
+
+    await fixture.push(RenewedJob, { id: 'blocked-renewal-job' })
+
+    const startPromise = fixture.start()
+    await executionStarted.promise
+    await fixture.adapter.renewals.waitForStarted()
+
+    const stop = trackPromise(fixture.worker.stop())
+    executionGate.resolve()
+    await fixture.adapter.finalizations.waitForSettled(1)
+    await setTimeout(0)
+
+    assert.isFalse(stop.settled, 'Worker must wait for a heartbeat already in flight')
+
+    fixture.adapter.renewals.release(1)
+    await Promise.all([stop.promise, startPromise])
+  })
+
   test('should wait for sibling acquisitions when one acquisition fails', async ({
     assert,
     cleanup,
@@ -975,9 +1081,13 @@ test.group('Worker', () => {
 
     const startPromise = fixture.start()
     await previousAdapter.destruction.waitForStarted()
-    await fixture.worker.stop()
+
+    const stop = trackPromise(fixture.worker.stop())
+    await setTimeout(0)
+    assert.isFalse(stop.settled, 'Worker stop must wait for initialization')
+
     previousAdapter.destruction.release(1)
-    await startPromise
+    await Promise.all([stop.promise, startPromise])
 
     assert.equal(fixture.adapter.acquisitions.calls, 0)
 
@@ -1062,6 +1172,32 @@ test.group('Worker', () => {
     fixture.adapter.stalledChecks.release(1)
     assert.isNull(await cyclePromise)
     await stop.promise
+  })
+
+  test('worker fixture cleanup should drain jobs before clearing the locator', async ({
+    assert,
+    cleanup,
+  }) => {
+    let executed = false
+
+    class CleanupJob extends Job {
+      async execute() {
+        executed = true
+      }
+    }
+
+    const fixture = createWorkerFixture()
+    fixture.adapter.acquisitions.block(1)
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(CleanupJob, { id: 'cleanup-job' })
+
+    const cyclePromise = fixture.worker.processCycle(['default'])
+    await fixture.adapter.acquisitions.waitForStarted()
+    await fixture.cleanup()
+    await cyclePromise
+
+    assert.isTrue(executed)
   })
 
   test('should not destroy the shared adapter when stopping', async ({ assert, cleanup }) => {

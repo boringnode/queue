@@ -63,9 +63,12 @@ export function createWorkerFixture(options: WorkerFixtureOptions = {}) {
 
     async cleanup(): Promise<void> {
       adapter.releaseAll()
-      Locator.clear()
-      await worker.stop()
-      await QueueManager.destroy()
+      try {
+        await worker.stop()
+      } finally {
+        Locator.clear()
+        await QueueManager.destroy()
+      }
     },
   }
 }

@@ -33,6 +33,30 @@ test.group('JobPool', () => {
     assert.equal(pool.size, 2)
   })
 
+  test('should observe job promise rejections as soon as they are added', async ({
+    assert,
+    cleanup,
+  }) => {
+    const execution = Promise.withResolvers<void>()
+    const originalCatch = execution.promise.catch.bind(execution.promise)
+    let observed = false
+
+    execution.promise.catch = ((...args: Parameters<Promise<void>['catch']>) => {
+      observed = true
+      return originalCatch(...args)
+    }) as Promise<void>['catch']
+
+    const pool = new JobPool()
+    cleanup(async () => {
+      execution.resolve()
+      await pool.drain()
+    })
+
+    pool.add(createJob('observed-job'), 'default', execution.promise)
+
+    assert.isTrue(observed)
+  })
+
   test('should check capacity correctly', ({ assert }) => {
     const pool = new JobPool()
 

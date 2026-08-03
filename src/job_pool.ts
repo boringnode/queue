@@ -64,6 +64,10 @@ export class JobPool {
    * @param promise - Promise that resolves when the job completes
    */
   add(job: AcquiredJob, queue: string, promise: Promise<void>) {
+    // Observe failures immediately so a consumer may pause after the `started`
+    // cycle without exposing the process to an unhandled rejection. The original
+    // promise remains rejected for waitForNextCompletion() and drain().
+    void promise.catch(() => {})
     this.#activeJobs.set(job.id, { promise, job, queue })
   }
 

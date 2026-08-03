@@ -70,6 +70,7 @@ export class Worker {
   #wrapInternal: <T>(fn: () => Promise<T>) => Promise<T> = (fn) => fn()
   #running = false
   #initialized = false
+  #initOperation?: Promise<void>
   #cycleGenerator?: AsyncGenerator<WorkerCycle, void, unknown>
   #cycleGeneratorClose?: Promise<void>
   #startCompletion?: Promise<void>
@@ -78,7 +79,7 @@ export class Worker {
   #lastStalledCheck = 0
   #shutdownHandler?: () => Promise<void>
   #heartbeatTimer?: NodeJS.Timeout
-  #renewingJobs = false
+  #heartbeatRenewal?: Promise<void>
   #delayController?: AbortController
   #shutdownGeneration = 0
 
@@ -118,6 +119,22 @@ export class Worker {
       return
     }
 
+    if (!this.#initOperation) {
+      this.#initOperation = this.#initialize()
+    }
+
+    const initOperation = this.#initOperation
+
+    try {
+      await initOperation
+    } finally {
+      if (this.#initOperation === initOperation) {
+        this.#initOperation = undefined
+      }
+    }
+  }
+
+  async #initialize(): Promise<void> {
     debug('initializing worker %s', this.#id)
 
     await QueueManager.init(this.#config)
@@ -211,6 +228,11 @@ export class Worker {
     this.#running = false
     this.#delayController?.abort()
 
+    if (this.#initOperation) {
+      debug('worker %s: waiting for initialization to complete', this.#id)
+      await this.#initOperation.catch(() => {})
+    }
+
     if (this.#fillOperation) {
       debug('worker %s: waiting for in-flight job acquisitions to complete', this.#id)
       await this.#fillOperation.catch(() => {})
@@ -221,18 +243,14 @@ export class Worker {
       await this.#pool.drain()
     }
 
+    this.#stopHeartbeat()
+    await this.#heartbeatRenewal
+
     await this.#closeCycleGenerator()
 
     if (this.#startCompletion) {
       await this.#startCompletion
     }
-
-    // Stop the heartbeat only after draining, so jobs that are still finishing
-    // keep being renewed until they actually complete. The process() generator
-    // also clears it in its `finally`, but clearing here guarantees prompt and
-    // deterministic cleanup regardless of how the worker was driven (start() vs
-    // processCycle()).
-    this.#stopHeartbeat()
 
     this.#removeShutdownHandlers()
   }
@@ -442,7 +460,11 @@ export class Worker {
         }
       }
     } finally {
-      this.#stopHeartbeat()
+      // During graceful shutdown, stop() owns the heartbeat until every acquired
+      // job has drained. For any other generator exit, clean it up here.
+      if (shutdownGeneration === this.#shutdownGeneration) {
+        this.#stopHeartbeat()
+      }
     }
   }
 
@@ -451,28 +473,32 @@ export class Worker {
 
     if (slotsAvailable <= 0) return { cycles: [], errors: [] }
 
-    const popPromises = Array.from({ length: slotsAvailable }, () => this.#acquireNextJob(queues))
+    const pool = this.#pool!
+    const cycles: Array<StartedCycle | undefined> = Array.from({ length: slotsAvailable })
+    const errors: Array<{ error: unknown } | undefined> = Array.from({ length: slotsAvailable })
 
-    const results = await Promise.allSettled(popPromises)
-    const cycles: StartedCycle[] = []
-    const errors: unknown[] = []
+    const acquisitions = Array.from({ length: slotsAvailable }, async (_, index) => {
+      try {
+        const result = await this.#acquireNextJob(queues)
+        if (!result) return
 
-    for (const result of results) {
-      if (result.status === 'rejected') {
-        errors.push(result.reason)
-        continue
+        const { job, queue } = result
+        const promise = this.#execute(job, queue)
+        pool.add(job, queue, promise)
+        cycles[index] = { type: 'started', queue, job }
+      } catch (error) {
+        errors[index] = { error }
       }
+    })
 
-      if (!result.value) continue
+    await Promise.all(acquisitions)
 
-      const { job, queue } = result.value
-      const promise = this.#execute(job, queue)
-      this.#pool!.add(job, queue, promise)
-
-      cycles.push({ type: 'started', queue, job })
+    return {
+      cycles: cycles.filter((cycle): cycle is StartedCycle => cycle !== undefined),
+      errors: errors
+        .filter((result): result is { error: unknown } => result !== undefined)
+        .map((result) => result.error),
     }
-
-    return { cycles, errors }
   }
 
   async #execute(job: AcquiredJob, queue: string): Promise<void> {
@@ -589,7 +615,18 @@ export class Worker {
     const interval = Math.max(Math.floor(this.#stalledThreshold / 2), 1)
 
     this.#heartbeatTimer = setInterval(() => {
-      void this.#renewActiveJobs(queues)
+      if (this.#heartbeatRenewal) return
+
+      const renewal = this.#renewActiveJobs(queues)
+      this.#heartbeatRenewal = renewal
+
+      const clearRenewal = () => {
+        if (this.#heartbeatRenewal === renewal) {
+          this.#heartbeatRenewal = undefined
+        }
+      }
+
+      void renewal.then(clearRenewal, clearRenewal)
     }, interval)
 
     // Don't let the heartbeat keep the event loop alive on its own.
@@ -609,33 +646,26 @@ export class Worker {
    * running. Only jobs still active in the adapter are renewed.
    */
   async #renewActiveJobs(queues: string[]): Promise<void> {
-    // Guard against overlapping runs if a renewal takes longer than the interval.
-    if (this.#renewingJobs || !this.#pool || this.#pool.isEmpty()) {
+    if (!this.#pool || this.#pool.isEmpty()) {
       return
     }
 
-    this.#renewingJobs = true
+    const jobIdsByQueue = this.#pool.activeJobIdsByQueue()
 
-    try {
-      const jobIdsByQueue = this.#pool.activeJobIdsByQueue()
+    for (const queue of queues) {
+      const jobIds = jobIdsByQueue.get(queue)
 
-      for (const queue of queues) {
-        const jobIds = jobIdsByQueue.get(queue)
-
-        if (!jobIds || jobIds.length === 0) {
-          continue
-        }
-
-        try {
-          await this.#wrapInternal(() => this.#adapter.renewJobs(queue, jobIds))
-        } catch (error) {
-          // A failed heartbeat must never crash the worker; the job will simply
-          // be considered stalled if renewals keep failing.
-          debug('worker %s: failed to renew jobs on queue %s: %O', this.#id, queue, error)
-        }
+      if (!jobIds || jobIds.length === 0) {
+        continue
       }
-    } finally {
-      this.#renewingJobs = false
+
+      try {
+        await this.#wrapInternal(() => this.#adapter.renewJobs(queue, jobIds))
+      } catch (error) {
+        // A failed heartbeat must never crash the worker; the job will simply
+        // be considered stalled if renewals keep failing.
+        debug('worker %s: failed to renew jobs on queue %s: %O', this.#id, queue, error)
+      }
     }
   }
 
