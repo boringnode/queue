@@ -8,6 +8,9 @@ import { Locator } from '../src/locator.js'
 import { Job } from '../src/job.js'
 import { QueueManager } from '../src/queue_manager.js'
 import * as errors from '../src/exceptions.js'
+import { ControllableAdapter } from './_mocks/controllable_adapter.js'
+import { createWorkerFixture } from './_utils/create_worker_fixture.js'
+import { trackPromise } from './_utils/track_promise.js'
 
 const config = {
   default: 'memory',
@@ -838,24 +841,6 @@ test.group('Worker', () => {
     assert,
     cleanup,
   }) => {
-    const acquisitionGate = Promise.withResolvers<void>()
-    const acquisitionsStarted = Promise.withResolvers<void>()
-
-    class BlockingPopAdapter extends MemoryAdapter {
-      popCalls = 0
-
-      override async popFrom(queue: string) {
-        this.popCalls++
-
-        if (this.popCalls === 2) {
-          acquisitionsStarted.resolve()
-        }
-
-        await acquisitionGate.promise
-        return super.popFrom(queue)
-      }
-    }
-
     const jobGate = Promise.withResolvers<void>()
     const allJobsStarted = Promise.withResolvers<void>()
     let jobsStarted = 0
@@ -873,94 +858,39 @@ test.group('Worker', () => {
       }
     }
 
-    const adapter = new BlockingPopAdapter()
-    const worker = new Worker({
-      default: 'memory',
-      adapters: { memory: () => adapter },
-      worker: { concurrency: 2, gracefulShutdown: false },
-    })
+    const fixture = createWorkerFixture({ worker: { concurrency: 2 } })
+    fixture.adapter.acquisitions.block(1, 2)
 
-    Locator.register('BlockingJob', BlockingJob)
     cleanup(async () => {
-      acquisitionGate.resolve()
       jobGate.resolve()
-      Locator.clear()
-      await worker.stop()
+      await fixture.cleanup()
     })
 
-    await adapter.push({
-      id: 'late-acquired-job',
-      name: 'BlockingJob',
-      payload: {},
-      attempts: 0,
-    })
-    await adapter.push({
-      id: 'second-late-acquired-job',
-      name: 'BlockingJob',
-      payload: {},
-      attempts: 0,
-    })
+    await fixture.push(BlockingJob, { id: 'late-acquired-job' })
+    await fixture.push(BlockingJob, { id: 'second-late-acquired-job' })
 
-    const startPromise = worker.start(['default'])
-    await acquisitionsStarted.promise
+    const startPromise = fixture.start()
+    await fixture.adapter.acquisitions.waitForStarted(2)
 
-    let stopped = false
-    const stopPromise = worker.stop().then(() => {
-      stopped = true
-    })
+    const stop = trackPromise(fixture.worker.stop())
+    assert.isFalse(stop.settled, 'Worker must wait for acquisitions already in flight')
 
-    await setTimeout(0)
-    assert.isFalse(stopped, 'Worker must wait for acquisitions already in flight')
-
-    acquisitionGate.resolve()
+    fixture.adapter.acquisitions.release(1, 2)
     await allJobsStarted.promise
-    await setTimeout(0)
-    assert.isFalse(stopped, 'Worker must wait for jobs returned by an in-flight acquisition')
+    assert.isFalse(stop.settled, 'Worker must wait for jobs returned by an in-flight acquisition')
 
     jobGate.resolve()
-    await stopPromise
-    await startPromise
+    await Promise.all([stop.promise, startPromise])
 
     assert.equal(jobsCompleted, 2)
-    assert.isNull(await adapter.getJob('late-acquired-job', 'default'))
-    assert.isNull(await adapter.getJob('second-late-acquired-job', 'default'))
+    assert.isNull(await fixture.adapter.getJob('late-acquired-job', 'default'))
+    assert.isNull(await fixture.adapter.getJob('second-late-acquired-job', 'default'))
   })
 
   test('should wait for sibling acquisitions when one acquisition fails', async ({
     assert,
     cleanup,
   }) => {
-    const firstPopGate = Promise.withResolvers<void>()
-    const firstPopRejected = Promise.withResolvers<void>()
-    const secondPopGate = Promise.withResolvers<void>()
-    const allPopsStarted = Promise.withResolvers<void>()
-    const finalizationGate = Promise.withResolvers<void>()
-    const finalizationStarted = Promise.withResolvers<void>()
-
-    class PartiallyFailingAdapter extends MemoryAdapter {
-      popCalls = 0
-
-      override async popFrom(queue: string) {
-        this.popCalls++
-
-        if (this.popCalls === 1) {
-          await firstPopGate.promise
-          firstPopRejected.resolve()
-          throw new Error('Failed to acquire job')
-        }
-
-        allPopsStarted.resolve()
-        await secondPopGate.promise
-        return super.popFrom(queue)
-      }
-
-      override async completeJob(...args: Parameters<MemoryAdapter['completeJob']>): Promise<void> {
-        finalizationStarted.resolve()
-        await finalizationGate.promise
-        return super.completeJob(...args)
-      }
-    }
-
     let jobCompleted = false
 
     class LateJob extends Job {
@@ -969,135 +899,66 @@ test.group('Worker', () => {
       }
     }
 
-    const adapter = new PartiallyFailingAdapter()
-    const worker = new Worker({
-      default: 'memory',
-      adapters: { memory: () => adapter },
-      worker: { concurrency: 2, gracefulShutdown: false },
-    })
+    const fixture = createWorkerFixture({ worker: { concurrency: 2 } })
+    fixture.adapter.acquisitions.block(1, 2).fail(1, new Error('Failed to acquire job'))
+    fixture.adapter.finalizations.block(1)
 
-    Locator.register('LateJob', LateJob)
-    cleanup(async () => {
-      firstPopGate.resolve()
-      secondPopGate.resolve()
-      finalizationGate.resolve()
-      Locator.clear()
-      await worker.stop()
-    })
+    cleanup(() => fixture.cleanup())
 
-    await adapter.push({
-      id: 'late-job-after-sibling-error',
-      name: 'LateJob',
-      payload: {},
-      attempts: 0,
-    })
+    await fixture.push(LateJob, { id: 'late-job-after-sibling-error' })
 
-    const startPromise = worker.start(['default'])
-    await allPopsStarted.promise
+    const startPromise = fixture.start()
+    await fixture.adapter.acquisitions.waitForStarted(2)
 
-    firstPopGate.resolve()
-    await firstPopRejected.promise
+    fixture.adapter.acquisitions.release(1)
+    await fixture.adapter.acquisitions.waitForSettled(1)
 
-    let stopped = false
-    const stopPromise = worker.stop().then(() => {
-      stopped = true
-    })
+    const stop = trackPromise(fixture.worker.stop())
+    assert.isFalse(stop.settled, 'Worker must wait for every sibling acquisition to settle')
 
-    await setTimeout(0)
-    assert.isFalse(stopped, 'Worker must wait for every sibling acquisition to settle')
-
-    secondPopGate.resolve()
-    await finalizationStarted.promise
+    fixture.adapter.acquisitions.release(2)
+    await fixture.adapter.finalizations.waitForStarted()
     assert.isTrue(jobCompleted)
-    assert.isFalse(stopped, 'Worker must wait for finalization of late-acquired jobs')
+    assert.isFalse(stop.settled, 'Worker must wait for finalization of late-acquired jobs')
 
-    finalizationGate.resolve()
-    await stopPromise
-    await startPromise
+    fixture.adapter.finalizations.release(1)
+    await Promise.all([stop.promise, startPromise])
 
-    assert.equal(adapter.popCalls, 2)
-    assert.isNull(await adapter.getJob('late-job-after-sibling-error', 'default'))
+    assert.equal(fixture.adapter.acquisitions.calls, 2)
+    assert.isNull(await fixture.adapter.getJob('late-job-after-sibling-error', 'default'))
   })
 
   test('should interrupt the idle delay when stopping', async ({ assert, cleanup }) => {
-    const idle = Promise.withResolvers<void>()
+    const fixture = createWorkerFixture({ worker: { idleDelay: '1m' } })
+    cleanup(() => fixture.cleanup())
 
-    class IdleAdapter extends MemoryAdapter {
-      override async popFrom() {
-        idle.resolve()
-        return null
-      }
-    }
-
-    const worker = new Worker({
-      default: 'memory',
-      adapters: { memory: () => new IdleAdapter() },
-      worker: { idleDelay: '1m', gracefulShutdown: false },
-    })
-
-    cleanup(() => worker.stop())
-
-    const startPromise = worker.start(['default'])
-    await idle.promise
+    const start = trackPromise(fixture.start())
+    await fixture.adapter.acquisitions.waitForSettled(1)
     await setTimeout(0)
-    await worker.stop()
+    await fixture.worker.stop()
 
-    const startStopped = await Promise.race([startPromise.then(() => true), setTimeout(100, false)])
-
-    assert.isTrue(startStopped, 'Worker start must not remain blocked in its idle delay')
+    assert.isTrue(start.settled, 'Worker start must not remain blocked in its idle delay')
   })
 
   test('should interrupt the error delay when stopping', async ({ assert, cleanup }) => {
-    const acquisitionFailed = Promise.withResolvers<void>()
+    const fixture = createWorkerFixture()
+    fixture.adapter.acquisitions.fail(1, new Error('Failed to acquire job'))
+    cleanup(() => fixture.cleanup())
 
-    class FailingAdapter extends MemoryAdapter {
-      override async popFrom(): Promise<never> {
-        acquisitionFailed.resolve()
-        throw new Error('Failed to acquire job')
-      }
-    }
-
-    const worker = new Worker({
-      default: 'memory',
-      adapters: { memory: () => new FailingAdapter() },
-      worker: { gracefulShutdown: false },
-    })
-
-    cleanup(() => worker.stop())
-
-    const startPromise = worker.start(['default'])
-    await acquisitionFailed.promise
+    const start = trackPromise(fixture.start())
+    await fixture.adapter.acquisitions.waitForSettled(1)
     await setTimeout(0)
-    await worker.stop()
+    await fixture.worker.stop()
 
-    const startStopped = await Promise.race([startPromise.then(() => true), setTimeout(100, false)])
-
-    assert.isTrue(startStopped, 'Worker start must not remain blocked in its error delay')
+    assert.isTrue(start.settled, 'Worker start must not remain blocked in its error delay')
   })
 
   test('should not start acquiring jobs when stopped during initialization', async ({
     assert,
     cleanup,
   }) => {
-    const initializationStarted = Promise.withResolvers<void>()
-    const initializationGate = Promise.withResolvers<void>()
-    const jobAcquired = Promise.withResolvers<void>()
-
-    class BlockingDestroyAdapter extends MemoryAdapter {
-      override async destroy(): Promise<void> {
-        initializationStarted.resolve()
-        await initializationGate.promise
-      }
-    }
-
-    class AcquisitionTrackingAdapter extends MemoryAdapter {
-      override async popFrom(queue: string) {
-        jobAcquired.resolve()
-        return super.popFrom(queue)
-      }
-    }
-
-    const previousAdapter = new BlockingDestroyAdapter()
+    const previousAdapter = new ControllableAdapter()
+    previousAdapter.destruction.block(1)
     await QueueManager.init({
       default: 'memory',
       adapters: { memory: () => previousAdapter },
@@ -1105,108 +966,59 @@ test.group('Worker', () => {
     })
     QueueManager.use()
 
-    const worker = new Worker({
-      default: 'memory',
-      adapters: { memory: () => new AcquisitionTrackingAdapter() },
-      autoLoadJobs: false,
-      worker: { gracefulShutdown: false },
-    })
+    const fixture = createWorkerFixture()
 
     cleanup(async () => {
-      initializationGate.resolve()
-      await worker.stop()
-      await QueueManager.destroy()
+      previousAdapter.releaseAll()
+      await fixture.cleanup()
     })
 
-    const startPromise = worker.start(['default'])
-    await initializationStarted.promise
-    await worker.stop()
-    initializationGate.resolve()
+    const startPromise = fixture.start()
+    await previousAdapter.destruction.waitForStarted()
+    await fixture.worker.stop()
+    previousAdapter.destruction.release(1)
+    await startPromise
 
-    const startStoppedBeforeAcquisition = await Promise.race([
-      startPromise.then(() => true),
-      jobAcquired.promise.then(() => false),
-    ])
+    assert.equal(fixture.adapter.acquisitions.calls, 0)
 
-    assert.isTrue(startStoppedBeforeAcquisition)
-
-    const restartedCycle = await worker.processCycle(['default'])
+    const restartedCycle = await fixture.worker.processCycle(['default'])
     assert.equal(restartedCycle?.type, 'idle')
-    await jobAcquired.promise
+    assert.equal(fixture.adapter.acquisitions.calls, 1)
   })
 
   test('should create a fresh processCycle generator after stopping', async ({
     assert,
     cleanup,
   }) => {
-    const polledQueues: string[] = []
+    const fixture = createWorkerFixture()
+    cleanup(() => fixture.cleanup())
 
-    class QueueTrackingAdapter extends MemoryAdapter {
-      override async popFrom(queue: string) {
-        polledQueues.push(queue)
-        return null
-      }
-    }
+    await fixture.worker.processCycle(['old'])
+    await fixture.worker.stop()
+    await fixture.worker.processCycle(['new'])
 
-    const worker = new Worker({
-      default: 'memory',
-      adapters: { memory: () => new QueueTrackingAdapter() },
-    })
-
-    cleanup(() => worker.stop())
-
-    await worker.processCycle(['old'])
-    await worker.stop()
-    await worker.processCycle(['new'])
-
-    assert.deepEqual(polledQueues, ['old', 'new'])
+    assert.deepEqual(fixture.adapter.polledQueues, ['old', 'new'])
   })
 
   test('should not return a started cycle after stopping during acquisition', async ({
     assert,
     cleanup,
   }) => {
-    const acquisitionStarted = Promise.withResolvers<void>()
-    const acquisitionGate = Promise.withResolvers<void>()
-
-    class BlockingAdapter extends MemoryAdapter {
-      override async popFrom(queue: string) {
-        acquisitionStarted.resolve()
-        await acquisitionGate.promise
-        return super.popFrom(queue)
-      }
-    }
-
     class LateJob extends Job {
       async execute() {}
     }
 
-    const adapter = new BlockingAdapter()
-    const worker = new Worker({
-      default: 'memory',
-      adapters: { memory: () => adapter },
-      worker: { gracefulShutdown: false },
-    })
+    const fixture = createWorkerFixture()
+    fixture.adapter.acquisitions.block(1)
+    cleanup(() => fixture.cleanup())
 
-    Locator.register('LateJob', LateJob)
-    cleanup(async () => {
-      acquisitionGate.resolve()
-      Locator.clear()
-      await worker.stop()
-    })
+    await fixture.push(LateJob, { id: 'stopped-cycle-job' })
 
-    await adapter.push({
-      id: 'stopped-cycle-job',
-      name: 'LateJob',
-      payload: {},
-      attempts: 0,
-    })
+    const cyclePromise = fixture.worker.processCycle(['default'])
+    await fixture.adapter.acquisitions.waitForStarted()
 
-    const cyclePromise = worker.processCycle(['default'])
-    await acquisitionStarted.promise
-
-    const stopPromise = worker.stop()
-    acquisitionGate.resolve()
+    const stopPromise = fixture.worker.stop()
+    fixture.adapter.acquisitions.release(1)
 
     assert.isNull(await cyclePromise)
     await stopPromise
@@ -1216,46 +1028,18 @@ test.group('Worker', () => {
     assert,
     cleanup,
   }) => {
-    class PartiallyFailingAdapter extends MemoryAdapter {
-      popCalls = 0
-
-      override async popFrom(queue: string) {
-        this.popCalls++
-
-        if (this.popCalls === 2) {
-          throw new Error('Failed to acquire sibling job')
-        }
-
-        return super.popFrom(queue)
-      }
-    }
-
     class SuccessfulJob extends Job {
       async execute() {}
     }
 
-    const adapter = new PartiallyFailingAdapter()
-    const worker = new Worker({
-      default: 'memory',
-      adapters: { memory: () => adapter },
-      worker: { concurrency: 2, gracefulShutdown: false },
-    })
+    const fixture = createWorkerFixture({ worker: { concurrency: 2 } })
+    fixture.adapter.acquisitions.fail(2, new Error('Failed to acquire sibling job'))
+    cleanup(() => fixture.cleanup())
 
-    Locator.register('SuccessfulJob', SuccessfulJob)
-    cleanup(async () => {
-      Locator.clear()
-      await worker.stop()
-    })
+    await fixture.push(SuccessfulJob, { id: 'success-before-error' })
 
-    await adapter.push({
-      id: 'success-before-error',
-      name: 'SuccessfulJob',
-      payload: {},
-      attempts: 0,
-    })
-
-    const startedCycle = await worker.processCycle(['default'])
-    const errorCycle = await worker.processCycle(['default'])
+    const startedCycle = await fixture.worker.processCycle(['default'])
+    const errorCycle = await fixture.worker.processCycle(['default'])
 
     assert.equal(startedCycle?.type, 'started')
     assert.equal(errorCycle?.type, 'error')
@@ -1265,42 +1049,19 @@ test.group('Worker', () => {
     assert,
     cleanup,
   }) => {
-    const stalledCheckStarted = Promise.withResolvers<void>()
-    const stalledCheckGate = Promise.withResolvers<void>()
+    const fixture = createWorkerFixture()
+    fixture.adapter.stalledChecks.block(1).fail(1, new Error('Failed to recover stalled jobs'))
+    cleanup(() => fixture.cleanup())
 
-    class BlockingStalledCheckAdapter extends MemoryAdapter {
-      override async recoverStalledJobs(): Promise<never> {
-        stalledCheckStarted.resolve()
-        await stalledCheckGate.promise
-        throw new Error('Failed to recover stalled jobs')
-      }
-    }
+    const cyclePromise = fixture.worker.processCycle(['default'])
+    await fixture.adapter.stalledChecks.waitForStarted()
 
-    const worker = new Worker({
-      default: 'memory',
-      adapters: { memory: () => new BlockingStalledCheckAdapter() },
-      worker: { gracefulShutdown: false },
-    })
+    const stop = trackPromise(fixture.worker.stop())
+    assert.isFalse(stop.settled, 'Worker must wait for worker-owned adapter operations')
 
-    cleanup(async () => {
-      stalledCheckGate.resolve()
-      await worker.stop()
-    })
-
-    const cyclePromise = worker.processCycle(['default'])
-    await stalledCheckStarted.promise
-
-    let stopped = false
-    const stopPromise = worker.stop().then(() => {
-      stopped = true
-    })
-
-    await setTimeout(0)
-    assert.isFalse(stopped, 'Worker must wait for worker-owned adapter operations')
-
-    stalledCheckGate.resolve()
+    fixture.adapter.stalledChecks.release(1)
     assert.isNull(await cyclePromise)
-    await stopPromise
+    await stop.promise
   })
 
   test('should not destroy the shared adapter when stopping', async ({ assert, cleanup }) => {
