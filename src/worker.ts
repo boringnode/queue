@@ -1,37 +1,32 @@
 import { randomUUID } from 'node:crypto'
-import { setTimeout } from 'node:timers/promises'
 import debug from './debug.js'
 import { parse } from './utils.js'
 import { QueueManager } from './queue_manager.js'
-import { JobPool } from './job_pool.js'
-import { Locator } from './locator.js'
 import { jobDispatchRuntime } from './job_dispatch_runtime.js'
-import type { Adapter, AcquiredJob } from './contracts/adapter.js'
+import {
+  WorkerSession,
+  type InternalOperationWrapper,
+  type WorkerSessionSettings,
+} from './worker_session.js'
+import type { Adapter } from './contracts/adapter.js'
 import type { QueueManagerConfig, WorkerCycle } from './types/main.js'
-import type { JobExecutionOutcome, JobExecutionRuntime } from './job_runtime.js'
+import type { JobExecutionRuntime } from './job_runtime.js'
 import {
   DEFAULT_IDLE_DELAY,
   DEFAULT_STALLED_INTERVAL,
   DEFAULT_STALLED_THRESHOLD,
-  DEFAULT_ERROR_RETRY_DELAY,
 } from './constants.js'
-
-type StartedCycle = Extract<WorkerCycle, { type: 'started' }>
-
-interface PoolFillResult {
-  cycles: StartedCycle[]
-  errors: unknown[]
-}
 
 /**
  * Job processing worker.
  *
- * The Worker continuously polls queues for jobs and executes them
- * with configurable concurrency. It handles:
- * - Concurrent job execution via JobPool
- * - Automatic retries with backoff strategies
- * - Stalled job detection and recovery
- * - Graceful shutdown on SIGINT/SIGTERM
+ * Worker owns configuration, initialization, and signal handling. Each
+ * continuous period of processing is delegated to one WorkerSession, which
+ * owns all work until it reaches quiescence.
+ *
+ * The Worker continuously polls queues for jobs and executes them with
+ * configurable concurrency. It handles retries, stalled job recovery, and
+ * graceful shutdown on SIGINT/SIGTERM.
  *
  * @example
  * ```typescript
@@ -41,69 +36,49 @@ interface PoolFillResult {
  *   default: 'redis',
  *   adapters: { redis: redis() },
  *   locations: ['./jobs/**\/*.js'],
- *   worker: {
- *     concurrency: 5,
- *     idleDelay: '1s',
- *   },
+ *   worker: { concurrency: 5, idleDelay: '1s' },
  * })
  *
- * // Start processing jobs
  * await worker.start(['default', 'emails'])
- *
- * // Or for testing, process one cycle at a time
- * const cycle = await worker.processCycle(['default'])
  * ```
  */
 export class Worker {
   readonly #id: string
   readonly #config: QueueManagerConfig
-  readonly #idleDelay: number
-  readonly #stalledInterval: number
-  readonly #stalledThreshold: number
-  readonly #maxStalledCount: number
-  readonly #concurrency: number
+  readonly #sessionSettings: WorkerSessionSettings
   readonly #gracefulShutdown: boolean
   readonly #onShutdownSignal?: () => void | Promise<void>
 
   #adapter!: Adapter
   #jobExecutionRuntime!: JobExecutionRuntime
-  #wrapInternal: <T>(fn: () => Promise<T>) => Promise<T> = (fn) => fn()
-  #running = false
+  #wrapInternal: InternalOperationWrapper = (operation) => operation()
   #initialized = false
   #initOperation?: Promise<void>
-  #cycleGenerator?: AsyncGenerator<WorkerCycle, void, unknown>
-  #cycleGeneratorClose?: Promise<void>
-  #startCompletion?: Promise<void>
+  #session?: WorkerSession
   #stopOperation?: Promise<void>
-  #pool?: JobPool
-  #fillOperation?: Promise<PoolFillResult>
-  #lastStalledCheck = 0
-  #shutdownHandler?: () => Promise<void>
-  #heartbeatTimer?: NodeJS.Timeout
-  #heartbeatRenewal?: Promise<void>
-  #delayController?: AbortController
   #shutdownGeneration = 0
+  #shutdownHandler?: () => Promise<void>
 
-  /** Unique identifier for this worker instance */
+  /** Unique identifier for this worker instance. */
   get id() {
     return this.#id
   }
 
   /**
-   * Create a new worker instance.
+   * Create a new Worker instance.
    *
-   * @param config - Queue configuration including adapter and worker settings
+   * @param config - Queue configuration including Adapter and Worker settings
    */
   constructor(config: QueueManagerConfig) {
     this.#config = config
     this.#id = randomUUID()
-
-    // Parse worker config once at construction
-    this.#idleDelay = parse(config.worker?.idleDelay ?? DEFAULT_IDLE_DELAY)
-    this.#stalledInterval = parse(config.worker?.stalledInterval ?? DEFAULT_STALLED_INTERVAL)
-    this.#stalledThreshold = parse(config.worker?.stalledThreshold ?? DEFAULT_STALLED_THRESHOLD)
-    this.#maxStalledCount = config.worker?.maxStalledCount ?? 1
-    this.#concurrency = config.worker?.concurrency ?? 1
+    this.#sessionSettings = {
+      idleDelay: parse(config.worker?.idleDelay ?? DEFAULT_IDLE_DELAY),
+      stalledInterval: parse(config.worker?.stalledInterval ?? DEFAULT_STALLED_INTERVAL),
+      stalledThreshold: parse(config.worker?.stalledThreshold ?? DEFAULT_STALLED_THRESHOLD),
+      maxStalledCount: config.worker?.maxStalledCount ?? 1,
+      concurrency: config.worker?.concurrency ?? 1,
+    }
     this.#gracefulShutdown = config.worker?.gracefulShutdown ?? true
     this.#onShutdownSignal = config.worker?.onShutdownSignal
 
@@ -111,17 +86,13 @@ export class Worker {
   }
 
   /**
-   * Initialize the worker (called automatically by `start()`).
+   * Initialize the Worker (called automatically by `start()`).
    *
-   * Sets up the QueueManager and adapter connection.
-   * Concurrent calls share the same initialization operation. Keeping that
-   * operation observable also lets `stop()` wait until QueueManager has finished
-   * mutating shared state before shutdown completes.
+   * Sets up QueueManager and the Adapter connection. Concurrent calls share
+   * one initialization operation.
    */
-  async init() {
-    if (this.#initialized) {
-      return
-    }
+  async init(): Promise<void> {
+    if (this.#initialized) return
 
     if (!this.#initOperation) {
       this.#initOperation = this.#initialize()
@@ -147,28 +118,18 @@ export class Worker {
     this.#adapter.setWorkerId(this.#id)
     this.#jobExecutionRuntime = QueueManager.getJobExecutionRuntime()
     this.#wrapInternal = QueueManager.getInternalOperationWrapper()
-
     this.#initialized = true
 
     debug('worker %s initialized', this.#id)
   }
 
   /**
-   * Start processing jobs from the specified queues.
+   * Start processing Jobs from the specified queues.
    *
-   * This method blocks until the worker is stopped (via `stop()` or signal).
-   * Jobs are processed concurrently up to the configured concurrency limit.
+   * This method blocks until the Worker is stopped. Jobs are processed
+   * concurrently up to the configured concurrency limit.
    *
-   * @param queues - Queue names to process (default: ['default'])
-   *
-   * @example
-   * ```typescript
-   * // Process single queue
-   * await worker.start()
-   *
-   * // Process multiple queues (priority order)
-   * await worker.start(['high-priority', 'default', 'low-priority'])
-   * ```
+   * @param queues - Queue names to process in priority order
    */
   async start(queues: string[] = ['default']): Promise<void> {
     while (this.#stopOperation) {
@@ -178,63 +139,22 @@ export class Worker {
     const shutdownGeneration = this.#shutdownGeneration
     await this.init()
 
-    if (shutdownGeneration !== this.#shutdownGeneration) {
-      return
-    }
+    if (shutdownGeneration !== this.#shutdownGeneration) return
 
-    if (this.#running) {
-      debug('worker %s is already running', this.#id)
-      return
-    }
-
-    this.#running = true
-    const completion = Promise.withResolvers<void>()
-    this.#startCompletion = completion.promise
-
-    try {
-      debug('starting worker %s on queues: %O', this.#id, queues)
-
-      this.#setupGracefulShutdown()
-
-      for await (const cycle of this.process(queues)) {
-        if (['started', 'completed'].includes(cycle.type)) {
-          continue
-        }
-
-        if (['idle', 'error'].includes(cycle.type)) {
-          // @ts-expect-error - we know suggestedDelay exists for these types
-          const delay = parse(cycle.suggestedDelay)
-
-          if (cycle.type === 'error') {
-            debug('worker %s encountered an error: %O', this.#id, cycle.error)
-          } else {
-            debug('worker %s is idle, waiting for %dms', this.#id, delay)
-          }
-
-          await this.#waitBeforeNextCycle(delay)
-        }
-      }
-    } finally {
-      completion.resolve()
-      if (this.#startCompletion === completion.promise) {
-        this.#startCompletion = undefined
-      }
-    }
+    const session = this.#useSession(queues)
+    this.#setupGracefulShutdown()
+    await session.start()
   }
 
   /**
-   * Stop the worker gracefully.
+   * Stop the active session and wait until it reaches quiescence.
    *
-   * Invalidates active processing loops first, then waits for every operation
-   * that may still create or own work: initialization, queue acquisitions, job
-   * execution, and heartbeat renewal. The heartbeat remains active while jobs
-   * drain so long-running handlers cannot be recovered as stalled during
-   * shutdown.
+   * Once this method resolves, the Worker can no longer acquire, execute,
+   * finalize, or renew Jobs from that session. A later start creates a fresh
+   * session.
    *
-   * Once this method resolves, the worker has reached quiescence: it can no
-   * longer acquire, execute, finalize, or renew jobs.
    * Adapter cleanup remains the responsibility of `QueueManager.destroy()`.
-   * Called automatically on SIGINT/SIGTERM if gracefulShutdown is enabled.
+   * Called automatically on SIGINT/SIGTERM when graceful shutdown is enabled.
    */
   stop(): Promise<void> {
     if (!this.#stopOperation) {
@@ -255,97 +175,32 @@ export class Worker {
 
   async #stop(): Promise<void> {
     debug('stopping worker %s', this.#id)
-
     this.#shutdownGeneration++
-    this.#running = false
-    this.#delayController?.abort()
 
     if (this.#initOperation) {
       debug('worker %s: waiting for initialization to complete', this.#id)
       await this.#initOperation.catch(() => {})
     }
 
-    if (this.#fillOperation) {
-      debug('worker %s: waiting for in-flight job acquisitions to complete', this.#id)
-      await this.#fillOperation.catch(() => {})
-    }
-
-    if (this.#pool) {
-      debug('worker %s: waiting for %d running jobs to complete', this.#id, this.#pool.size)
-      await this.#pool.drain()
-    }
-
-    this.#stopHeartbeat()
-    await this.#heartbeatRenewal
-
-    await this.#closeCycleGenerator()
-
-    if (this.#startCompletion) {
-      await this.#startCompletion
+    const session = this.#session
+    if (session) {
+      await session.stop()
+      if (this.#session === session) {
+        this.#session = undefined
+      }
     }
 
     this.#removeShutdownHandlers()
   }
 
-  async #closeCycleGenerator(): Promise<void> {
-    if (!this.#cycleGenerator) {
-      await this.#cycleGeneratorClose
-      return
-    }
-
-    const generator = this.#cycleGenerator
-    this.#cycleGenerator = undefined
-    const closeOperation = generator.return(undefined).then(() => {})
-    this.#cycleGeneratorClose = closeOperation
-
-    try {
-      await closeOperation
-    } finally {
-      if (this.#cycleGeneratorClose === closeOperation) {
-        this.#cycleGeneratorClose = undefined
-      }
-    }
-  }
-
-  async #waitBeforeNextCycle(delay: number): Promise<void> {
-    if (!this.#running) return
-
-    const controller = new AbortController()
-    this.#delayController = controller
-
-    try {
-      await setTimeout(delay, undefined, { signal: controller.signal })
-    } catch (error) {
-      if (!controller.signal.aborted) {
-        throw error
-      }
-    } finally {
-      if (this.#delayController === controller) {
-        this.#delayController = undefined
-      }
-    }
-  }
-
   /**
-   * Process a single cycle and return the result.
+   * Process a single cycle and return its event.
    *
-   * Useful for testing or when you need fine-grained control.
-   * Each cycle may start new jobs, complete a job, or return idle.
+   * Useful for tests and callers that need fine-grained control. Repeated calls
+   * share one manual session until `stop()`.
    *
-   * @param queues - Queue names to process
-   * @returns The cycle result, or null if the worker was stopped
-   *
-   * @example
-   * ```typescript
-   * const worker = new Worker(config)
-   *
-   * // Process cycles manually
-   * let cycle = await worker.processCycle(['default'])
-   * while (cycle) {
-   *   console.log('Cycle:', cycle.type)
-   *   cycle = await worker.processCycle(['default'])
-   * }
-   * ```
+   * @param queues - Queue names to process in priority order
+   * @returns The cycle event, or null when the session is stopping or stopped
    */
   async processCycle(queues: string[]): Promise<WorkerCycle | null> {
     while (this.#stopOperation) {
@@ -355,364 +210,54 @@ export class Worker {
     const shutdownGeneration = this.#shutdownGeneration
     await this.init()
 
-    if (shutdownGeneration !== this.#shutdownGeneration) {
-      return null
-    }
+    if (shutdownGeneration !== this.#shutdownGeneration) return null
 
-    this.#running = true
-
-    if (!this.#cycleGenerator) {
-      this.#cycleGenerator = this.process(queues)
-    }
-
-    const result = await this.#cycleGenerator.next()
-
-    if (result.done) {
-      this.#cycleGenerator = undefined
-      return null
-    }
-
-    return result.value
+    return this.#useSession(queues).processCycle()
   }
 
   /**
-   * Generator that yields worker cycle events.
+   * Yield Worker cycle events from the active continuous session.
    *
-   * Low-level processing primitive driven by `start()` and `processCycle()`.
-   * Those entry points initialize the worker, manage its running state, and
-   * serialize new runs with shutdown. Consume cycles through them rather than
-   * iterating this generator directly.
+   * This is the low-level processing interface used by callers that consume
+   * `started`, `completed`, `idle`, and `error` events directly.
    *
-   * Yields events for:
-   * - `started`: A new job began execution
-   * - `completed`: A job finished (success or failure)
-   * - `idle`: No jobs available, suggest waiting
-   * - `error`: An error occurred during processing
-   *
-   * @param queues - Queue names to process
-   * @yields WorkerCycle events
+   * @param queues - Queue names to process in priority order
    */
   async *process(queues: string[]): AsyncGenerator<WorkerCycle, void, unknown> {
-    const shutdownGeneration = this.#shutdownGeneration
-    const isRunning = () => this.#running && shutdownGeneration === this.#shutdownGeneration
-
-    this.#pool = new JobPool()
-    this.#startHeartbeat(queues)
-
-    try {
-      while (isRunning()) {
-        try {
-          // Check for stalled jobs periodically
-          await this.#checkStalledJobs(queues)
-
-          if (!isRunning()) {
-            break
-          }
-
-          // Dispatch any due scheduled jobs
-          await this.#dispatchDueSchedules()
-
-          if (!isRunning()) {
-            break
-          }
-
-          const fillOperation = this.#fillPool(queues)
-          this.#fillOperation = fillOperation
-
-          try {
-            const result = await fillOperation
-
-            for (const cycle of result.cycles) {
-              if (!isRunning()) {
-                break
-              }
-
-              yield cycle
-            }
-
-            if (result.errors.length > 0 && isRunning()) {
-              throw result.errors[0]
-            }
-          } finally {
-            if (this.#fillOperation === fillOperation) {
-              this.#fillOperation = undefined
-            }
-          }
-
-          if (!isRunning()) {
-            break
-          }
-
-          if (this.#pool.isEmpty()) {
-            yield { type: 'idle', suggestedDelay: this.#idleDelay }
-            continue
-          }
-
-          const hasCapacity = this.#pool.hasCapacity(this.#concurrency)
-
-          // If we have capacity, don't block indefinitely waiting for a completion;
-          // wake up periodically to try to acquire newly enqueued jobs.
-          const result = await Promise.race([
-            this.#pool
-              .waitForNextCompletion()
-              .then((completed) => ({ kind: 'completed' as const, completed })),
-            ...(hasCapacity
-              ? [setTimeout(this.#idleDelay).then(() => ({ kind: 'tick' as const }))]
-              : []),
-          ])
-
-          if (!isRunning()) {
-            break
-          }
-
-          if (result.kind === 'tick') {
-            // No completion yet, but we woke up to check the queue again
-            continue
-          }
-
-          yield { type: 'completed', queue: result.completed.queue, job: result.completed.job }
-        } catch (error) {
-          if (!isRunning()) {
-            break
-          }
-
-          yield {
-            type: 'error',
-            error: error as Error,
-            suggestedDelay: parse(DEFAULT_ERROR_RETRY_DELAY),
-          }
-        }
-      }
-    } finally {
-      // During graceful shutdown, stop() owns the heartbeat until every acquired
-      // job has drained. For any other generator exit, clean it up here.
-      if (shutdownGeneration === this.#shutdownGeneration) {
-        this.#stopHeartbeat()
-      }
+    while (this.#stopOperation) {
+      await this.#stopOperation
     }
+
+    const shutdownGeneration = this.#shutdownGeneration
+    await this.init()
+
+    if (shutdownGeneration !== this.#shutdownGeneration) return
+
+    yield* this.#useSession(queues).process()
   }
 
-  /**
-   * Acquire enough jobs to fill the available concurrency slots.
-   *
-   * Acquisitions run concurrently, but each successful job is executed and
-   * added to the pool immediately instead of waiting for its siblings. From
-   * that point onward the pool owns the job, so heartbeat renewal and shutdown
-   * draining can see it even when another adapter call remains pending.
-   *
-   * The method itself still waits for every acquisition to settle. This gives
-   * `stop()` one operation it can await before draining the complete pool.
-   * Cycles and errors retain acquisition order for deterministic consumption.
-   */
-  async #fillPool(queues: string[]): Promise<PoolFillResult> {
-    const slotsAvailable = this.#concurrency - this.#pool!.size
+  #useSession(queues: string[]): WorkerSession {
+    if (this.#session) {
+      this.#session.assertQueues(queues)
+      return this.#session
+    }
 
-    if (slotsAvailable <= 0) return { cycles: [], errors: [] }
-
-    const pool = this.#pool!
-    const cycles: Array<StartedCycle | undefined> = Array.from({ length: slotsAvailable })
-    const errors: Array<{ error: unknown } | undefined> = Array.from({ length: slotsAvailable })
-
-    const acquisitions = Array.from({ length: slotsAvailable }, async (_, index) => {
-      try {
-        const result = await this.#acquireNextJob(queues)
-        if (!result) return
-
-        const { job, queue } = result
-        const promise = this.#execute(job, queue)
-        pool.add(job, queue, promise)
-        cycles[index] = { type: 'started', queue, job }
-      } catch (error) {
-        errors[index] = { error }
-      }
+    const session = new WorkerSession({
+      workerId: this.#id,
+      queues,
+      adapter: this.#adapter,
+      jobExecutionRuntime: this.#jobExecutionRuntime,
+      scheduleDispatcher: jobDispatchRuntime,
+      wrapInternal: this.#wrapInternal,
+      settings: this.#sessionSettings,
     })
 
-    await Promise.all(acquisitions)
-
-    return {
-      cycles: cycles.filter((cycle): cycle is StartedCycle => cycle !== undefined),
-      errors: errors
-        .filter((result): result is { error: unknown } => result !== undefined)
-        .map((result) => result.error),
-    }
+    this.#session = session
+    return session
   }
 
-  async #execute(job: AcquiredJob, queue: string): Promise<void> {
-    const startTime = performance.now()
-
-    debug('worker %s: executing job %s (%s)', this.#id, job.id, job.name)
-
-    const outcome = await this.#jobExecutionRuntime.execute(job, queue)
-    await this.#finalizeExecution(job, queue, outcome)
-
-    if (outcome.type === 'completed') {
-      debug(
-        'worker %s: successfully executed job %s in %dms',
-        this.#id,
-        job.id,
-        (performance.now() - startTime).toFixed(2)
-      )
-    }
-  }
-
-  async #finalizeExecution(
-    job: AcquiredJob,
-    queue: string,
-    outcome: JobExecutionOutcome
-  ): Promise<void> {
-    if (outcome.type === 'completed') {
-      await this.#wrapInternal(() =>
-        this.#adapter.completeJob(job.id, queue, outcome.removeOnComplete)
-      )
-      return
-    }
-
-    if (outcome.type === 'initialization-failed') {
-      debug('worker %s: failed to initialize job %s (%s)', this.#id, job.id, job.name)
-      await this.#wrapInternal(() =>
-        this.#adapter.failJob(job.id, queue, outcome.error, outcome.removeOnFail)
-      )
-      return
-    }
-
-    if (outcome.type === 'failed') {
-      await this.#wrapInternal(() =>
-        this.#adapter.failJob(job.id, queue, outcome.error, outcome.removeOnFail)
-      )
-
-      if (outcome.failedHookError) {
-        throw outcome.failedHookError
-      }
-
-      return
-    }
-
-    if (outcome.retryAt) {
-      debug('worker %s: job %s will retry at %s', this.#id, job.id, outcome.retryAt.toISOString())
-      await this.#wrapInternal(() => this.#adapter.retryJob(job.id, queue, outcome.retryAt))
-    } else {
-      await this.#wrapInternal(() => this.#adapter.retryJob(job.id, queue))
-    }
-  }
-
-  async #acquireNextJob(queues: string[]): Promise<{ job: AcquiredJob; queue: string } | null> {
-    for (const queue of queues) {
-      const job = await this.#wrapInternal(() => this.#adapter.popFrom(queue))
-
-      if (!job) {
-        continue
-      }
-
-      debug('worker %s: acquired job %s', this.#id, job.id)
-      return { job, queue }
-    }
-
-    return null
-  }
-
-  async #checkStalledJobs(queues: string[]): Promise<void> {
-    const now = Date.now()
-
-    // Only check if enough time has passed since last check
-    if (now - this.#lastStalledCheck < this.#stalledInterval) {
-      return
-    }
-
-    this.#lastStalledCheck = now
-
-    for (const queue of queues) {
-      const recovered = await this.#wrapInternal(() =>
-        this.#adapter.recoverStalledJobs(queue, this.#stalledThreshold, this.#maxStalledCount)
-      )
-
-      if (recovered > 0) {
-        debug('worker %s: recovered %d stalled jobs from queue %s', this.#id, recovered, queue)
-      }
-    }
-  }
-
-  /**
-   * Start the heartbeat timer that periodically renews the acquired timestamp
-   * of in-flight jobs.
-   *
-   * Renewal cannot piggyback on the main process loop: at full concurrency the
-   * loop blocks on `waitForNextCompletion()` with no idle tick, so exactly when
-   * long-running jobs are in flight the loop is not cycling. A dedicated timer
-   * guarantees healthy jobs are refreshed before `recoverStalledJobs` would
-   * consider them stalled and re-deliver them.
-   *
-   * The interval is half the stalled threshold so a job is renewed at least
-   * once within every stalled window.
-   *
-   * During shutdown, `stop()` keeps this timer alive until the pool has drained,
-   * then clears it and awaits the last renewal. On any other processing-loop
-   * exit, the generator owns timer cleanup.
-   */
-  #startHeartbeat(queues: string[]) {
-    // Never leave a previous timer running if the loop is somehow re-entered.
-    this.#stopHeartbeat()
-
-    const interval = Math.max(Math.floor(this.#stalledThreshold / 2), 1)
-
-    this.#heartbeatTimer = setInterval(() => {
-      if (this.#heartbeatRenewal) return
-
-      const renewal = this.#renewActiveJobs(queues)
-      this.#heartbeatRenewal = renewal
-
-      const clearRenewal = () => {
-        if (this.#heartbeatRenewal === renewal) {
-          this.#heartbeatRenewal = undefined
-        }
-      }
-
-      void renewal.then(clearRenewal, clearRenewal)
-    }, interval)
-
-    // Don't let the heartbeat keep the event loop alive on its own.
-    this.#heartbeatTimer.unref?.()
-  }
-
-  #stopHeartbeat() {
-    if (this.#heartbeatTimer) {
-      clearInterval(this.#heartbeatTimer)
-      this.#heartbeatTimer = undefined
-    }
-  }
-
-  /**
-   * Renew the acquired timestamp of the jobs currently in the pool so that
-   * long-running handlers are not treated as stalled while they are still
-   * running. Only jobs still active in the adapter are renewed.
-   */
-  async #renewActiveJobs(queues: string[]): Promise<void> {
-    if (!this.#pool || this.#pool.isEmpty()) {
-      return
-    }
-
-    const jobIdsByQueue = this.#pool.activeJobIdsByQueue()
-
-    for (const queue of queues) {
-      const jobIds = jobIdsByQueue.get(queue)
-
-      if (!jobIds || jobIds.length === 0) {
-        continue
-      }
-
-      try {
-        await this.#wrapInternal(() => this.#adapter.renewJobs(queue, jobIds))
-      } catch (error) {
-        // A failed heartbeat must never crash the worker; the job will simply
-        // be considered stalled if renewals keep failing.
-        debug('worker %s: failed to renew jobs on queue %s: %O', this.#id, queue, error)
-      }
-    }
-  }
-
-  #setupGracefulShutdown() {
-    if (!this.#gracefulShutdown) {
-      return
-    }
+  #setupGracefulShutdown(): void {
+    if (!this.#gracefulShutdown || this.#shutdownHandler) return
 
     this.#shutdownHandler = async () => {
       debug('received shutdown signal, stopping worker...')
@@ -728,50 +273,11 @@ export class Worker {
     process.on('SIGTERM', this.#shutdownHandler)
   }
 
-  #removeShutdownHandlers() {
-    if (this.#shutdownHandler) {
-      process.off('SIGINT', this.#shutdownHandler)
-      process.off('SIGTERM', this.#shutdownHandler)
-      this.#shutdownHandler = undefined
-    }
-  }
+  #removeShutdownHandlers(): void {
+    if (!this.#shutdownHandler) return
 
-  /**
-   * Dispatch any due scheduled jobs.
-   *
-   * Claims due schedules from the adapter and dispatches the corresponding
-   * jobs to their configured queues.
-   */
-  async #dispatchDueSchedules(): Promise<void> {
-    // Keep claiming due schedules until there are none left
-    while (true) {
-      const schedule = await this.#wrapInternal(() => this.#adapter.claimDueSchedule())
-
-      if (!schedule) {
-        break
-      }
-
-      debug(
-        'worker %s: dispatching scheduled job %s (schedule: %s, runCount: %d)',
-        this.#id,
-        schedule.name,
-        schedule.id,
-        schedule.runCount + 1
-      )
-
-      const JobClass = await Locator.resolve(schedule.name)
-
-      // A claimed occurrence stays consumed if dispatch throws. Rolling it back after an
-      // ambiguous push could produce a duplicate. An idempotent enqueue protocol would
-      // have to span every Adapter and is not justified by the current Schedule semantics.
-      await jobDispatchRuntime.dispatch({
-        kind: 'single',
-        name: schedule.name,
-        payload: schedule.payload,
-        jobOptions: JobClass?.options,
-        overrides: { adapter: () => this.#adapter },
-        scheduleId: schedule.id,
-      })
-    }
+    process.off('SIGINT', this.#shutdownHandler)
+    process.off('SIGTERM', this.#shutdownHandler)
+    this.#shutdownHandler = undefined
   }
 }
