@@ -3,6 +3,7 @@ import debug from './debug.js'
 import * as errors from './exceptions.js'
 import { parse } from './utils.js'
 import { JobPool } from './job_pool.js'
+import { WorkerHeartbeat, type HeartbeatOperationWrapper } from './worker_heartbeat.js'
 import { Locator } from './locator.js'
 import type { SingleJobDispatchRequest } from './job_dispatch_runtime.js'
 import type { Adapter, AcquiredJob } from './contracts/adapter.js'
@@ -18,7 +19,7 @@ interface PoolFillResult {
   errors: unknown[]
 }
 
-export type InternalOperationWrapper = <T>(operation: () => Promise<T>) => Promise<T>
+export type InternalOperationWrapper = HeartbeatOperationWrapper
 export type JobExecutor = Pick<JobExecutionRuntime, 'execute'>
 export interface ScheduleDispatcher {
   dispatch(request: SingleJobDispatchRequest): Promise<unknown>
@@ -58,6 +59,7 @@ export class WorkerSession {
   readonly #scheduleDispatcher: ScheduleDispatcher
   readonly #wrapInternal: InternalOperationWrapper
   readonly #settings: WorkerSessionSettings
+  readonly #heartbeat: WorkerHeartbeat
 
   #mode?: SessionMode
   #running = false
@@ -70,8 +72,6 @@ export class WorkerSession {
   #pool = new JobPool()
   #fillOperation?: Promise<PoolFillResult>
   #lastStalledCheck = 0
-  #heartbeatTimer?: NodeJS.Timeout
-  #heartbeatRenewal?: Promise<void>
   #delayController?: AbortController
 
   constructor(options: WorkerSessionOptions) {
@@ -82,6 +82,14 @@ export class WorkerSession {
     this.#scheduleDispatcher = options.scheduleDispatcher
     this.#wrapInternal = options.wrapInternal
     this.#settings = options.settings
+    this.#heartbeat = new WorkerHeartbeat({
+      workerId: options.workerId,
+      queues: this.#queues,
+      interval: Math.max(Math.floor(options.settings.stalledThreshold / 2), 1),
+      pool: this.#pool,
+      adapter: options.adapter,
+      wrapInternal: options.wrapInternal,
+    })
   }
 
   assertQueues(queues: readonly string[]): void {
@@ -192,8 +200,7 @@ export class WorkerSession {
       await this.#pool.drain()
     }
 
-    this.#stopHeartbeat()
-    await this.#heartbeatRenewal
+    await this.#heartbeat.stop()
     await this.#closeCycleGenerator()
 
     if (this.#startCompletion) {
@@ -260,7 +267,7 @@ export class WorkerSession {
   }
 
   async *#cycles(): AsyncGenerator<WorkerCycle, void, unknown> {
-    this.#startHeartbeat()
+    this.#heartbeat.start()
 
     try {
       while (this.#running) {
@@ -326,7 +333,7 @@ export class WorkerSession {
       }
     } finally {
       if (!this.#stopping) {
-        this.#stopHeartbeat()
+        await this.#heartbeat.stop()
       }
     }
   }
@@ -464,53 +471,6 @@ export class WorkerSession {
           recovered,
           queue
         )
-      }
-    }
-  }
-
-  #startHeartbeat(): void {
-    this.#stopHeartbeat()
-
-    const interval = Math.max(Math.floor(this.#settings.stalledThreshold / 2), 1)
-
-    this.#heartbeatTimer = setInterval(() => {
-      if (this.#heartbeatRenewal) return
-
-      const renewal = this.#renewActiveJobs()
-      this.#heartbeatRenewal = renewal
-
-      const clearRenewal = () => {
-        if (this.#heartbeatRenewal === renewal) {
-          this.#heartbeatRenewal = undefined
-        }
-      }
-
-      void renewal.then(clearRenewal, clearRenewal)
-    }, interval)
-
-    this.#heartbeatTimer.unref?.()
-  }
-
-  #stopHeartbeat(): void {
-    if (this.#heartbeatTimer) {
-      clearInterval(this.#heartbeatTimer)
-      this.#heartbeatTimer = undefined
-    }
-  }
-
-  async #renewActiveJobs(): Promise<void> {
-    if (this.#pool.isEmpty()) return
-
-    const jobIdsByQueue = this.#pool.activeJobIdsByQueue()
-
-    for (const queue of this.#queues) {
-      const jobIds = jobIdsByQueue.get(queue)
-      if (!jobIds || jobIds.length === 0) continue
-
-      try {
-        await this.#wrapInternal(() => this.#adapter.renewJobs(queue, jobIds))
-      } catch (error) {
-        debug('worker %s: failed to renew jobs on queue %s: %O', this.#workerId, queue, error)
       }
     }
   }
