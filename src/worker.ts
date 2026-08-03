@@ -74,6 +74,7 @@ export class Worker {
   #cycleGenerator?: AsyncGenerator<WorkerCycle, void, unknown>
   #cycleGeneratorClose?: Promise<void>
   #startCompletion?: Promise<void>
+  #stopOperation?: Promise<void>
   #pool?: JobPool
   #fillOperation?: Promise<PoolFillResult>
   #lastStalledCheck = 0
@@ -170,6 +171,10 @@ export class Worker {
    * ```
    */
   async start(queues: string[] = ['default']): Promise<void> {
+    while (this.#stopOperation) {
+      await this.#stopOperation
+    }
+
     const shutdownGeneration = this.#shutdownGeneration
     await this.init()
 
@@ -231,7 +236,24 @@ export class Worker {
    * Adapter cleanup remains the responsibility of `QueueManager.destroy()`.
    * Called automatically on SIGINT/SIGTERM if gracefulShutdown is enabled.
    */
-  async stop() {
+  stop(): Promise<void> {
+    if (!this.#stopOperation) {
+      const stopOperation = this.#stop()
+      this.#stopOperation = stopOperation
+
+      const clearStopOperation = () => {
+        if (this.#stopOperation === stopOperation) {
+          this.#stopOperation = undefined
+        }
+      }
+
+      void stopOperation.then(clearStopOperation, clearStopOperation)
+    }
+
+    return this.#stopOperation
+  }
+
+  async #stop(): Promise<void> {
     debug('stopping worker %s', this.#id)
 
     this.#shutdownGeneration++
@@ -326,6 +348,10 @@ export class Worker {
    * ```
    */
   async processCycle(queues: string[]): Promise<WorkerCycle | null> {
+    while (this.#stopOperation) {
+      await this.#stopOperation
+    }
+
     const shutdownGeneration = this.#shutdownGeneration
     await this.init()
 
@@ -352,7 +378,12 @@ export class Worker {
   /**
    * Generator that yields worker cycle events.
    *
-   * Low-level API for processing jobs. Yields events for:
+   * Low-level processing primitive driven by `start()` and `processCycle()`.
+   * Those entry points initialize the worker, manage its running state, and
+   * serialize new runs with shutdown. Consume cycles through them rather than
+   * iterating this generator directly.
+   *
+   * Yields events for:
    * - `started`: A new job began execution
    * - `completed`: A job finished (success or failure)
    * - `idle`: No jobs available, suggest waiting
@@ -360,23 +391,6 @@ export class Worker {
    *
    * @param queues - Queue names to process
    * @yields WorkerCycle events
-   *
-   * @example
-   * ```typescript
-   * for await (const cycle of worker.process(['default'])) {
-   *   switch (cycle.type) {
-   *     case 'started':
-   *       console.log(`Started job ${cycle.job.id}`)
-   *       break
-   *     case 'completed':
-   *       console.log(`Completed job ${cycle.job.id}`)
-   *       break
-   *     case 'idle':
-   *       await sleep(cycle.suggestedDelay)
-   *       break
-   *   }
-   * }
-   * ```
    */
   async *process(queues: string[]): AsyncGenerator<WorkerCycle, void, unknown> {
     const shutdownGeneration = this.#shutdownGeneration

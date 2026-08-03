@@ -887,6 +887,41 @@ test.group('Worker', () => {
     assert.isNull(await fixture.adapter.getJob('second-late-acquired-job', 'default'))
   })
 
+  test('should finish stopping before a new start can acquire jobs', async ({
+    assert,
+    cleanup,
+  }) => {
+    class RestartedJob extends Job {
+      async execute() {}
+    }
+
+    const fixture = createWorkerFixture()
+    fixture.adapter.finalizations.block(1)
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(RestartedJob, { id: 'job-before-restart' })
+
+    const firstStart = fixture.start()
+    await fixture.adapter.finalizations.waitForStarted(1)
+
+    const stop = trackPromise(fixture.worker.stop())
+    const secondStart = fixture.start()
+    await setTimeout(0)
+
+    assert.equal(
+      fixture.adapter.acquisitions.calls,
+      1,
+      'A new run must not acquire jobs while the previous run is stopping'
+    )
+
+    fixture.adapter.finalizations.release(1)
+    await stop.promise
+    await fixture.adapter.acquisitions.waitForStarted(2)
+
+    await fixture.worker.stop()
+    await Promise.all([firstStart, secondStart])
+  })
+
   test('should execute an acquired job while a sibling acquisition is still pending', async ({
     assert,
     cleanup,
