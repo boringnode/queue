@@ -65,6 +65,7 @@ export class Worker {
   #initialized = false
   #generator?: AsyncGenerator<WorkerCycle, void, unknown>
   #pool?: JobPool
+  #fillOperation?: Promise<WorkerCycle[]>
   #lastStalledCheck = 0
   #shutdownHandler?: () => Promise<void>
   #heartbeatTimer?: NodeJS.Timeout
@@ -183,6 +184,11 @@ export class Worker {
 
     this.#running = false
 
+    if (this.#fillOperation) {
+      debug('worker %s: waiting for in-flight job acquisitions to complete', this.#id)
+      await this.#fillOperation.catch(() => {})
+    }
+
     if (this.#pool) {
       debug('worker %s: waiting for %d running jobs to complete', this.#id, this.#pool.size)
       await this.#pool.drain()
@@ -280,7 +286,26 @@ export class Worker {
           // Dispatch any due scheduled jobs
           await this.#dispatchDueSchedules()
 
-          yield* this.#fillPool(queues)
+          if (!this.#running) {
+            continue
+          }
+
+          const fillOperation = this.#fillPool(queues)
+          this.#fillOperation = fillOperation
+
+          try {
+            for (const cycle of await fillOperation) {
+              yield cycle
+            }
+          } finally {
+            if (this.#fillOperation === fillOperation) {
+              this.#fillOperation = undefined
+            }
+          }
+
+          if (!this.#running) {
+            continue
+          }
 
           if (this.#pool.isEmpty()) {
             yield { type: 'idle', suggestedDelay: this.#idleDelay }
@@ -319,14 +344,15 @@ export class Worker {
     }
   }
 
-  async *#fillPool(queues: string[]): AsyncGenerator<WorkerCycle, void, unknown> {
+  async #fillPool(queues: string[]): Promise<WorkerCycle[]> {
     const slotsAvailable = this.#concurrency - this.#pool!.size
 
-    if (slotsAvailable <= 0) return
+    if (slotsAvailable <= 0) return []
 
     const popPromises = Array.from({ length: slotsAvailable }, () => this.#acquireNextJob(queues))
 
     const results = await Promise.all(popPromises)
+    const cycles: WorkerCycle[] = []
 
     for (const result of results) {
       if (!result) continue
@@ -335,8 +361,10 @@ export class Worker {
       const promise = this.#execute(job, queue)
       this.#pool!.add(job, queue, promise)
 
-      yield { type: 'started', queue, job }
+      cycles.push({ type: 'started', queue, job })
     }
+
+    return cycles
   }
 
   async #execute(job: AcquiredJob, queue: string): Promise<void> {

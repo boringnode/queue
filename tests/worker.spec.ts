@@ -834,6 +834,92 @@ test.group('Worker', () => {
     assert.isTrue(jobCompleted, 'Job should have completed before worker stopped')
   })
 
+  test('should wait for in-flight acquisitions and their jobs before stopping', async ({
+    assert,
+    cleanup,
+  }) => {
+    let releaseAcquisitions!: () => void
+    const acquisitionsBlocked = new Promise<void>((resolve) => (releaseAcquisitions = resolve))
+    let acquisitionsStartedResolve!: () => void
+    const acquisitionsStarted = new Promise<void>(
+      (resolve) => (acquisitionsStartedResolve = resolve)
+    )
+
+    class BlockingPopAdapter extends MemoryAdapter {
+      popCalls = 0
+
+      override async popFrom(queue: string) {
+        this.popCalls++
+
+        if (this.popCalls === 2) {
+          acquisitionsStartedResolve()
+        }
+
+        await acquisitionsBlocked
+        return super.popFrom(queue)
+      }
+    }
+
+    let releaseJob!: () => void
+    const jobBlocked = new Promise<void>((resolve) => (releaseJob = resolve))
+    let jobStartedResolve!: () => void
+    const jobStarted = new Promise<void>((resolve) => (jobStartedResolve = resolve))
+    let jobCompleted = false
+
+    class BlockingJob extends Job {
+      async execute() {
+        jobStartedResolve()
+        await jobBlocked
+        jobCompleted = true
+      }
+    }
+
+    const adapter = new BlockingPopAdapter()
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => adapter },
+      worker: { concurrency: 2, gracefulShutdown: false },
+    })
+
+    Locator.register('BlockingJob', BlockingJob)
+    cleanup(async () => {
+      releaseAcquisitions()
+      releaseJob()
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await adapter.push({
+      id: 'late-acquired-job',
+      name: 'BlockingJob',
+      payload: {},
+      attempts: 0,
+    })
+
+    const startPromise = worker.start(['default'])
+    await acquisitionsStarted
+
+    let stopped = false
+    const stopPromise = worker.stop().then(() => {
+      stopped = true
+    })
+
+    await setTimeout(0)
+    assert.isFalse(stopped, 'Worker must wait for acquisitions already in flight')
+
+    releaseAcquisitions()
+    await jobStarted
+    await setTimeout(0)
+    assert.isFalse(stopped, 'Worker must wait for jobs returned by an in-flight acquisition')
+
+    releaseJob()
+    await stopPromise
+    await startPromise
+
+    assert.isTrue(jobCompleted)
+    assert.isNull(await adapter.getJob('late-acquired-job', 'default'))
+  })
+
   test('should not destroy the shared adapter when stopping', async ({ assert, cleanup }) => {
     const adapters: DestroyAwareMemoryAdapter[] = []
 
