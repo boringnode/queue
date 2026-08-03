@@ -838,12 +838,8 @@ test.group('Worker', () => {
     assert,
     cleanup,
   }) => {
-    let releaseAcquisitions!: () => void
-    const acquisitionsBlocked = new Promise<void>((resolve) => (releaseAcquisitions = resolve))
-    let acquisitionsStartedResolve!: () => void
-    const acquisitionsStarted = new Promise<void>(
-      (resolve) => (acquisitionsStartedResolve = resolve)
-    )
+    const acquisitionGate = Promise.withResolvers<void>()
+    const acquisitionsStarted = Promise.withResolvers<void>()
 
     class BlockingPopAdapter extends MemoryAdapter {
       popCalls = 0
@@ -852,25 +848,28 @@ test.group('Worker', () => {
         this.popCalls++
 
         if (this.popCalls === 2) {
-          acquisitionsStartedResolve()
+          acquisitionsStarted.resolve()
         }
 
-        await acquisitionsBlocked
+        await acquisitionGate.promise
         return super.popFrom(queue)
       }
     }
 
-    let releaseJob!: () => void
-    const jobBlocked = new Promise<void>((resolve) => (releaseJob = resolve))
-    let jobStartedResolve!: () => void
-    const jobStarted = new Promise<void>((resolve) => (jobStartedResolve = resolve))
-    let jobCompleted = false
+    const jobGate = Promise.withResolvers<void>()
+    const allJobsStarted = Promise.withResolvers<void>()
+    let jobsStarted = 0
+    let jobsCompleted = 0
 
     class BlockingJob extends Job {
       async execute() {
-        jobStartedResolve()
-        await jobBlocked
-        jobCompleted = true
+        jobsStarted++
+        if (jobsStarted === 2) {
+          allJobsStarted.resolve()
+        }
+
+        await jobGate.promise
+        jobsCompleted++
       }
     }
 
@@ -883,8 +882,8 @@ test.group('Worker', () => {
 
     Locator.register('BlockingJob', BlockingJob)
     cleanup(async () => {
-      releaseAcquisitions()
-      releaseJob()
+      acquisitionGate.resolve()
+      jobGate.resolve()
       Locator.clear()
       await worker.stop()
     })
@@ -895,9 +894,15 @@ test.group('Worker', () => {
       payload: {},
       attempts: 0,
     })
+    await adapter.push({
+      id: 'second-late-acquired-job',
+      name: 'BlockingJob',
+      payload: {},
+      attempts: 0,
+    })
 
     const startPromise = worker.start(['default'])
-    await acquisitionsStarted
+    await acquisitionsStarted.promise
 
     let stopped = false
     const stopPromise = worker.stop().then(() => {
@@ -907,17 +912,395 @@ test.group('Worker', () => {
     await setTimeout(0)
     assert.isFalse(stopped, 'Worker must wait for acquisitions already in flight')
 
-    releaseAcquisitions()
-    await jobStarted
+    acquisitionGate.resolve()
+    await allJobsStarted.promise
     await setTimeout(0)
     assert.isFalse(stopped, 'Worker must wait for jobs returned by an in-flight acquisition')
 
-    releaseJob()
+    jobGate.resolve()
     await stopPromise
     await startPromise
 
-    assert.isTrue(jobCompleted)
+    assert.equal(jobsCompleted, 2)
     assert.isNull(await adapter.getJob('late-acquired-job', 'default'))
+    assert.isNull(await adapter.getJob('second-late-acquired-job', 'default'))
+  })
+
+  test('should wait for sibling acquisitions when one acquisition fails', async ({
+    assert,
+    cleanup,
+  }) => {
+    const firstPopGate = Promise.withResolvers<void>()
+    const firstPopRejected = Promise.withResolvers<void>()
+    const secondPopGate = Promise.withResolvers<void>()
+    const allPopsStarted = Promise.withResolvers<void>()
+    const finalizationGate = Promise.withResolvers<void>()
+    const finalizationStarted = Promise.withResolvers<void>()
+
+    class PartiallyFailingAdapter extends MemoryAdapter {
+      popCalls = 0
+
+      override async popFrom(queue: string) {
+        this.popCalls++
+
+        if (this.popCalls === 1) {
+          await firstPopGate.promise
+          firstPopRejected.resolve()
+          throw new Error('Failed to acquire job')
+        }
+
+        allPopsStarted.resolve()
+        await secondPopGate.promise
+        return super.popFrom(queue)
+      }
+
+      override async completeJob(...args: Parameters<MemoryAdapter['completeJob']>): Promise<void> {
+        finalizationStarted.resolve()
+        await finalizationGate.promise
+        return super.completeJob(...args)
+      }
+    }
+
+    let jobCompleted = false
+
+    class LateJob extends Job {
+      async execute() {
+        jobCompleted = true
+      }
+    }
+
+    const adapter = new PartiallyFailingAdapter()
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => adapter },
+      worker: { concurrency: 2, gracefulShutdown: false },
+    })
+
+    Locator.register('LateJob', LateJob)
+    cleanup(async () => {
+      firstPopGate.resolve()
+      secondPopGate.resolve()
+      finalizationGate.resolve()
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await adapter.push({
+      id: 'late-job-after-sibling-error',
+      name: 'LateJob',
+      payload: {},
+      attempts: 0,
+    })
+
+    const startPromise = worker.start(['default'])
+    await allPopsStarted.promise
+
+    firstPopGate.resolve()
+    await firstPopRejected.promise
+
+    let stopped = false
+    const stopPromise = worker.stop().then(() => {
+      stopped = true
+    })
+
+    await setTimeout(0)
+    assert.isFalse(stopped, 'Worker must wait for every sibling acquisition to settle')
+
+    secondPopGate.resolve()
+    await finalizationStarted.promise
+    assert.isTrue(jobCompleted)
+    assert.isFalse(stopped, 'Worker must wait for finalization of late-acquired jobs')
+
+    finalizationGate.resolve()
+    await stopPromise
+    await startPromise
+
+    assert.equal(adapter.popCalls, 2)
+    assert.isNull(await adapter.getJob('late-job-after-sibling-error', 'default'))
+  })
+
+  test('should interrupt the idle delay when stopping', async ({ assert, cleanup }) => {
+    const idle = Promise.withResolvers<void>()
+
+    class IdleAdapter extends MemoryAdapter {
+      override async popFrom() {
+        idle.resolve()
+        return null
+      }
+    }
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => new IdleAdapter() },
+      worker: { idleDelay: '1m', gracefulShutdown: false },
+    })
+
+    cleanup(() => worker.stop())
+
+    const startPromise = worker.start(['default'])
+    await idle.promise
+    await setTimeout(0)
+    await worker.stop()
+
+    const startStopped = await Promise.race([startPromise.then(() => true), setTimeout(100, false)])
+
+    assert.isTrue(startStopped, 'Worker start must not remain blocked in its idle delay')
+  })
+
+  test('should interrupt the error delay when stopping', async ({ assert, cleanup }) => {
+    const acquisitionFailed = Promise.withResolvers<void>()
+
+    class FailingAdapter extends MemoryAdapter {
+      override async popFrom(): Promise<never> {
+        acquisitionFailed.resolve()
+        throw new Error('Failed to acquire job')
+      }
+    }
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => new FailingAdapter() },
+      worker: { gracefulShutdown: false },
+    })
+
+    cleanup(() => worker.stop())
+
+    const startPromise = worker.start(['default'])
+    await acquisitionFailed.promise
+    await setTimeout(0)
+    await worker.stop()
+
+    const startStopped = await Promise.race([startPromise.then(() => true), setTimeout(100, false)])
+
+    assert.isTrue(startStopped, 'Worker start must not remain blocked in its error delay')
+  })
+
+  test('should not start acquiring jobs when stopped during initialization', async ({
+    assert,
+    cleanup,
+  }) => {
+    const initializationStarted = Promise.withResolvers<void>()
+    const initializationGate = Promise.withResolvers<void>()
+    const jobAcquired = Promise.withResolvers<void>()
+
+    class BlockingDestroyAdapter extends MemoryAdapter {
+      override async destroy(): Promise<void> {
+        initializationStarted.resolve()
+        await initializationGate.promise
+      }
+    }
+
+    class AcquisitionTrackingAdapter extends MemoryAdapter {
+      override async popFrom(queue: string) {
+        jobAcquired.resolve()
+        return super.popFrom(queue)
+      }
+    }
+
+    const previousAdapter = new BlockingDestroyAdapter()
+    await QueueManager.init({
+      default: 'memory',
+      adapters: { memory: () => previousAdapter },
+      autoLoadJobs: false,
+    })
+    QueueManager.use()
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => new AcquisitionTrackingAdapter() },
+      autoLoadJobs: false,
+      worker: { gracefulShutdown: false },
+    })
+
+    cleanup(async () => {
+      initializationGate.resolve()
+      await worker.stop()
+      await QueueManager.destroy()
+    })
+
+    const startPromise = worker.start(['default'])
+    await initializationStarted.promise
+    await worker.stop()
+    initializationGate.resolve()
+
+    const startStoppedBeforeAcquisition = await Promise.race([
+      startPromise.then(() => true),
+      jobAcquired.promise.then(() => false),
+    ])
+
+    assert.isTrue(startStoppedBeforeAcquisition)
+
+    const restartedCycle = await worker.processCycle(['default'])
+    assert.equal(restartedCycle?.type, 'idle')
+    await jobAcquired.promise
+  })
+
+  test('should create a fresh processCycle generator after stopping', async ({
+    assert,
+    cleanup,
+  }) => {
+    const polledQueues: string[] = []
+
+    class QueueTrackingAdapter extends MemoryAdapter {
+      override async popFrom(queue: string) {
+        polledQueues.push(queue)
+        return null
+      }
+    }
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => new QueueTrackingAdapter() },
+    })
+
+    cleanup(() => worker.stop())
+
+    await worker.processCycle(['old'])
+    await worker.stop()
+    await worker.processCycle(['new'])
+
+    assert.deepEqual(polledQueues, ['old', 'new'])
+  })
+
+  test('should not return a started cycle after stopping during acquisition', async ({
+    assert,
+    cleanup,
+  }) => {
+    const acquisitionStarted = Promise.withResolvers<void>()
+    const acquisitionGate = Promise.withResolvers<void>()
+
+    class BlockingAdapter extends MemoryAdapter {
+      override async popFrom(queue: string) {
+        acquisitionStarted.resolve()
+        await acquisitionGate.promise
+        return super.popFrom(queue)
+      }
+    }
+
+    class LateJob extends Job {
+      async execute() {}
+    }
+
+    const adapter = new BlockingAdapter()
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => adapter },
+      worker: { gracefulShutdown: false },
+    })
+
+    Locator.register('LateJob', LateJob)
+    cleanup(async () => {
+      acquisitionGate.resolve()
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await adapter.push({
+      id: 'stopped-cycle-job',
+      name: 'LateJob',
+      payload: {},
+      attempts: 0,
+    })
+
+    const cyclePromise = worker.processCycle(['default'])
+    await acquisitionStarted.promise
+
+    const stopPromise = worker.stop()
+    acquisitionGate.resolve()
+
+    assert.isNull(await cyclePromise)
+    await stopPromise
+  })
+
+  test('should emit successful acquisitions before a sibling acquisition error', async ({
+    assert,
+    cleanup,
+  }) => {
+    class PartiallyFailingAdapter extends MemoryAdapter {
+      popCalls = 0
+
+      override async popFrom(queue: string) {
+        this.popCalls++
+
+        if (this.popCalls === 2) {
+          throw new Error('Failed to acquire sibling job')
+        }
+
+        return super.popFrom(queue)
+      }
+    }
+
+    class SuccessfulJob extends Job {
+      async execute() {}
+    }
+
+    const adapter = new PartiallyFailingAdapter()
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => adapter },
+      worker: { concurrency: 2, gracefulShutdown: false },
+    })
+
+    Locator.register('SuccessfulJob', SuccessfulJob)
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await adapter.push({
+      id: 'success-before-error',
+      name: 'SuccessfulJob',
+      payload: {},
+      attempts: 0,
+    })
+
+    const startedCycle = await worker.processCycle(['default'])
+    const errorCycle = await worker.processCycle(['default'])
+
+    assert.equal(startedCycle?.type, 'started')
+    assert.equal(errorCycle?.type, 'error')
+  })
+
+  test('should wait for a stalled check without yielding an error after stopping', async ({
+    assert,
+    cleanup,
+  }) => {
+    const stalledCheckStarted = Promise.withResolvers<void>()
+    const stalledCheckGate = Promise.withResolvers<void>()
+
+    class BlockingStalledCheckAdapter extends MemoryAdapter {
+      override async recoverStalledJobs(): Promise<never> {
+        stalledCheckStarted.resolve()
+        await stalledCheckGate.promise
+        throw new Error('Failed to recover stalled jobs')
+      }
+    }
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => new BlockingStalledCheckAdapter() },
+      worker: { gracefulShutdown: false },
+    })
+
+    cleanup(async () => {
+      stalledCheckGate.resolve()
+      await worker.stop()
+    })
+
+    const cyclePromise = worker.processCycle(['default'])
+    await stalledCheckStarted.promise
+
+    let stopped = false
+    const stopPromise = worker.stop().then(() => {
+      stopped = true
+    })
+
+    await setTimeout(0)
+    assert.isFalse(stopped, 'Worker must wait for worker-owned adapter operations')
+
+    stalledCheckGate.resolve()
+    assert.isNull(await cyclePromise)
+    await stopPromise
   })
 
   test('should not destroy the shared adapter when stopping', async ({ assert, cleanup }) => {

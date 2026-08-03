@@ -16,6 +16,13 @@ import {
   DEFAULT_ERROR_RETRY_DELAY,
 } from './constants.js'
 
+type StartedCycle = Extract<WorkerCycle, { type: 'started' }>
+
+interface PoolFillResult {
+  cycles: StartedCycle[]
+  errors: unknown[]
+}
+
 /**
  * Job processing worker.
  *
@@ -63,13 +70,17 @@ export class Worker {
   #wrapInternal: <T>(fn: () => Promise<T>) => Promise<T> = (fn) => fn()
   #running = false
   #initialized = false
-  #generator?: AsyncGenerator<WorkerCycle, void, unknown>
+  #cycleGenerator?: AsyncGenerator<WorkerCycle, void, unknown>
+  #cycleGeneratorClose?: Promise<void>
+  #startCompletion?: Promise<void>
   #pool?: JobPool
-  #fillOperation?: Promise<WorkerCycle[]>
+  #fillOperation?: Promise<PoolFillResult>
   #lastStalledCheck = 0
   #shutdownHandler?: () => Promise<void>
   #heartbeatTimer?: NodeJS.Timeout
   #renewingJobs = false
+  #delayController?: AbortController
+  #shutdownGeneration = 0
 
   /** Unique identifier for this worker instance */
   get id() {
@@ -139,7 +150,12 @@ export class Worker {
    * ```
    */
   async start(queues: string[] = ['default']): Promise<void> {
+    const shutdownGeneration = this.#shutdownGeneration
     await this.init()
+
+    if (shutdownGeneration !== this.#shutdownGeneration) {
+      return
+    }
 
     if (this.#running) {
       debug('worker %s is already running', this.#id)
@@ -147,27 +163,36 @@ export class Worker {
     }
 
     this.#running = true
+    const completion = Promise.withResolvers<void>()
+    this.#startCompletion = completion.promise
 
-    debug('starting worker %s on queues: %O', this.#id, queues)
+    try {
+      debug('starting worker %s on queues: %O', this.#id, queues)
 
-    this.#setupGracefulShutdown()
+      this.#setupGracefulShutdown()
 
-    for await (const cycle of this.process(queues)) {
-      if (['started', 'completed'].includes(cycle.type)) {
-        continue
-      }
-
-      if (['idle', 'error'].includes(cycle.type)) {
-        // @ts-expect-error - we know suggestedDelay exists for these types
-        const delay = parse(cycle.suggestedDelay)
-
-        if (cycle.type === 'error') {
-          debug('worker %s encountered an error: %O', this.#id, cycle.error)
-        } else {
-          debug('worker %s is idle, waiting for %dms', this.#id, delay)
+      for await (const cycle of this.process(queues)) {
+        if (['started', 'completed'].includes(cycle.type)) {
+          continue
         }
 
-        await setTimeout(delay)
+        if (['idle', 'error'].includes(cycle.type)) {
+          // @ts-expect-error - we know suggestedDelay exists for these types
+          const delay = parse(cycle.suggestedDelay)
+
+          if (cycle.type === 'error') {
+            debug('worker %s encountered an error: %O', this.#id, cycle.error)
+          } else {
+            debug('worker %s is idle, waiting for %dms', this.#id, delay)
+          }
+
+          await this.#waitBeforeNextCycle(delay)
+        }
+      }
+    } finally {
+      completion.resolve()
+      if (this.#startCompletion === completion.promise) {
+        this.#startCompletion = undefined
       }
     }
   }
@@ -182,7 +207,9 @@ export class Worker {
   async stop() {
     debug('stopping worker %s', this.#id)
 
+    this.#shutdownGeneration++
     this.#running = false
+    this.#delayController?.abort()
 
     if (this.#fillOperation) {
       debug('worker %s: waiting for in-flight job acquisitions to complete', this.#id)
@@ -194,6 +221,12 @@ export class Worker {
       await this.#pool.drain()
     }
 
+    await this.#closeCycleGenerator()
+
+    if (this.#startCompletion) {
+      await this.#startCompletion
+    }
+
     // Stop the heartbeat only after draining, so jobs that are still finishing
     // keep being renewed until they actually complete. The process() generator
     // also clears it in its `finally`, but clearing here guarantees prompt and
@@ -202,6 +235,45 @@ export class Worker {
     this.#stopHeartbeat()
 
     this.#removeShutdownHandlers()
+  }
+
+  async #closeCycleGenerator(): Promise<void> {
+    if (!this.#cycleGenerator) {
+      await this.#cycleGeneratorClose
+      return
+    }
+
+    const generator = this.#cycleGenerator
+    this.#cycleGenerator = undefined
+    const closeOperation = generator.return(undefined).then(() => {})
+    this.#cycleGeneratorClose = closeOperation
+
+    try {
+      await closeOperation
+    } finally {
+      if (this.#cycleGeneratorClose === closeOperation) {
+        this.#cycleGeneratorClose = undefined
+      }
+    }
+  }
+
+  async #waitBeforeNextCycle(delay: number): Promise<void> {
+    if (!this.#running) return
+
+    const controller = new AbortController()
+    this.#delayController = controller
+
+    try {
+      await setTimeout(delay, undefined, { signal: controller.signal })
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        throw error
+      }
+    } finally {
+      if (this.#delayController === controller) {
+        this.#delayController = undefined
+      }
+    }
   }
 
   /**
@@ -226,18 +298,23 @@ export class Worker {
    * ```
    */
   async processCycle(queues: string[]): Promise<WorkerCycle | null> {
+    const shutdownGeneration = this.#shutdownGeneration
     await this.init()
+
+    if (shutdownGeneration !== this.#shutdownGeneration) {
+      return null
+    }
 
     this.#running = true
 
-    if (!this.#generator) {
-      this.#generator = this.process(queues)
+    if (!this.#cycleGenerator) {
+      this.#cycleGenerator = this.process(queues)
     }
 
-    const result = await this.#generator.next()
+    const result = await this.#cycleGenerator.next()
 
     if (result.done) {
-      this.#generator = undefined
+      this.#cycleGenerator = undefined
       return null
     }
 
@@ -274,28 +351,45 @@ export class Worker {
    * ```
    */
   async *process(queues: string[]): AsyncGenerator<WorkerCycle, void, unknown> {
+    const shutdownGeneration = this.#shutdownGeneration
+    const isRunning = () => this.#running && shutdownGeneration === this.#shutdownGeneration
+
     this.#pool = new JobPool()
     this.#startHeartbeat(queues)
 
     try {
-      while (this.#running) {
+      while (isRunning()) {
         try {
           // Check for stalled jobs periodically
           await this.#checkStalledJobs(queues)
 
+          if (!isRunning()) {
+            break
+          }
+
           // Dispatch any due scheduled jobs
           await this.#dispatchDueSchedules()
 
-          if (!this.#running) {
-            continue
+          if (!isRunning()) {
+            break
           }
 
           const fillOperation = this.#fillPool(queues)
           this.#fillOperation = fillOperation
 
           try {
-            for (const cycle of await fillOperation) {
+            const result = await fillOperation
+
+            for (const cycle of result.cycles) {
+              if (!isRunning()) {
+                break
+              }
+
               yield cycle
+            }
+
+            if (result.errors.length > 0 && isRunning()) {
+              throw result.errors[0]
             }
           } finally {
             if (this.#fillOperation === fillOperation) {
@@ -303,8 +397,8 @@ export class Worker {
             }
           }
 
-          if (!this.#running) {
-            continue
+          if (!isRunning()) {
+            break
           }
 
           if (this.#pool.isEmpty()) {
@@ -325,6 +419,10 @@ export class Worker {
               : []),
           ])
 
+          if (!isRunning()) {
+            break
+          }
+
           if (result.kind === 'tick') {
             // No completion yet, but we woke up to check the queue again
             continue
@@ -332,6 +430,10 @@ export class Worker {
 
           yield { type: 'completed', queue: result.completed.queue, job: result.completed.job }
         } catch (error) {
+          if (!isRunning()) {
+            break
+          }
+
           yield {
             type: 'error',
             error: error as Error,
@@ -344,27 +446,33 @@ export class Worker {
     }
   }
 
-  async #fillPool(queues: string[]): Promise<WorkerCycle[]> {
+  async #fillPool(queues: string[]): Promise<PoolFillResult> {
     const slotsAvailable = this.#concurrency - this.#pool!.size
 
-    if (slotsAvailable <= 0) return []
+    if (slotsAvailable <= 0) return { cycles: [], errors: [] }
 
     const popPromises = Array.from({ length: slotsAvailable }, () => this.#acquireNextJob(queues))
 
-    const results = await Promise.all(popPromises)
-    const cycles: WorkerCycle[] = []
+    const results = await Promise.allSettled(popPromises)
+    const cycles: StartedCycle[] = []
+    const errors: unknown[] = []
 
     for (const result of results) {
-      if (!result) continue
+      if (result.status === 'rejected') {
+        errors.push(result.reason)
+        continue
+      }
 
-      const { job, queue } = result
+      if (!result.value) continue
+
+      const { job, queue } = result.value
       const promise = this.#execute(job, queue)
       this.#pool!.add(job, queue, promise)
 
       cycles.push({ type: 'started', queue, job })
     }
 
-    return cycles
+    return { cycles, errors }
   }
 
   async #execute(job: AcquiredJob, queue: string): Promise<void> {
