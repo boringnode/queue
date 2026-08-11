@@ -192,6 +192,7 @@ export class WorkerSession {
     this.#stopping = true
     this.#running = false
     this.#delayController?.abort()
+    this.#completionDelayController?.abort()
 
     if (this.#fillOperation) {
       debug('worker %s: waiting for in-flight job acquisitions to complete', this.#workerId)

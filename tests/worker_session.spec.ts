@@ -256,6 +256,9 @@ test.group('WorkerSession', () => {
     await setTimeout(0)
 
     const stop = trackPromise(session.stop())
+    await setTimeout(0)
+
+    assert.isTrue(pendingCycle.settled)
     assert.isFalse(stop.settled)
 
     execution.resolve()
