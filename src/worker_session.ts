@@ -343,31 +343,46 @@ export class WorkerSession {
 
     if (slotsAvailable <= 0) return { cycles: [], errors: [] }
 
-    const cycles: Array<StartedCycle | undefined> = Array.from({ length: slotsAvailable })
-    const failures: Array<{ error: unknown } | undefined> = Array.from({ length: slotsAvailable })
+    let probe: StartedCycle | null
 
-    const acquisitions = Array.from({ length: slotsAvailable }, async (_, index) => {
-      try {
-        const result = await this.#acquireNextJob()
-        if (!result) return
-
-        const { job, queue } = result
-        const promise = this.#execute(job, queue)
-        this.#pool.add(job, queue, promise)
-        cycles[index] = { type: 'started', queue, job }
-      } catch (error) {
-        failures[index] = { error }
-      }
-    })
-
-    await Promise.all(acquisitions)
-
-    return {
-      cycles: cycles.filter((cycle): cycle is StartedCycle => cycle !== undefined),
-      errors: failures
-        .filter((result): result is { error: unknown } => result !== undefined)
-        .map((result) => result.error),
+    try {
+      probe = await this.#acquireAndStartNextJob()
+    } catch (error) {
+      return { cycles: [], errors: [error] }
     }
+
+    if (!probe) return { cycles: [], errors: [] }
+    if (!this.#running) return { cycles: [probe], errors: [] }
+
+    const acquisitions: Array<Promise<StartedCycle | null>> = []
+    for (let index = 1; index < slotsAvailable; index++) {
+      acquisitions.push(this.#acquireAndStartNextJob())
+    }
+
+    const results = await Promise.allSettled(acquisitions)
+    const cycles = [probe]
+    const errors: unknown[] = []
+
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        errors.push(result.reason)
+      } else if (result.value) {
+        cycles.push(result.value)
+      }
+    }
+
+    return { cycles, errors }
+  }
+
+  async #acquireAndStartNextJob(): Promise<StartedCycle | null> {
+    const result = await this.#acquireNextJob()
+    if (!result) return null
+
+    const { job, queue } = result
+    const promise = this.#execute(job, queue)
+    this.#pool.add(job, queue, promise)
+
+    return { type: 'started', queue, job }
   }
 
   async #execute(job: AcquiredJob, queue: string): Promise<void> {
