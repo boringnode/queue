@@ -2,7 +2,7 @@ import { setTimeout } from 'node:timers/promises'
 import debug from './debug.js'
 import * as errors from './exceptions.js'
 import { parse } from './utils.js'
-import { JobPool } from './job_pool.js'
+import { JobPool, type PoolEntry } from './job_pool.js'
 import { WorkerHeartbeat, type HeartbeatOperationWrapper } from './worker_heartbeat.js'
 import { Locator } from './locator.js'
 import type { SingleJobDispatchRequest } from './job_dispatch_runtime.js'
@@ -71,6 +71,9 @@ export class WorkerSession {
   #stopOperation?: Promise<void>
   #pool = new JobPool()
   #fillOperation?: Promise<PoolFillResult>
+  #completionOperation?: Promise<PoolEntry>
+  #completedEntry?: PoolEntry
+  #completionDelayController?: AbortController
   #lastStalledCheck = 0
   #delayController?: AbortController
 
@@ -308,19 +311,12 @@ export class WorkerSession {
           }
 
           const hasCapacity = this.#pool.hasCapacity(this.#settings.concurrency)
-          const result = await Promise.race([
-            this.#pool
-              .waitForNextCompletion()
-              .then((completed) => ({ kind: 'completed' as const, completed })),
-            ...(hasCapacity
-              ? [setTimeout(this.#settings.idleDelay).then(() => ({ kind: 'tick' as const }))]
-              : []),
-          ])
+          const completed = await this.#waitForCompletion(hasCapacity)
 
           if (!this.#running) break
-          if (result.kind === 'tick') continue
+          if (!completed) continue
 
-          yield { type: 'completed', queue: result.completed.queue, job: result.completed.job }
+          yield { type: 'completed', queue: completed.queue, job: completed.job }
         } catch (error) {
           if (!this.#running) break
 
@@ -336,6 +332,56 @@ export class WorkerSession {
         await this.#heartbeat.stop()
       }
     }
+  }
+
+  async #waitForCompletion(hasCapacity: boolean): Promise<PoolEntry | null> {
+    const completionOperation = this.#getCompletionOperation()
+
+    if (!hasCapacity || this.#completedEntry) {
+      return this.#consumeCompletion(completionOperation)
+    }
+
+    const controller = new AbortController()
+    this.#completionDelayController = controller
+
+    try {
+      await setTimeout(this.#settings.idleDelay, undefined, { signal: controller.signal })
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        throw error
+      }
+    } finally {
+      if (this.#completionDelayController === controller) {
+        this.#completionDelayController = undefined
+      }
+    }
+
+    return this.#completedEntry ? this.#consumeCompletion(completionOperation) : null
+  }
+
+  #getCompletionOperation(): Promise<PoolEntry> {
+    if (this.#completionOperation) return this.#completionOperation
+
+    const completionOperation = this.#pool.waitForNextCompletion().then((completed) => {
+      if (this.#completionOperation === completionOperation) {
+        this.#completedEntry = completed
+        this.#completionDelayController?.abort()
+      }
+      return completed
+    })
+    this.#completionOperation = completionOperation
+    return completionOperation
+  }
+
+  async #consumeCompletion(completionOperation: Promise<PoolEntry>): Promise<PoolEntry> {
+    const completed = this.#completedEntry ?? (await completionOperation)
+
+    if (this.#completionOperation === completionOperation) {
+      this.#completionOperation = undefined
+      this.#completedEntry = undefined
+    }
+
+    return completed
   }
 
   async #fillPool(): Promise<PoolFillResult> {

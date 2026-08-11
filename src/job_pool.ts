@@ -3,13 +3,18 @@ import type { AcquiredJob } from './contracts/adapter.js'
 /**
  * Entry representing an active job in the pool.
  */
-interface PoolEntry {
+export interface PoolEntry {
   /** Promise that resolves when the job completes */
   promise: Promise<void>
   /** The acquired job data */
   job: AcquiredJob
   /** The queue this job came from */
   queue: string
+}
+
+interface CompletedEntry {
+  id: string
+  entry: PoolEntry
 }
 
 /**
@@ -31,6 +36,9 @@ interface PoolEntry {
  */
 export class JobPool {
   #activeJobs = new Map<string, PoolEntry>()
+  #completedEntries: CompletedEntry[] = []
+  #completedHead = 0
+  #completionAvailable?: PromiseWithResolvers<void>
 
   /** Number of currently running jobs */
   get size() {
@@ -69,8 +77,12 @@ export class JobPool {
    * @param promise - Promise that resolves when the job completes
    */
   add(job: AcquiredJob, queue: string, promise: Promise<void>) {
-    void promise.catch(() => {})
-    this.#activeJobs.set(job.id, { promise, job, queue })
+    const entry = { promise, job, queue }
+    this.#activeJobs.set(job.id, entry)
+    void promise.then(
+      () => this.#enqueueCompletion(job.id, entry),
+      () => this.#enqueueCompletion(job.id, entry)
+    )
   }
 
   /**
@@ -100,27 +112,26 @@ export class JobPool {
   /**
    * Wait for the next job to complete and return it.
    *
-   * Uses `Promise.race()` internally, so the fastest job wins.
-   * The completed job is removed from the pool.
+   * Completions are queued in settlement order and remain available until a
+   * consumer asks for them. The completed job is removed from the pool.
    *
    * @returns The first job to complete (success or failure)
    */
   async waitForNextCompletion(): Promise<PoolEntry> {
-    const completedJobId = await Promise.race(
-      [...this.#activeJobs.entries()].map(async ([id, { promise }]) => {
-        try {
-          await promise
-        } catch {
-          // Errors are handled in Worker#execute
-        }
-        return id
-      })
-    )
+    while (true) {
+      while (this.#completedHead >= this.#completedEntries.length) {
+        this.#completionAvailable ??= Promise.withResolvers<void>()
+        await this.#completionAvailable.promise
+      }
 
-    const completed = this.#activeJobs.get(completedJobId)!
-    this.#activeJobs.delete(completedJobId)
+      const completed = this.#completedEntries[this.#completedHead++]!
+      this.#compactCompletedJobs()
 
-    return completed
+      if (this.#activeJobs.get(completed.id) !== completed.entry) continue
+
+      this.#activeJobs.delete(completed.id)
+      return completed.entry
+    }
   }
 
   /**
@@ -140,5 +151,24 @@ export class JobPool {
 
     await Promise.all(promises)
     this.#activeJobs.clear()
+    this.#completedEntries = []
+    this.#completedHead = 0
+  }
+
+  #enqueueCompletion(jobId: string, entry: PoolEntry): void {
+    if (this.#activeJobs.get(jobId) !== entry) return
+
+    this.#completedEntries.push({ id: jobId, entry })
+    this.#completionAvailable?.resolve()
+    this.#completionAvailable = undefined
+  }
+
+  #compactCompletedJobs(): void {
+    if (this.#completedHead < 1_024 || this.#completedHead * 2 < this.#completedEntries.length) {
+      return
+    }
+
+    this.#completedEntries = this.#completedEntries.slice(this.#completedHead)
+    this.#completedHead = 0
   }
 }

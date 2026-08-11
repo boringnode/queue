@@ -1,6 +1,7 @@
 import { setTimeout } from 'node:timers/promises'
 import { test } from '@japa/runner'
 import { fake } from '../src/drivers/fake_adapter.js'
+import { JobPool } from '../src/job_pool.js'
 import {
   WorkerSession,
   type WorkerSessionOptions,
@@ -143,6 +144,125 @@ test.group('WorkerSession', () => {
 
     assert.equal((await session.processCycle())?.type, 'idle')
     assert.equal(adapter.acquisitions.calls, 12)
+  })
+
+  test('reuses one completion wait across idle ticks and observes a later job', async ({
+    assert,
+    cleanup,
+  }) => {
+    const adapter = new ControllableAdapter()
+    const longExecution = Promise.withResolvers<void>()
+    const originalWaitForNextCompletion = JobPool.prototype.waitForNextCompletion
+    let completionWaits = 0
+    let completionObservers = 0
+
+    JobPool.prototype.waitForNextCompletion = function () {
+      completionWaits++
+      const operation = originalWaitForNextCompletion.call(this)
+      return {
+        then(onFulfilled, onRejected) {
+          completionObservers++
+          return operation.then(onFulfilled, onRejected)
+        },
+      } as Promise<Awaited<typeof operation>>
+    }
+
+    const session = createSession({
+      adapter,
+      jobExecutionRuntime: {
+        async execute(job) {
+          if (job.id === 'long-running') {
+            await longExecution.promise
+          }
+          return { type: 'completed' }
+        },
+      },
+      settings: { concurrency: 2, idleDelay: 1 },
+    })
+
+    cleanup(async () => {
+      JobPool.prototype.waitForNextCompletion = originalWaitForNextCompletion
+      longExecution.resolve()
+      await session.stop()
+    })
+
+    await adapter.pushOn('default', {
+      id: 'long-running',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    assert.equal((await session.processCycle())?.type, 'started')
+
+    const laterCycle = session.processCycle()
+    await adapter.acquisitions.waitForStarted(8)
+    assert.equal(completionWaits, 1)
+    assert.equal(completionObservers, 1)
+
+    await adapter.pushOn('default', {
+      id: 'later-short-job',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    const started = await laterCycle
+    assert.equal(started?.type, 'started')
+    if (started?.type === 'started') {
+      assert.equal(started.job.id, 'later-short-job')
+    }
+
+    const completed = await session.processCycle()
+    assert.equal(completed?.type, 'completed')
+    if (completed?.type === 'completed') {
+      assert.equal(completed.job.id, 'later-short-job')
+    }
+    assert.equal(completionWaits, 1)
+    assert.equal(completionObservers, 1)
+  })
+
+  test('stops cleanly with a completion wait pending', async ({ assert, cleanup }) => {
+    const adapter = new ControllableAdapter()
+    const execution = Promise.withResolvers<void>()
+    const session = createSession({
+      adapter,
+      jobExecutionRuntime: {
+        async execute() {
+          await execution.promise
+          return { type: 'completed' }
+        },
+      },
+      settings: { concurrency: 2, idleDelay: 60_000 },
+    })
+
+    cleanup(async () => {
+      execution.resolve()
+      await session.stop()
+    })
+
+    await adapter.pushOn('default', {
+      id: 'pending-completion',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    assert.equal((await session.processCycle())?.type, 'started')
+    const pendingCycle = trackPromise(session.processCycle())
+    await setTimeout(0)
+
+    const stop = trackPromise(session.stop())
+    assert.isFalse(stop.settled)
+
+    execution.resolve()
+    await Promise.all([pendingCycle.promise, stop.promise])
+
+    assert.isTrue(stop.settled)
+    assert.isNull(await session.processCycle())
   })
 
   test('surfaces an initial probe failure without starting fan-out acquisitions', async ({
