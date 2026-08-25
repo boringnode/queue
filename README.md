@@ -366,7 +366,7 @@ const adapter = knex(config, 'custom_jobs_table')
 The Knex adapter requires tables to be created before use. Use `QueueSchemaService` to create them:
 
 ```typescript
-import { QueueSchemaService } from '@boringnode/queue'
+import { QueueSchemaService } from '@boringnode/queue/drivers/knex_adapter'
 import Knex from 'knex'
 
 const connection = Knex({ client: 'pg', connection: '...' })
@@ -386,7 +386,7 @@ await schemaService.createJobsTable('queue_jobs', (table) => {
 
 ```typescript
 import { BaseSchema } from '@adonisjs/lucid/schema'
-import { QueueSchemaService } from '@boringnode/queue'
+import { QueueSchemaService } from '@boringnode/queue/drivers/knex_adapter'
 
 export default class extends BaseSchema {
   async up() {

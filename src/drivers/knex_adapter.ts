@@ -15,6 +15,8 @@ import type {
 import { DEFAULT_PRIORITY } from '../constants.js'
 import { calculateScore, resolveRetention } from '../utils.js'
 
+export { QueueSchemaService } from '../services/queue_schema.js'
+
 export interface KnexAdapterOptions {
   connection: Knex
   tableName?: string
