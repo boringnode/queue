@@ -15,7 +15,7 @@ import type {
 import { DEFAULT_PRIORITY } from '../constants.js'
 import { calculateScore, resolveRetention } from '../utils.js'
 
-export { QueueSchemaService } from '../services/queue_schema.js'
+export { KnexQueueSchemaService } from '../services/knex_queue_schema.js'
 
 export interface KnexAdapterOptions {
   connection: Knex
@@ -419,7 +419,7 @@ export class KnexAdapter implements Adapter {
     } catch (err) {
       if (this.#isMissingDedupColumn(err)) {
         throw new Error(
-          `Dedup columns missing on "${this.#jobsTable}". Run QueueSchemaService.addDedupColumns() on your jobs table before dispatching jobs with .dedup().`,
+          `Dedup columns missing on "${this.#jobsTable}". Run KnexQueueSchemaService.addDedupColumns() on your jobs table before dispatching jobs with .dedup().`,
           { cause: err }
         )
       }
