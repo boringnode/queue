@@ -4,7 +4,7 @@ import { Redis } from 'ioredis'
 import { MemoryAdapter } from './_mocks/memory_adapter.js'
 import { RedisAdapter } from '../src/drivers/redis_adapter.js'
 import { KnexAdapter } from '../src/drivers/knex_adapter.js'
-import { QueueSchemaService } from '../src/services/queue_schema.js'
+import { KnexQueueSchemaService } from '../src/services/knex_queue_schema.js'
 import { registerWorkerRetryTestSuite } from './_utils/register_worker_retry_suite.js'
 
 const KEY_PREFIX = 'boringnode::queue::worker-test::'
@@ -62,7 +62,7 @@ test.group('Worker Adapter | Knex (SQLite)', (group) => {
       useNullAsDefault: true,
     })
 
-    const schemaService = new QueueSchemaService(connection)
+    const schemaService = new KnexQueueSchemaService(connection)
     await schemaService.createJobsTable()
     await schemaService.createSchedulesTable()
 
@@ -84,7 +84,7 @@ test.group('Worker Adapter | Knex (SQLite)', (group) => {
 test.group('Worker Adapter | Knex (PostgreSQL)', (group) => {
   let connection: ReturnType<typeof Knex>
   let adapter: KnexAdapter
-  let schemaService: QueueSchemaService
+  let schemaService: KnexQueueSchemaService
   const tableName = 'queue_jobs_worker_test'
   const schedulesTableName = 'queue_schedules_worker_test'
 
@@ -100,7 +100,7 @@ test.group('Worker Adapter | Knex (PostgreSQL)', (group) => {
       },
     })
 
-    schemaService = new QueueSchemaService(connection)
+    schemaService = new KnexQueueSchemaService(connection)
     await schemaService.dropJobsTable(tableName)
     await schemaService.dropSchedulesTable(schedulesTableName)
     await schemaService.createJobsTable(tableName)

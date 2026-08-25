@@ -4,7 +4,7 @@ import { Redis } from 'ioredis'
 import { MemoryAdapter } from './_mocks/memory_adapter.js'
 import { redis, RedisAdapter } from '../src/drivers/redis_adapter.js'
 import { KnexAdapter } from '../src/drivers/knex_adapter.js'
-import { QueueSchemaService } from '../src/services/queue_schema.js'
+import { KnexQueueSchemaService } from '../src/services/knex_queue_schema.js'
 import { registerDriverTestSuite } from './_utils/register_driver_test_suite.js'
 import { withRedisWriteSpy } from './_utils/with_redis_write_spy.js'
 import { withKnexQuerySpy } from './_utils/with_knex_query_spy.js'
@@ -644,8 +644,8 @@ test.group('Adapter | Knex (SQLite)', (group) => {
       useNullAsDefault: true,
     })
 
-    // Create tables via QueueSchemaService
-    const schemaService = new QueueSchemaService(connection)
+    // Create tables via KnexQueueSchemaService
+    const schemaService = new KnexQueueSchemaService(connection)
     await schemaService.createJobsTable()
     await schemaService.createSchedulesTable()
 
@@ -728,7 +728,7 @@ test.group('Adapter | Knex (SQLite)', (group) => {
 test.group('Adapter | Knex (PostgreSQL)', (group) => {
   let connection: ReturnType<typeof Knex>
   let adapter: KnexAdapter
-  let schemaService: QueueSchemaService
+  let schemaService: KnexQueueSchemaService
   const tableName = 'queue_jobs_test'
   const schedulesTableName = 'queue_schedules_test'
 
@@ -744,7 +744,7 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       },
     })
 
-    schemaService = new QueueSchemaService(connection)
+    schemaService = new KnexQueueSchemaService(connection)
 
     // Clean up tables before each test
     await schemaService.dropJobsTable(tableName)
