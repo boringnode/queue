@@ -48,7 +48,7 @@
     "@opentelemetry/sdk-trace-base": "^2.8.0",
     "@poppinss/ts-exec": "^1.4.4",
     "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^25.9.4",
+    "@types/node": "^25.9.4 || ^26.0.0",
     "@types/pg": "^8.20.0",
     "better-sqlite3": "^12.11.1",
     "bullmq": "^5.79.2",
