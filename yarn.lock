@@ -55,7 +55,7 @@ __metadata:
     "@poppinss/ts-exec": "npm:^1.4.4"
     "@poppinss/utils": "npm:^7.0.1"
     "@types/better-sqlite3": "npm:^7.6.13"
-    "@types/node": "npm:^25.9.4"
+    "@types/node": "npm:^25.9.4 || ^26.0.0"
     "@types/pg": "npm:^8.20.0"
     better-sqlite3: "npm:^12.11.1"
     bullmq: "npm:^5.79.2"
@@ -1793,12 +1793,12 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@types/node@npm:^25.9.4":
-  version: 25.9.4
-  resolution: "@types/node@npm:25.9.4"
+"@types/node@npm:^25.9.4 || ^26.0.0":
+  version: 26.3.0
+  resolution: "@types/node@npm:26.3.0"
   dependencies:
-    undici-types: "npm:>=7.24.0 <7.24.7"
-  checksum: 10c0/4b19670ef5dbefa836a2d4a9ed0b5ac6befbc0844bfdd12833234ff8fa68da1f65e6362d2ef87acf7e7da9d6ff649bf81c454d12e802b7e7fa9246a15c0edcf6
+    undici-types: "npm:~8.3.0"
+  checksum: 10c0/b1b71d722cea67807abde4993d71aa6e4e24ae3072635ff5fbca3e5fbe7f0d4adc20507ab3f1e14b13720d742fb5cae4b12c7326fbe706fcda24e2aab8306374
   languageName: node
   linkType: hard
 
@@ -5610,17 +5610,17 @@ __metadata:
   languageName: node
   linkType: hard
 
-"undici-types@npm:>=7.24.0 <7.24.7":
-  version: 7.24.6
-  resolution: "undici-types@npm:7.24.6"
-  checksum: 10c0/d9cd8befb643ac904615c280a095ba4240531f6bb4a5e75a22a7483630ca8d3f1016d2ab6ace6ceda1f63b3a2db2fe037fafe121d6917a0187573aa548ff78ca
-  languageName: node
-  linkType: hard
-
 "undici-types@npm:~7.10.0":
   version: 7.10.0
   resolution: "undici-types@npm:7.10.0"
   checksum: 10c0/8b00ce50e235fe3cc601307f148b5e8fb427092ee3b23e8118ec0a5d7f68eca8cee468c8fc9f15cbb2cf2a3797945ebceb1cbd9732306a1d00e0a9b6afa0f635
+  languageName: node
+  linkType: hard
+
+"undici-types@npm:~8.3.0":
+  version: 8.3.0
+  resolution: "undici-types@npm:8.3.0"
+  checksum: 10c0/c8aa7e2fbebfce519654dafadc0ece59be888d2ccaf180fb4495da875e7b536d2456345c384069c7e6f3e9c9ab7435f074957da306f142343eee86ff8048855a
   languageName: node
   linkType: hard
 
