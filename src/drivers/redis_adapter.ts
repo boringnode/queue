@@ -565,12 +565,14 @@ export class RedisAdapter implements Adapter {
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
     const now = Date.now()
+    const claimToken = randomUUID()
     const result = await this.#connection.eval(
       CLAIM_SCHEDULE_SCRIPT,
       2,
       schedulesDueKey,
       `${schedulesKey}::`,
-      now.toString()
+      now.toString(),
+      claimToken
     )
 
     if (!result) {
@@ -610,6 +612,7 @@ export class RedisAdapter implements Adapter {
         data.id,
         data.cron_expression,
         data.config_revision || '',
+        claimToken,
         newNextRunAt.toString()
       )
     }

@@ -1119,7 +1119,7 @@ test.group('Adapter | Redis', (group) => {
     assert.isNull(await connection.zscore('schedules::due', id))
   })
 
-  test('cron finalization survives a concurrent manual trigger metadata update', async ({
+  test('cron finalization survives a concurrent runtime metadata update', async ({
     assert,
     cleanup,
   }) => {
@@ -1184,6 +1184,114 @@ test.group('Adapter | Redis', (group) => {
     assert.equal(
       Number(await connection.zscore('schedules::due', id)),
       schedule!.nextRunAt!.getTime()
+    )
+  })
+
+  test('stale cron finalization cannot modify a recreated schedule claim', async ({
+    assert,
+    cleanup,
+  }) => {
+    const secondConnection = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+      keyPrefix: KEY_PREFIX,
+      db: 15,
+    })
+    cleanup(async () => {
+      await secondConnection.quit()
+    })
+
+    const adapter = new RedisAdapter(connection)
+    const secondAdapter = new RedisAdapter(secondConnection)
+    const id = 'cron-finalize-recreated-claim'
+    const cronExpression = '0 9 * * *'
+
+    await adapter.upsertSchedule({
+      id,
+      name: 'OriginalCronJob',
+      payload: {},
+      cronExpression,
+      timezone: 'UTC',
+    })
+    await adapter.updateSchedule(id, { nextRunAt: new Date(Date.now() - 1_000) })
+
+    const originalEval = connection.eval.bind(connection)
+    let releaseFirstClaim!: () => void
+    let firstClaimReturned!: () => void
+    const firstClaimReleased = new Promise<void>((resolve) => {
+      releaseFirstClaim = resolve
+    })
+    const firstClaimHasReturned = new Promise<void>((resolve) => {
+      firstClaimReturned = resolve
+    })
+    let gateFirstEval = true
+
+    connection.eval = (async (...args: Parameters<typeof connection.eval>) => {
+      const result = await originalEval(...args)
+      if (gateFirstEval) {
+        gateFirstEval = false
+        firstClaimReturned()
+        await firstClaimReleased
+      }
+      return result
+    }) as typeof connection.eval
+
+    const firstClaim = adapter.claimDueSchedule()
+    await firstClaimHasReturned
+
+    await secondAdapter.deleteSchedule(id)
+    await secondAdapter.upsertSchedule({
+      id,
+      name: 'RecreatedCronJob',
+      payload: {},
+      cronExpression,
+      timezone: 'America/New_York',
+    })
+    await secondAdapter.updateSchedule(id, { nextRunAt: new Date(Date.now() - 1_000) })
+
+    const originalSecondEval = secondConnection.eval.bind(secondConnection)
+    let releaseSecondClaim!: () => void
+    let secondClaimReturned!: () => void
+    const secondClaimReleased = new Promise<void>((resolve) => {
+      releaseSecondClaim = resolve
+    })
+    const secondClaimHasReturned = new Promise<void>((resolve) => {
+      secondClaimReturned = resolve
+    })
+    let gateSecondEval = true
+
+    secondConnection.eval = (async (...args: Parameters<typeof secondConnection.eval>) => {
+      const result = await originalSecondEval(...args)
+      if (gateSecondEval) {
+        gateSecondEval = false
+        secondClaimReturned()
+        await secondClaimReleased
+      }
+      return result
+    }) as typeof secondConnection.eval
+
+    const secondClaim = secondAdapter.claimDueSchedule()
+    await secondClaimHasReturned
+
+    releaseFirstClaim()
+    await firstClaim
+
+    const awaitingSecondFinalization = await adapter.getSchedule(id)
+    assert.equal(awaitingSecondFinalization!.name, 'RecreatedCronJob')
+    assert.equal(awaitingSecondFinalization!.timezone, 'America/New_York')
+    assert.isNull(awaitingSecondFinalization!.nextRunAt)
+    assert.isNull(await connection.zscore('schedules::due', id))
+
+    releaseSecondClaim()
+    await secondClaim
+    connection.eval = originalEval
+    secondConnection.eval = originalSecondEval
+
+    const finalized = await adapter.getSchedule(id)
+    assert.isNotNull(finalized!.nextRunAt)
+    assert.equal(
+      Number(await connection.zscore('schedules::due', id)),
+      finalized!.nextRunAt!.getTime()
     )
   })
 

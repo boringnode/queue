@@ -530,7 +530,8 @@ ${SCHEDULE_DUE_INDEX_LUA}
     'every_ms',
     'from_date',
     'to_date',
-    'run_limit'
+    'run_limit',
+    'claim_token'
   )
 
   for field, value in pairs(schedule) do
@@ -589,7 +590,8 @@ export const FINALIZE_CRON_SCHEDULE_SCRIPT = `
   local id = ARGV[1]
   local expected_cron_expression = ARGV[2]
   local expected_config_revision = ARGV[3]
-  local next_run_at = ARGV[4]
+  local expected_claim_token = ARGV[4]
+  local next_run_at = ARGV[5]
 
 ${SCHEDULE_DUE_INDEX_LUA}
 
@@ -602,11 +604,16 @@ ${SCHEDULE_DUE_INDEX_LUA}
   local current_next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
   local cron_expression = redis.call('HGET', schedule_key, 'cron_expression')
   local config_revision = redis.call('HGET', schedule_key, 'config_revision') or ''
+  local claim_token = redis.call('HGET', schedule_key, 'claim_token') or ''
 
   if status ~= 'active'
     or current_next_run_at ~= ''
     or cron_expression ~= expected_cron_expression
-    or config_revision ~= expected_config_revision then
+    or config_revision ~= expected_config_revision
+    or claim_token ~= expected_claim_token then
+    if claim_token == expected_claim_token then
+      redis.call('HDEL', schedule_key, 'claim_token')
+    end
     sync_schedule_due_index(schedule_key, due_key, id)
     return 0
   end
@@ -622,6 +629,7 @@ ${SCHEDULE_DUE_INDEX_LUA}
   end
 
   redis.call('HSET', schedule_key, 'next_run_at', next_run_at)
+  redis.call('HDEL', schedule_key, 'claim_token')
   sync_schedule_due_index(schedule_key, due_key, id)
 
   return 1
@@ -674,6 +682,7 @@ export const CLAIM_SCHEDULE_SCRIPT = `
   local due_key = KEYS[1]
   local prefix = KEYS[2]
   local now = tonumber(ARGV[1])
+  local claim_token = ARGV[2]
 
   while true do
     local candidates = redis.call('ZRANGEBYSCORE', due_key, '-inf', tostring(now), 'LIMIT', 0, 1)
@@ -721,6 +730,7 @@ export const CLAIM_SCHEDULE_SCRIPT = `
           else
             -- This schedule is claimable - atomically update it
             local new_run_count = run_count + 1
+            local new_claim_token = ''
 
             -- Calculate new next_run_at (simple interval-based for now)
             -- Complex cron calculation happens in the caller
@@ -728,6 +738,8 @@ export const CLAIM_SCHEDULE_SCRIPT = `
             local every_ms = schedule.every_ms and tonumber(schedule.every_ms) or nil
             if every_ms then
               new_next_run_at = tostring(now + every_ms)
+            elseif schedule.cron_expression then
+              new_claim_token = claim_token
             end
 
             -- Check if we've hit the limit after this run
@@ -744,7 +756,8 @@ export const CLAIM_SCHEDULE_SCRIPT = `
             redis.call('HSET', schedule_key,
               'next_run_at', new_next_run_at,
               'last_run_at', tostring(now),
-              'run_count', tostring(new_run_count))
+              'run_count', tostring(new_run_count),
+              'claim_token', new_claim_token)
 
             -- Update or remove from ZSET
             if new_next_run_at ~= '' then
