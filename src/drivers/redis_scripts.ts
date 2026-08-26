@@ -521,6 +521,7 @@ ${SCHEDULE_DUE_INDEX_LUA}
 
   local run_count = redis.call('HGET', schedule_key, 'run_count') or '0'
   local created_at = redis.call('HGET', schedule_key, 'created_at') or now
+  local config_revision = tonumber(redis.call('HGET', schedule_key, 'config_revision') or '0') + 1
 
   redis.call(
     'HDEL',
@@ -536,7 +537,16 @@ ${SCHEDULE_DUE_INDEX_LUA}
     redis.call('HSET', schedule_key, field, value)
   end
 
-  redis.call('HSET', schedule_key, 'run_count', run_count, 'created_at', created_at)
+  redis.call(
+    'HSET',
+    schedule_key,
+    'run_count',
+    run_count,
+    'created_at',
+    created_at,
+    'config_revision',
+    tostring(config_revision)
+  )
   redis.call('SADD', schedules_index_key, id)
   sync_schedule_due_index(schedule_key, due_key, id)
 
@@ -575,7 +585,8 @@ export const FINALIZE_CRON_SCHEDULE_SCRIPT = `
   local expected_run_count = ARGV[2]
   local expected_last_run_at = ARGV[3]
   local expected_cron_expression = ARGV[4]
-  local next_run_at = ARGV[5]
+  local expected_config_revision = ARGV[5]
+  local next_run_at = ARGV[6]
 
 ${SCHEDULE_DUE_INDEX_LUA}
 
@@ -589,12 +600,14 @@ ${SCHEDULE_DUE_INDEX_LUA}
   local last_run_at = redis.call('HGET', schedule_key, 'last_run_at')
   local current_next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
   local cron_expression = redis.call('HGET', schedule_key, 'cron_expression')
+  local config_revision = redis.call('HGET', schedule_key, 'config_revision') or ''
 
   if status ~= 'active'
     or run_count ~= expected_run_count
     or last_run_at ~= expected_last_run_at
     or current_next_run_at ~= ''
-    or cron_expression ~= expected_cron_expression then
+    or cron_expression ~= expected_cron_expression
+    or config_revision ~= expected_config_revision then
     sync_schedule_due_index(schedule_key, due_key, id)
     return 0
   end

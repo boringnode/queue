@@ -611,6 +611,7 @@ export class RedisAdapter implements Adapter {
         runCount.toString(),
         now.toString(),
         data.cron_expression,
+        data.config_revision || '',
         newNextRunAt.toString()
       )
     }
