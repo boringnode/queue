@@ -21,6 +21,13 @@ interface DriverTestSuiteOptions {
 export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
   const { test } = options
 
+  test('migrate should be safe to call repeatedly', async () => {
+    const adapter = await options.createAdapter()
+
+    await adapter.migrate()
+    await adapter.migrate()
+  })
+
   test('popFrom should return null when queue is empty', async ({ assert }) => {
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')

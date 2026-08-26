@@ -464,6 +464,8 @@ export class RedisAdapter implements Adapter {
 
     if (existingNextRunAt) {
       multi.zadd(schedulesDueKey, Number.parseInt(existingNextRunAt, 10), id)
+    } else {
+      multi.zrem(schedulesDueKey, id)
     }
 
     await multi.exec()
@@ -544,18 +546,33 @@ export class RedisAdapter implements Adapter {
 
     if (Object.keys(data).length === 0) return
 
-    const multi = this.#connection.multi().hset(scheduleKey, data)
+    let dueStatus = updates.status
+    let dueAt = updates.nextRunAt === undefined ? undefined : (updates.nextRunAt?.getTime() ?? null)
 
-    if (updates.nextRunAt) {
-      multi.zadd(schedulesDueKey, updates.nextRunAt.getTime(), id)
-    } else if (updates.nextRunAt === null || updates.status === 'paused') {
-      multi.zrem(schedulesDueKey, id)
+    if (
+      (updates.status !== undefined || updates.nextRunAt !== undefined) &&
+      (dueStatus === undefined || dueAt === undefined)
+    ) {
+      const [existingStatus, existingNextRunAt] = await this.#connection.hmget(
+        scheduleKey,
+        'status',
+        'next_run_at'
+      )
+      if (dueStatus === undefined) {
+        dueStatus = existingStatus === 'paused' ? 'paused' : 'active'
+      }
+      if (dueAt === undefined) {
+        dueAt = existingNextRunAt ? Number.parseInt(existingNextRunAt, 10) : null
+      }
     }
 
-    if (updates.status === 'active' && updates.nextRunAt === undefined) {
-      const existing = await this.#connection.hget(scheduleKey, 'next_run_at')
-      if (existing) {
-        multi.zadd(schedulesDueKey, Number.parseInt(existing, 10), id)
+    const multi = this.#connection.multi().hset(scheduleKey, data)
+
+    if (updates.status !== undefined || updates.nextRunAt !== undefined) {
+      if (dueStatus === 'active' && dueAt !== null && dueAt !== undefined) {
+        multi.zadd(schedulesDueKey, dueAt, id)
+      } else {
+        multi.zrem(schedulesDueKey, id)
       }
     }
 
@@ -634,7 +651,10 @@ export class RedisAdapter implements Adapter {
 
   async backfillDueIndex(): Promise<number> {
     const ids = await this.#connection.smembers(schedulesIndexKey)
-    if (ids.length === 0) return 0
+    if (ids.length === 0) {
+      await this.#connection.del(schedulesDueKey)
+      return 0
+    }
 
     const pipeline = this.#connection.pipeline()
     for (const id of ids) {
@@ -643,20 +663,21 @@ export class RedisAdapter implements Adapter {
     const results = await pipeline.exec()
     if (!results) return 0
 
-    const addPipeline = this.#connection.pipeline()
+    const rebuild = this.#connection.multi().del(schedulesDueKey)
     let count = 0
 
     for (let i = 0; i < ids.length; i++) {
       const [err, values] = results[i]
       if (err || !values) continue
       const [nextRunAt, status] = values as [string | null, string | null]
-      if (nextRunAt && status === 'active') {
-        addPipeline.zadd(schedulesDueKey, Number.parseInt(nextRunAt, 10), ids[i])
+      const score = nextRunAt ? Number.parseInt(nextRunAt, 10) : Number.NaN
+      if (Number.isFinite(score) && status === 'active') {
+        rebuild.zadd(schedulesDueKey, score, ids[i])
         count++
       }
     }
 
-    if (count > 0) await addPipeline.exec()
+    await rebuild.exec()
     return count
   }
 

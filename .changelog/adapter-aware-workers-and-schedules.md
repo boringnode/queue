@@ -66,3 +66,20 @@ its configured Adapter.
 When a schedule does not call `.with()`, its Adapter is resolved from the job's `adapter` option,
 then from the Adapter configured for the job's queue, and finally from the queue manager default.
 An explicit `.with()` always takes precedence.
+
+### Run Adapter Migrations Before Starting Workers
+
+The `Adapter` contract now includes an idempotent `migrate()` lifecycle method. Built-in adapters
+without data migrations implement it as a no-op; custom adapters must implement it as well.
+
+Redis now claims schedules through the derived `schedules::due` sorted-set index. Deployments
+upgrading from an earlier version must rebuild that index before workers start:
+
+```typescript
+await QueueManager.init(config)
+await QueueManager.use('redis').migrate()
+```
+
+Existing Redis schedules will not fire from the new index until this migration runs. The migration
+scans all schedules, is safe to repeat, and should remain an explicit deployment step rather than
+part of schedule polling.

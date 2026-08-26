@@ -629,7 +629,7 @@ test.group('Adapter | Redis', (group) => {
     assert.isNull(await adapter.getJob('metadata-stalled-uuid-1', queue))
   })
 
-  test('backfillDueIndex populates ZSET for pre-existing schedules', async ({ assert }) => {
+  test('migrate makes pre-existing schedules claimable from the due index', async ({ assert }) => {
     const adapter = new RedisAdapter(connection)
 
     // Simulate pre-upgrade schedule data: write hash + index directly, skip ZSET
@@ -656,7 +656,10 @@ test.group('Adapter | Redis', (group) => {
     const beforeBackfill = await adapter.claimDueSchedule()
     assert.isNull(beforeBackfill)
 
-    await adapter.backfillDueIndex()
+    await adapter.migrate()
+
+    const score = await connection.zscore('schedules::due', id)
+    assert.equal(Number(score), Number(pastRunAt))
 
     const afterBackfill = await adapter.claimDueSchedule()
     assert.isNotNull(afterBackfill)
@@ -665,6 +668,7 @@ test.group('Adapter | Redis', (group) => {
 
   test('backfillDueIndex is idempotent', async ({ assert }) => {
     const adapter = new RedisAdapter(connection)
+    const nextRunAt = Date.now() + 30_000
 
     await adapter.upsertSchedule({
       id: 'idempotent-schedule',
@@ -674,20 +678,23 @@ test.group('Adapter | Redis', (group) => {
       timezone: 'UTC',
     })
     await adapter.updateSchedule('idempotent-schedule', {
-      nextRunAt: new Date(Date.now() + 30_000),
+      nextRunAt: new Date(nextRunAt),
     })
 
-    // Clear the ZSET so backfill has work to do
-    await connection.del('schedules::due')
+    await connection
+      .multi()
+      .del('schedules::due')
+      .zadd('schedules::due', Date.now() - 10_000, 'orphaned-schedule')
+      .exec()
 
-    const first = await adapter.backfillDueIndex()
-    const second = await adapter.backfillDueIndex()
+    await adapter.backfillDueIndex()
+    const firstMembers = await connection.zrange('schedules::due', 0, -1, 'WITHSCORES')
 
-    assert.isAbove(first, 0)
-    assert.equal(second, first)
+    await adapter.backfillDueIndex()
+    const secondMembers = await connection.zrange('schedules::due', 0, -1, 'WITHSCORES')
 
-    const score = await connection.zscore('schedules::due', 'idempotent-schedule')
-    assert.isNotNull(score)
+    assert.deepEqual(firstMembers, ['idempotent-schedule', nextRunAt.toString()])
+    assert.deepEqual(secondMembers, firstMembers)
   })
 
   test('stale ZSET score is self-healed during claim', async ({ assert }) => {
@@ -713,6 +720,116 @@ test.group('Adapter | Redis', (group) => {
     // ZSET score should have been repaired to match the hash
     const repairedScore = await connection.zscore('schedules::due', id)
     assert.equal(Number(repairedScore), futureRunAt)
+  })
+
+  test('schedule lifecycle keeps the due index aligned with canonical state', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+    const id = 'lifecycle-schedule'
+    const firstRunAt = Date.now() + 30_000
+    const pausedRunAt = firstRunAt + 30_000
+
+    await adapter.upsertSchedule({
+      id,
+      name: 'LifecycleJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+    await adapter.updateSchedule(id, { nextRunAt: new Date(firstRunAt) })
+    assert.equal(Number(await connection.zscore('schedules::due', id)), firstRunAt)
+
+    await adapter.updateSchedule(id, {
+      status: 'paused',
+      nextRunAt: new Date(pausedRunAt),
+    })
+    assert.isNull(await connection.zscore('schedules::due', id))
+
+    await adapter.updateSchedule(id, { nextRunAt: new Date(pausedRunAt + 30_000) })
+    assert.isNull(await connection.zscore('schedules::due', id))
+
+    await adapter.updateSchedule(id, { status: 'active' })
+    assert.equal(Number(await connection.zscore('schedules::due', id)), pausedRunAt + 30_000)
+
+    await adapter.updateSchedule(id, { nextRunAt: null })
+    assert.isNull(await connection.zscore('schedules::due', id))
+
+    await adapter.updateSchedule(id, { nextRunAt: new Date(firstRunAt) })
+    await adapter.deleteSchedule(id)
+    assert.isNull(await connection.zscore('schedules::due', id))
+  })
+
+  test('interval claims update the due index from the canonical hash', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+    const id = 'interval-index-schedule'
+
+    await adapter.upsertSchedule({
+      id,
+      name: 'IntervalJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+    await adapter.updateSchedule(id, { nextRunAt: new Date(Date.now() - 1_000) })
+
+    assert.equal((await adapter.claimDueSchedule())?.id, id)
+
+    const schedule = await adapter.getSchedule(id)
+    const score = await connection.zscore('schedules::due', id)
+    assert.isNotNull(schedule!.nextRunAt)
+    assert.equal(Number(score), schedule!.nextRunAt!.getTime())
+  })
+
+  test('cron claims update the due index from the canonical hash', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+    const id = 'cron-index-schedule'
+
+    await adapter.upsertSchedule({
+      id,
+      name: 'CronJob',
+      payload: {},
+      cronExpression: '* * * * *',
+      timezone: 'UTC',
+    })
+    await adapter.updateSchedule(id, { nextRunAt: new Date(Date.now() - 1_000) })
+
+    assert.equal((await adapter.claimDueSchedule())?.id, id)
+
+    const schedule = await adapter.getSchedule(id)
+    const score = await connection.zscore('schedules::due', id)
+    assert.isNotNull(schedule!.nextRunAt)
+    assert.equal(Number(score), schedule!.nextRunAt!.getTime())
+  })
+
+  test('exhausted schedules are removed from the due index', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+
+    for (const config of [
+      { id: 'limited-interval', everyMs: 60_000, limit: 1 },
+      { id: 'limited-cron', cronExpression: '* * * * *', limit: 1 },
+      { id: 'ended-interval', everyMs: 60_000, to: new Date(Date.now() + 1_000) },
+    ]) {
+      await adapter.upsertSchedule({
+        ...config,
+        name: 'ExhaustedJob',
+        payload: {},
+        timezone: 'UTC',
+      })
+      await adapter.updateSchedule(config.id, { nextRunAt: new Date(Date.now() - 1_000) })
+
+      assert.equal((await adapter.claimDueSchedule())?.id, config.id)
+      assert.isNull((await adapter.getSchedule(config.id))!.nextRunAt)
+      assert.isNull(await connection.zscore('schedules::due', config.id))
+    }
+  })
+
+  test('claim removes a due index member whose canonical hash is missing', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+    await connection.zadd('schedules::due', Date.now() - 1_000, 'missing-schedule')
+
+    assert.isNull(await adapter.claimDueSchedule())
+    assert.isNull(await connection.zscore('schedules::due', 'missing-schedule'))
   })
 })
 
