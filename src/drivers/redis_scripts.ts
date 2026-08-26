@@ -702,51 +702,51 @@ export const CLAIM_SCHEDULE_SCRIPT = `
         elseif hash_score > now then
           redis.call('ZADD', due_key, hash_score, id)
         else
-        local run_count = tonumber(schedule.run_count or '0')
-        local run_limit = schedule.run_limit and tonumber(schedule.run_limit) or nil
-        local to_date = schedule.to_date and tonumber(schedule.to_date) or nil
+          local run_count = tonumber(schedule.run_count or '0')
+          local run_limit = schedule.run_limit and tonumber(schedule.run_limit) or nil
+          local to_date = schedule.to_date and tonumber(schedule.to_date) or nil
 
-        -- Check limits
-        if (run_limit and run_count >= run_limit) or (to_date and now > to_date) then
-          redis.call('ZREM', due_key, id)
-        else
-          -- This schedule is claimable - atomically update it
-          local new_run_count = run_count + 1
-
-          -- Calculate new next_run_at (simple interval-based for now)
-          -- Complex cron calculation happens in the caller
-          local new_next_run_at = ''
-          local every_ms = schedule.every_ms and tonumber(schedule.every_ms) or nil
-          if every_ms then
-            new_next_run_at = tostring(now + every_ms)
-          end
-
-          -- Check if we've hit the limit after this run
-          if run_limit and new_run_count >= run_limit then
-            new_next_run_at = ''
-          end
-
-          -- Check if past end date
-          if to_date and new_next_run_at ~= '' and tonumber(new_next_run_at) > to_date then
-            new_next_run_at = ''
-          end
-
-          -- Update the schedule atomically
-          redis.call('HSET', schedule_key,
-            'next_run_at', new_next_run_at,
-            'last_run_at', tostring(now),
-            'run_count', tostring(new_run_count))
-
-          -- Update or remove from ZSET
-          if new_next_run_at ~= '' then
-            redis.call('ZADD', due_key, tonumber(new_next_run_at), id)
-          else
+          -- Check limits
+          if (run_limit and run_count >= run_limit) or (to_date and now > to_date) then
             redis.call('ZREM', due_key, id)
-          end
+          else
+            -- This schedule is claimable - atomically update it
+            local new_run_count = run_count + 1
 
-          -- Return the schedule data (before update) as JSON
-          return cjson.encode(schedule)
-        end
+            -- Calculate new next_run_at (simple interval-based for now)
+            -- Complex cron calculation happens in the caller
+            local new_next_run_at = ''
+            local every_ms = schedule.every_ms and tonumber(schedule.every_ms) or nil
+            if every_ms then
+              new_next_run_at = tostring(now + every_ms)
+            end
+
+            -- Check if we've hit the limit after this run
+            if run_limit and new_run_count >= run_limit then
+              new_next_run_at = ''
+            end
+
+            -- Check if past end date
+            if to_date and new_next_run_at ~= '' and tonumber(new_next_run_at) > to_date then
+              new_next_run_at = ''
+            end
+
+            -- Update the schedule atomically
+            redis.call('HSET', schedule_key,
+              'next_run_at', new_next_run_at,
+              'last_run_at', tostring(now),
+              'run_count', tostring(new_run_count))
+
+            -- Update or remove from ZSET
+            if new_next_run_at ~= '' then
+              redis.call('ZADD', due_key, tonumber(new_next_run_at), id)
+            else
+              redis.call('ZREM', due_key, id)
+            end
+
+            -- Return the schedule data (before update) as JSON
+            return cjson.encode(schedule)
+          end
         end
       end
     end
