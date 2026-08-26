@@ -19,6 +19,7 @@ import {
   BACKFILL_SCHEDULE_DUE_INDEX_SCRIPT,
   CLAIM_SCHEDULE_SCRIPT,
   FINALIZE_JOB_SCRIPT,
+  FINALIZE_CRON_SCHEDULE_SCRIPT,
   GET_JOB_SCRIPT,
   PUSH_DEDUP_JOB_SCRIPT,
   PUSH_DELAYED_JOB_SCRIPT,
@@ -601,18 +602,17 @@ export class RedisAdapter implements Adapter {
         newNextRunAt = ''
       }
 
-      const scheduleKey = `${schedulesKey}::${data.id}`
-      const multi = this.#connection
-        .multi()
-        .hset(scheduleKey, 'next_run_at', newNextRunAt.toString())
-
-      if (typeof newNextRunAt === 'number') {
-        multi.zadd(schedulesDueKey, newNextRunAt, data.id)
-      } else {
-        multi.zrem(schedulesDueKey, data.id)
-      }
-
-      await multi.exec()
+      await this.#connection.eval(
+        FINALIZE_CRON_SCHEDULE_SCRIPT,
+        2,
+        `${schedulesKey}::${data.id}`,
+        schedulesDueKey,
+        data.id,
+        runCount.toString(),
+        now.toString(),
+        data.cron_expression,
+        newNextRunAt.toString()
+      )
     }
 
     return this.#hashToScheduleData(data)

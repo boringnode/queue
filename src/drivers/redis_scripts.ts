@@ -565,6 +565,47 @@ ${SCHEDULE_DUE_INDEX_LUA}
 `
 
 /**
+ * Finalizes the JS-calculated next run for a cron claim only when the same
+ * claimed occurrence still owns the canonical hash.
+ */
+export const FINALIZE_CRON_SCHEDULE_SCRIPT = `
+  local schedule_key = KEYS[1]
+  local due_key = KEYS[2]
+  local id = ARGV[1]
+  local expected_run_count = ARGV[2]
+  local expected_last_run_at = ARGV[3]
+  local expected_cron_expression = ARGV[4]
+  local next_run_at = ARGV[5]
+
+${SCHEDULE_DUE_INDEX_LUA}
+
+  if redis.call('EXISTS', schedule_key) == 0 then
+    redis.call('ZREM', due_key, id)
+    return 0
+  end
+
+  local status = redis.call('HGET', schedule_key, 'status')
+  local run_count = redis.call('HGET', schedule_key, 'run_count')
+  local last_run_at = redis.call('HGET', schedule_key, 'last_run_at')
+  local current_next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
+  local cron_expression = redis.call('HGET', schedule_key, 'cron_expression')
+
+  if status ~= 'active'
+    or run_count ~= expected_run_count
+    or last_run_at ~= expected_last_run_at
+    or current_next_run_at ~= ''
+    or cron_expression ~= expected_cron_expression then
+    sync_schedule_due_index(schedule_key, due_key, id)
+    return 0
+  end
+
+  redis.call('HSET', schedule_key, 'next_run_at', next_run_at)
+  sync_schedule_due_index(schedule_key, due_key, id)
+
+  return 1
+`
+
+/**
  * Atomically rebuilds the derived due index from canonical schedule hashes.
  * This is an explicit O(N) migration and blocks concurrent Redis commands
  * until the complete index reflects one consistent point in time.
@@ -642,10 +683,11 @@ export const CLAIM_SCHEDULE_SCRIPT = `
         -- Hash is the source of truth for next_run_at.
         -- If the ZSET score is stale, repair it and skip this candidate.
         local hash_nra = schedule.next_run_at
-        if not hash_nra or hash_nra == '' then
+        local hash_score = hash_nra and tonumber(hash_nra) or nil
+        if not hash_score then
           redis.call('ZREM', due_key, id)
-        elseif tonumber(hash_nra) > now then
-          redis.call('ZADD', due_key, tonumber(hash_nra), id)
+        elseif hash_score > now then
+          redis.call('ZADD', due_key, hash_score, id)
         else
         local run_count = tonumber(schedule.run_count or '0')
         local run_limit = schedule.run_limit and tonumber(schedule.run_limit) or nil
