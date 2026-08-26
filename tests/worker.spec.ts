@@ -8,6 +8,9 @@ import { Locator } from '../src/locator.js'
 import { Job } from '../src/job.js'
 import { QueueManager } from '../src/queue_manager.js'
 import * as errors from '../src/exceptions.js'
+import { ControllableAdapter } from './_mocks/controllable_adapter.js'
+import { createWorkerFixture } from './_utils/create_worker_fixture.js'
+import { trackPromise } from './_utils/track_promise.js'
 
 const config = {
   default: 'memory',
@@ -60,6 +63,58 @@ test.group('Worker', () => {
     assert.equal(cycle.type, 'idle')
     // @ts-ignore
     assert.isNumber(cycle.suggestedDelay)
+  })
+
+  test('should reject different queues during an active session', async ({ assert, cleanup }) => {
+    const worker = new Worker(config)
+
+    cleanup(() => worker.stop())
+    await worker.processCycle(['default'])
+
+    await assert.rejects(
+      () => worker.processCycle(['other']),
+      'Configuration error. Reason: Cannot change WorkerSession queues from [default] to [other]'
+    )
+  })
+
+  test('should listen on the configured Worker Adapter', async ({ assert, cleanup }) => {
+    let executed = false
+
+    class AdapterWorkerJob extends Job {
+      async execute() {
+        executed = true
+      }
+    }
+
+    const defaultAdapter = memory()()
+    const workerAdapter = memory()()
+    const worker = new Worker({
+      default: 'default',
+      adapters: {
+        default: () => defaultAdapter,
+        worker: () => workerAdapter,
+      },
+      worker: { adapter: 'worker' },
+    })
+
+    Locator.register('AdapterWorkerJob', AdapterWorkerJob)
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await workerAdapter.push({
+      id: 'worker-adapter-job',
+      name: 'AdapterWorkerJob',
+      payload: {},
+      attempts: 0,
+    })
+
+    await worker.processCycle(['default'])
+    await worker.processCycle(['default'])
+
+    assert.isTrue(executed)
+    assert.equal(await defaultAdapter.size(), 0)
   })
 
   test('should yield error when an exception occurs', async ({ assert, cleanup }) => {
@@ -792,6 +847,118 @@ test.group('Worker', () => {
 
     // Job should have completed before stop() returned
     assert.isTrue(jobCompleted, 'Job should have completed before worker stopped')
+  })
+
+  test('should finish stopping before a new start can acquire jobs', async ({
+    assert,
+    cleanup,
+  }) => {
+    class RestartedJob extends Job {
+      async execute() {}
+    }
+
+    const fixture = createWorkerFixture()
+    fixture.adapter.finalizations.block(1)
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(RestartedJob, { id: 'job-before-restart' })
+
+    const firstStart = fixture.start()
+    await fixture.adapter.finalizations.waitForStarted(1)
+
+    const stop = trackPromise(fixture.worker.stop())
+    const secondStart = fixture.start()
+    await setTimeout(0)
+
+    assert.equal(
+      fixture.adapter.acquisitions.calls,
+      1,
+      'A new run must not acquire jobs while the previous run is stopping'
+    )
+
+    fixture.adapter.finalizations.release(1)
+    await stop.promise
+    await fixture.adapter.acquisitions.waitForStarted(2)
+
+    await fixture.worker.stop()
+    await Promise.all([firstStart, secondStart])
+  })
+
+  test('should not start acquiring jobs when stopped during initialization', async ({
+    assert,
+    cleanup,
+  }) => {
+    const previousAdapter = new ControllableAdapter()
+    previousAdapter.destruction.block(1)
+    await QueueManager.init({
+      default: 'memory',
+      adapters: { memory: () => previousAdapter },
+      autoLoadJobs: false,
+    })
+    QueueManager.use()
+
+    const fixture = createWorkerFixture()
+
+    cleanup(async () => {
+      previousAdapter.releaseAll()
+      await fixture.cleanup()
+    })
+
+    const startPromise = fixture.start()
+    await previousAdapter.destruction.waitForStarted()
+
+    const stop = trackPromise(fixture.worker.stop())
+    await setTimeout(0)
+    assert.isFalse(stop.settled, 'Worker stop must wait for initialization')
+
+    previousAdapter.destruction.release(1)
+    await Promise.all([stop.promise, startPromise])
+
+    assert.equal(fixture.adapter.acquisitions.calls, 0)
+
+    const restartedCycle = await fixture.worker.processCycle(['default'])
+    assert.equal(restartedCycle?.type, 'idle')
+    assert.equal(fixture.adapter.acquisitions.calls, 1)
+  })
+
+  test('should create a fresh processCycle generator after stopping', async ({
+    assert,
+    cleanup,
+  }) => {
+    const fixture = createWorkerFixture()
+    cleanup(() => fixture.cleanup())
+
+    await fixture.worker.processCycle(['old'])
+    await fixture.worker.stop()
+    await fixture.worker.processCycle(['new'])
+
+    assert.deepEqual(fixture.adapter.polledQueues, ['old', 'new'])
+  })
+
+  test('worker fixture cleanup should drain jobs before clearing the locator', async ({
+    assert,
+    cleanup,
+  }) => {
+    let executed = false
+
+    class CleanupJob extends Job {
+      async execute() {
+        executed = true
+      }
+    }
+
+    const fixture = createWorkerFixture()
+    fixture.adapter.acquisitions.block(1)
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(CleanupJob, { id: 'cleanup-job' })
+
+    const cyclePromise = fixture.worker.processCycle(['default'])
+    await fixture.adapter.acquisitions.waitForStarted()
+    await fixture.cleanup()
+    await cyclePromise
+
+    assert.isTrue(executed)
   })
 
   test('should not destroy the shared adapter when stopping', async ({ assert, cleanup }) => {
@@ -1901,6 +2068,100 @@ test.group('Worker | Scheduler Integration', () => {
     await worker.processCycle(['scheduled-queue']) // completed
 
     assert.equal(executedOnQueue, 'scheduled-queue')
+  })
+
+  test('should dispatch due Schedules with Job options and provenance', async ({
+    assert,
+    cleanup,
+  }) => {
+    let executedScheduleId: string | undefined
+
+    class ProvenanceScheduledJob extends Job {
+      static options = { queue: 'scheduled-queue', priority: 2 }
+
+      async execute() {
+        executedScheduleId = this.context.scheduleId
+      }
+    }
+
+    const sharedAdapter = memory()()
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+    })
+
+    Locator.register('ProvenanceScheduledJob', ProvenanceScheduledJob)
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await sharedAdapter.upsertSchedule({
+      id: 'provenance-schedule',
+      name: 'ProvenanceScheduledJob',
+      payload: {},
+      everyMs: 60000,
+      timezone: 'UTC',
+    })
+    await sharedAdapter.updateSchedule('provenance-schedule', {
+      nextRunAt: new Date(Date.now() - 1000),
+    })
+
+    const cycle = await worker.processCycle(['scheduled-queue'])
+
+    assert.equal(cycle?.type, 'started')
+    if (cycle?.type !== 'started') return
+    assert.equal(cycle.job.priority, 2)
+    assert.equal(cycle.job.scheduleId, 'provenance-schedule')
+    assert.isNumber(cycle.job.createdAt)
+
+    await worker.processCycle(['scheduled-queue'])
+    assert.equal(executedScheduleId, 'provenance-schedule')
+  })
+
+  test('should keep a due Schedule occurrence consumed when dispatch fails', async ({
+    assert,
+    cleanup,
+  }) => {
+    class FailingScheduleAdapter extends MemoryAdapter {
+      override async pushOn(): Promise<void> {
+        throw new Error('dispatch failed')
+      }
+    }
+
+    class FailingScheduledJob extends Job {
+      async execute() {}
+    }
+
+    const adapter = new FailingScheduleAdapter()
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => adapter },
+    })
+
+    Locator.register('FailingScheduledJob', FailingScheduledJob)
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await adapter.upsertSchedule({
+      id: 'failed-occurrence',
+      name: 'FailingScheduledJob',
+      payload: {},
+      everyMs: 60000,
+      timezone: 'UTC',
+    })
+    await adapter.updateSchedule('failed-occurrence', {
+      nextRunAt: new Date(Date.now() - 1000),
+    })
+
+    const cycle = await worker.processCycle(['default'])
+    const schedule = await adapter.getSchedule('failed-occurrence')
+
+    assert.equal(cycle?.type, 'error')
+    assert.equal(schedule?.runCount, 1)
+    assert.isTrue(schedule!.nextRunAt!.getTime() > Date.now())
   })
 
   test('should not dispatch paused schedules', async ({ assert, cleanup }) => {

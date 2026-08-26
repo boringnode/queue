@@ -1,5 +1,11 @@
-import type { Duration, ScheduleConfig, ScheduleResult } from './types/main.js'
-import { QueueManager } from './queue_manager.js'
+import type {
+  AdapterSelector,
+  Duration,
+  JobOptions,
+  ScheduleConfig,
+  ScheduleResult,
+} from './types/main.js'
+import { resolveJobDispatchTarget } from './job_dispatch_runtime.js'
 import { parse } from './utils.js'
 import { CronExpressionParser } from 'cron-parser'
 import * as errors from './exceptions.js'
@@ -32,10 +38,13 @@ export class ScheduleBuilder<TPayload = unknown> implements PromiseLike<Schedule
   #from?: Date
   #to?: Date
   #limit?: number
+  #adapter?: AdapterSelector
+  readonly #jobOptions?: () => JobOptions
 
-  constructor(name: string, payload: TPayload) {
+  constructor(name: string, payload: TPayload, jobOptions?: () => JobOptions) {
     this.#name = name
     this.#payload = payload
+    this.#jobOptions = jobOptions
   }
 
   /**
@@ -110,9 +119,20 @@ export class ScheduleBuilder<TPayload = unknown> implements PromiseLike<Schedule
   }
 
   /**
+   * Store this Schedule on a specific Adapter.
+   */
+  with(adapter: AdapterSelector): this {
+    this.#adapter = adapter
+    return this
+  }
+
+  /**
    * Create the schedule and return the schedule ID.
    */
   async run(): Promise<ScheduleResult> {
+    const jobOptions = this.#jobOptions?.()
+    const jobName = jobOptions?.name ?? this.#name
+
     // Validation
     if (!this.#cronExpression && !this.#everyMs) {
       throw new errors.E_INVALID_SCHEDULE_CONFIG([
@@ -141,8 +161,8 @@ export class ScheduleBuilder<TPayload = unknown> implements PromiseLike<Schedule
     }
 
     const config: ScheduleConfig = {
-      id: this.#id ?? this.#name,
-      name: this.#name,
+      id: this.#id ?? jobName,
+      name: jobName,
       payload: this.#payload,
       cronExpression: this.#cronExpression,
       everyMs: this.#everyMs,
@@ -152,7 +172,9 @@ export class ScheduleBuilder<TPayload = unknown> implements PromiseLike<Schedule
       limit: this.#limit,
     }
 
-    const adapter = QueueManager.use()
+    const { adapter } = resolveJobDispatchTarget(jobOptions, {
+      adapter: this.#adapter,
+    })
     const scheduleId = await adapter.upsertSchedule(config)
 
     // Calculate and set nextRunAt

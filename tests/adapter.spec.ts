@@ -11,6 +11,30 @@ import { withKnexQuerySpy } from './_utils/with_knex_query_spy.js'
 
 const KEY_PREFIX = 'boringnode::queue::test::'
 
+test('redis factory should reuse a connection from another ioredis package copy', async ({
+  assert,
+}) => {
+  class ForeignRedis {
+    readonly lazyConnect = true
+    readonly enableOfflineQueue = false
+    readonly maxRetriesPerRequest = 0
+    lastKey?: string
+
+    defineCommand() {}
+
+    async zcard(key: string) {
+      this.lastKey = key
+      return 42
+    }
+  }
+
+  const connection = new ForeignRedis()
+  const adapter = redis(connection as unknown as Redis)()
+
+  assert.equal(await adapter.size(), 42)
+  assert.equal(connection.lastKey, 'jobs::default::pending')
+})
+
 test.group('Adapter | Memory', (group) => {
   let adapter: MemoryAdapter
 

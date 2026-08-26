@@ -4,6 +4,23 @@ import type { JobClass } from './types/main.js'
 import debug from './debug.js'
 import { glob } from 'node:fs/promises'
 import { resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+
+type HotImportMeta = ImportMeta & {
+  hot?: {
+    boundary?: ImportCallOptions
+  }
+}
+
+type LocatorEntry = {
+  JobClass: JobClass
+  path?: string
+  hotReload: boolean
+}
+
+type RegisterFromGlobOptions = {
+  hotReload?: boolean
+}
 
 /**
  * Job class registry.
@@ -30,7 +47,7 @@ import { resolve } from 'node:path'
  * ```
  */
 class LocatorSingleton {
-  #registry = new Map<string, JobClass>()
+  #registry = new Map<string, LocatorEntry>()
 
   /**
    * Register a job class with a given name.
@@ -46,7 +63,7 @@ class LocatorSingleton {
   register<T extends Job>(name: string, JobClass: JobClass<T>) {
     debug('registering job: %s', name)
 
-    this.#registry.set(name, JobClass)
+    this.#registry.set(name, { JobClass, hotReload: false })
   }
 
   /**
@@ -67,7 +84,10 @@ class LocatorSingleton {
    * console.log(`Registered ${count} jobs`)
    * ```
    */
-  async registerFromGlob(patterns: string[]): Promise<number> {
+  async registerFromGlob(
+    patterns: string[],
+    options: RegisterFromGlobOptions = {}
+  ): Promise<number> {
     let registered = 0
 
     for (const pattern of patterns) {
@@ -77,12 +97,16 @@ class LocatorSingleton {
 
         try {
           const absolutePath = resolve(file)
-          const module = await import(`file://${absolutePath}`)
+          const module = await this.#import(absolutePath, options.hotReload ?? false)
           const JobClass = module.default as JobClass
 
           if (JobClass && typeof JobClass === 'function') {
             const jobName = JobClass.options?.name || JobClass.name
-            this.register(jobName, JobClass)
+            this.#registry.set(jobName, {
+              JobClass,
+              path: absolutePath,
+              hotReload: options.hotReload ?? false,
+            })
             registered++
           }
         } catch (error) {
@@ -109,7 +133,7 @@ class LocatorSingleton {
    * ```
    */
   get<T extends Job = Job>(name: string): JobClass<T> | undefined {
-    return this.#registry.get(name) as JobClass<T> | undefined
+    return this.#registry.get(name)?.JobClass as JobClass<T> | undefined
   }
 
   /**
@@ -136,12 +160,71 @@ class LocatorSingleton {
   }
 
   /**
+   * Resolve a job class by name.
+   *
+   * Jobs registered from glob patterns with `hotReload: true` are imported
+   * again on every resolution. When Hot Hook is active, the dynamic import is
+   * enough for it to return the latest version of the job module.
+   *
+   * @param name - The job name to look up
+   * @returns The job class, or undefined if not found
+   */
+  async resolve<T extends Job = Job>(name: string): Promise<JobClass<T> | undefined> {
+    const entry = this.#registry.get(name)
+
+    if (!entry) {
+      return undefined
+    }
+
+    if (!entry.hotReload || !entry.path) {
+      return entry.JobClass as JobClass<T>
+    }
+
+    const module = await this.#import(entry.path, true)
+    const JobClass = module.default as JobClass<T>
+
+    if (JobClass && typeof JobClass === 'function') {
+      entry.JobClass = JobClass
+    }
+
+    return entry.JobClass as JobClass<T>
+  }
+
+  /**
+   * Resolve a job class by name, throwing if not found.
+   *
+   * @param name - The job name to look up
+   * @returns The job class
+   * @throws {E_JOB_NOT_FOUND} If the job is not registered
+   */
+  async resolveOrThrow<T extends Job = Job>(name: string): Promise<JobClass<T>> {
+    const JobClass = await this.resolve<T>(name)
+
+    if (!JobClass) {
+      throw new errors.E_JOB_NOT_FOUND([name])
+    }
+
+    return JobClass
+  }
+
+  /**
    * Remove all registered jobs.
    *
    * Primarily useful for testing.
    */
   clear(): void {
     this.#registry.clear()
+  }
+
+  async #import(path: string, hotReload: boolean): Promise<{ default?: JobClass }> {
+    const url = pathToFileURL(path).href
+
+    if (!hotReload) {
+      return import(url)
+    }
+
+    const boundary = (import.meta as HotImportMeta).hot?.boundary
+    return boundary ? import(url, { with: { hot: 'true' } }) : import(url)
   }
 }
 

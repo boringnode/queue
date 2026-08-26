@@ -24,6 +24,7 @@ import {
   PUSH_JOB_SCRIPT,
   RECOVER_STALLED_JOBS_SCRIPT,
   REMOVE_JOB_SCRIPT,
+  RENEW_JOBS_SCRIPT,
   RETRY_JOB_SCRIPT,
 } from './redis_scripts.js'
 
@@ -32,6 +33,10 @@ const schedulesKey = 'schedules'
 const schedulesIndexKey = 'schedules::index'
 const schedulesDueKey = 'schedules::due'
 type RedisConfig = Redis | RedisOptions
+
+function isRedisConnection(config?: RedisConfig): config is Redis {
+  return !!config && 'defineCommand' in config && typeof config.defineCommand === 'function'
+}
 
 /**
  * Create a new Redis adapter factory.
@@ -45,7 +50,7 @@ type RedisConfig = Redis | RedisOptions
  */
 export function redis(config?: RedisConfig) {
   return () => {
-    if (config instanceof Redis) {
+    if (isRedisConnection(config)) {
       return new RedisAdapter(config, false)
     }
 
@@ -402,6 +407,26 @@ export class RedisAdapter implements Adapter {
     )
 
     return recovered as number
+  }
+
+  async renewJobs(queue: string, jobIds: string[]): Promise<number> {
+    if (jobIds.length === 0) {
+      return 0
+    }
+
+    const keys = this.#getKeys(queue)
+    const now = Date.now()
+
+    const renewed = await this.#connection.eval(
+      RENEW_JOBS_SCRIPT,
+      1,
+      keys.active,
+      now.toString(),
+      this.#workerId,
+      ...jobIds
+    )
+
+    return renewed as number
   }
 
   async upsertSchedule(config: ScheduleConfig): Promise<string> {

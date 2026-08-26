@@ -4,6 +4,7 @@ import { Locator } from './locator.js'
 import { consoleLogger, type Logger } from './logger.js'
 import { FakeAdapter } from './drivers/fake_adapter.js'
 import { QueueConfigResolver } from './queue_config_resolver.js'
+import { JobExecutionRuntime } from './job_runtime.js'
 import type { Adapter } from './contracts/adapter.js'
 import type { AdapterFactory, JobFactory, QueueManagerConfig } from './types/main.js'
 
@@ -22,6 +23,7 @@ type QueueManagerFakeState = {
   executionWrapper?: QueueManagerConfig['executionWrapper']
   configResolver: QueueConfigResolver
   locations: string[]
+  hotReload: boolean
   fakeAdapter: FakeAdapter
 }
 
@@ -67,6 +69,7 @@ class QueueManagerSingleton {
   #executionWrapper?: QueueManagerConfig['executionWrapper']
   #configResolver: QueueConfigResolver = new QueueConfigResolver({})
   #locations: string[] = []
+  #hotReload = false
   #fakeState?: QueueManagerFakeState
 
   /**
@@ -108,6 +111,7 @@ class QueueManagerSingleton {
     this.#executionWrapper = config.executionWrapper
     this.#configResolver = QueueConfigResolver.from(config)
     this.#locations = config.locations ?? []
+    this.#hotReload = config.hotReload ?? false
 
     if (config.autoLoadJobs ?? true) {
       await this.loadJobs()
@@ -141,7 +145,7 @@ class QueueManagerSingleton {
       return 0
     }
 
-    const registered = await Locator.registerFromGlob(locations)
+    const registered = await Locator.registerFromGlob(locations, { hotReload: this.#hotReload })
 
     if (registered === 0) {
       this.#logger.warn(
@@ -288,6 +292,7 @@ class QueueManagerSingleton {
       executionWrapper: this.#executionWrapper,
       configResolver: this.#configResolver,
       locations: this.#locations,
+      hotReload: this.#hotReload,
       fakeAdapter,
     }
 
@@ -330,6 +335,7 @@ class QueueManagerSingleton {
     this.#executionWrapper = state.executionWrapper
     this.#configResolver = state.configResolver
     this.#locations = state.locations
+    this.#hotReload = state.hotReload
   }
 
   /**
@@ -378,6 +384,22 @@ class QueueManagerSingleton {
     }
 
     return this.#configResolver
+  }
+
+  /**
+   * Create the configured in-process Job execution runtime.
+   */
+  getJobExecutionRuntime(): JobExecutionRuntime {
+    if (!this.#initialized) {
+      throw new errors.E_QUEUE_NOT_INITIALIZED()
+    }
+
+    return new JobExecutionRuntime({
+      resolveJob: (jobName) => Locator.resolveOrThrow(jobName),
+      configResolver: this.#configResolver,
+      jobFactory: this.#jobFactory,
+      executionWrapper: this.#executionWrapper,
+    })
   }
 
   #validateConfig(config: QueueManagerConfig): void {
@@ -435,6 +457,7 @@ class QueueManagerSingleton {
     this.#executionWrapper = undefined
     this.#configResolver = new QueueConfigResolver({})
     this.#locations = []
+    this.#hotReload = false
     this.#fakeState = undefined
   }
 }

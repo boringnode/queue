@@ -39,6 +39,19 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      mysql:
+        image: mysql:8.4
+        ports:
+          - 3307:3306
+        env:
+          MYSQL_ROOT_PASSWORD: mysql
+          MYSQL_DATABASE: queue_test
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -uroot -pmysql --silent"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -68,3 +81,8 @@ jobs:
           PG_USER: postgres
           PG_PASSWORD: postgres
           PG_DATABASE: queue_test
+          MYSQL_HOST: localhost
+          MYSQL_PORT: 3307
+          MYSQL_USER: root
+          MYSQL_PASSWORD: mysql
+          MYSQL_DATABASE: queue_test

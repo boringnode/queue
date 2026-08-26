@@ -33,6 +33,65 @@ test.group('JobPool', () => {
     assert.equal(pool.size, 2)
   })
 
+  test('should observe job promise rejections as soon as they are added', async ({
+    assert,
+    cleanup,
+  }) => {
+    const execution = Promise.withResolvers<void>()
+    const originalThen = execution.promise.then.bind(execution.promise)
+    let observed = false
+
+    execution.promise.then = ((onFulfilled, onRejected) => {
+      observed = onRejected !== undefined
+      return originalThen(onFulfilled, onRejected)
+    }) as Promise<void>['then']
+
+    const pool = new JobPool()
+    cleanup(async () => {
+      execution.resolve()
+      await pool.drain()
+    })
+
+    pool.add(createJob('observed-job'), 'default', execution.promise)
+
+    assert.isTrue(observed)
+  })
+
+  test('attaches one settlement handler while a completion wait remains pending', async ({
+    assert,
+    cleanup,
+  }) => {
+    const execution = Promise.withResolvers<void>()
+    let attachments = 0
+    const observablePromise = {
+      then(onFulfilled, onRejected) {
+        attachments++
+        return execution.promise.then(onFulfilled, onRejected)
+      },
+      catch(onRejected) {
+        return this.then(undefined, onRejected)
+      },
+    } as Promise<void>
+
+    const pool = new JobPool()
+    cleanup(async () => {
+      execution.resolve()
+      await pool.drain()
+    })
+
+    pool.add(createJob('observed-once'), 'default', observablePromise)
+    const completion = pool.waitForNextCompletion()
+
+    for (let tick = 0; tick < 10; tick++) {
+      await setTimeout(0)
+    }
+
+    assert.equal(attachments, 1)
+
+    execution.resolve()
+    await completion
+  })
+
   test('should check capacity correctly', ({ assert }) => {
     const pool = new JobPool()
 
@@ -59,6 +118,81 @@ test.group('JobPool', () => {
     assert.equal(completed.job.id, 'fast')
     assert.equal(completed.queue, 'email')
     assert.equal(pool.size, 1)
+  })
+
+  test('returns a completion queued before waiting begins', async ({ assert }) => {
+    const pool = new JobPool()
+    pool.add(createJob('already-completed'), 'default', Promise.resolve())
+
+    await setTimeout(0)
+
+    const completed = await pool.waitForNextCompletion()
+    assert.equal(completed.job.id, 'already-completed')
+    assert.isTrue(pool.isEmpty())
+  })
+
+  test('returns a newer job that settles after waiting begins', async ({ assert }) => {
+    const pool = new JobPool()
+    const longExecution = Promise.withResolvers<void>()
+    pool.add(createJob('long-running'), 'default', longExecution.promise)
+
+    const completion = pool.waitForNextCompletion()
+    pool.add(createJob('newer-fast-job'), 'default', Promise.resolve())
+
+    assert.equal((await completion).job.id, 'newer-fast-job')
+    longExecution.resolve()
+    await pool.drain()
+  })
+
+  test('ignores a stale completion after an active job id is replaced', async ({ assert }) => {
+    const pool = new JobPool()
+    const staleExecution = Promise.withResolvers<void>()
+    const currentExecution = Promise.withResolvers<void>()
+
+    pool.add(createJob('reused-id'), 'stale', staleExecution.promise)
+    staleExecution.resolve()
+    await setTimeout(0)
+    pool.add(createJob('reused-id'), 'current', currentExecution.promise)
+
+    let delivered = false
+    const completion = pool.waitForNextCompletion().then((entry) => {
+      delivered = true
+      return entry
+    })
+
+    await setTimeout(0)
+    assert.isFalse(delivered)
+
+    currentExecution.resolve()
+    assert.equal((await completion).queue, 'current')
+    assert.isTrue(pool.isEmpty())
+  })
+
+  test('returns every job once in settlement order', async ({ assert }) => {
+    const pool = new JobPool()
+    const first = Promise.withResolvers<void>()
+    const second = Promise.withResolvers<void>()
+    const third = Promise.withResolvers<void>()
+
+    pool.add(createJob('first'), 'default', first.promise)
+    pool.add(createJob('second'), 'default', second.promise)
+    pool.add(createJob('third'), 'default', third.promise)
+
+    second.resolve()
+    await setTimeout(0)
+    first.resolve()
+    await setTimeout(0)
+    third.resolve()
+
+    assert.deepEqual(
+      [
+        (await pool.waitForNextCompletion()).job.id,
+        (await pool.waitForNextCompletion()).job.id,
+        (await pool.waitForNextCompletion()).job.id,
+      ],
+      ['second', 'first', 'third']
+    )
+    assert.isTrue(pool.isEmpty())
   })
 
   test('should remove job from pool after completion', async ({ assert }) => {
@@ -148,5 +282,23 @@ test.group('JobPool', () => {
     await pool.drain()
 
     assert.isTrue(pool.isEmpty())
+  })
+
+  test('drain clears completions that settled before they were consumed', async ({ assert }) => {
+    const pool = new JobPool()
+    const running = Promise.withResolvers<void>()
+
+    pool.add(createJob('settled'), 'default', Promise.resolve())
+    pool.add(createJob('running'), 'default', running.promise)
+    await setTimeout(0)
+
+    const drain = pool.drain()
+    running.resolve()
+    await drain
+
+    assert.isTrue(pool.isEmpty())
+
+    pool.add(createJob('after-drain'), 'default', Promise.resolve())
+    assert.equal((await pool.waitForNextCompletion()).job.id, 'after-drain')
   })
 })

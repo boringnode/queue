@@ -175,24 +175,13 @@ export abstract class Job<Payload = any> {
     payload: T extends Job<infer P> ? P : never
   ): JobDispatcher<T extends Job<infer P> ? P : never> {
     const jobClass = this as unknown as { options?: JobOptions; name: string }
-    const options = jobClass.options || {}
-    const jobName = options.name || this.name
+    const jobName = this.name
 
-    const dispatcher = new JobDispatcher<T extends Job<infer P> ? P : never>(jobName, payload)
-
-    if (options.queue) {
-      dispatcher.toQueue(options.queue)
-    }
-
-    if (options.adapter) {
-      dispatcher.with(options.adapter)
-    }
-
-    if (options.priority !== undefined) {
-      dispatcher.priority(options.priority)
-    }
-
-    return dispatcher
+    return new JobDispatcher<T extends Job<infer P> ? P : never>(
+      jobName,
+      payload,
+      () => jobClass.options || {}
+    )
   }
 
   /**
@@ -227,24 +216,13 @@ export abstract class Job<Payload = any> {
     payloads: (T extends Job<infer P> ? P : never)[]
   ): JobBatchDispatcher<T extends Job<infer P> ? P : never> {
     const jobClass = this as unknown as { options?: JobOptions; name: string }
-    const options = jobClass.options || {}
-    const jobName = options.name || this.name
+    const jobName = this.name
 
-    const dispatcher = new JobBatchDispatcher<T extends Job<infer P> ? P : never>(jobName, payloads)
-
-    if (options.queue) {
-      dispatcher.toQueue(options.queue)
-    }
-
-    if (options.adapter) {
-      dispatcher.with(options.adapter)
-    }
-
-    if (options.priority !== undefined) {
-      dispatcher.priority(options.priority)
-    }
-
-    return dispatcher
+    return new JobBatchDispatcher<T extends Job<infer P> ? P : never>(
+      jobName,
+      payloads,
+      () => jobClass.options || {}
+    )
   }
 
   /**
@@ -277,10 +255,13 @@ export abstract class Job<Payload = any> {
     payload: T extends Job<infer P> ? P : never
   ): ScheduleBuilder<T extends Job<infer P> ? P : never> {
     const jobClass = this as unknown as { options?: JobOptions; name: string }
-    const options = jobClass.options || {}
-    const jobName = options.name || this.name
+    const jobName = this.name
 
-    return new ScheduleBuilder<T extends Job<infer P> ? P : never>(jobName, payload)
+    return new ScheduleBuilder<T extends Job<infer P> ? P : never>(
+      jobName,
+      payload,
+      () => jobClass.options || {}
+    )
   }
 
   /**

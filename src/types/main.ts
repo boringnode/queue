@@ -20,6 +20,9 @@ export type { Logger }
  */
 export type Duration = number | string
 
+/** Registered Adapter name or factory used to select an Adapter. */
+export type AdapterSelector = string | (() => Adapter)
+
 /**
  * Retention policy for completed/failed jobs.
  *
@@ -145,6 +148,9 @@ export interface JobData {
    */
   groupId?: string
 
+  /** Schedule that caused this Job to be dispatched, when applicable. */
+  scheduleId?: string
+
   /**
    * Timestamp (ms) when the job was dispatched.
    * Used to compute queue wait time in OTel instrumentation.
@@ -247,7 +253,7 @@ export interface JobOptions {
    *
    * Defaults to the queue manager's configured default adapter.
    */
-  adapter?: string | (() => Adapter)
+  adapter?: AdapterSelector
 
   /**
    * Maximum retry attempts before permanent failure.
@@ -340,6 +346,9 @@ export interface JobContext {
 
   /** Number of times this job has been recovered from stalled state */
   stalledCount: number
+
+  /** Schedule that caused this Job to be dispatched, when applicable. */
+  scheduleId?: string
 }
 
 /**
@@ -460,6 +469,12 @@ export interface QueueConfig {
  * Runtime options for workers that poll queues and execute jobs.
  */
 export interface WorkerConfig {
+  /**
+   * Registered Adapter this Worker listens on.
+   * Falls back to the queue manager's default Adapter.
+   */
+  adapter?: string
+
   /**
    * Maximum number of jobs to process concurrently.
    * @default 1
@@ -642,6 +657,11 @@ export interface ScheduleResult {
   scheduleId: string
 }
 
+/** Selects the Adapter used to access persisted Schedules. */
+export interface ScheduleAccessOptions {
+  adapter?: AdapterSelector
+}
+
 /**
  * Options for listing schedules.
  */
@@ -706,6 +726,19 @@ export interface QueueManagerConfig {
    * @default true
    */
   autoLoadJobs?: boolean
+
+  /**
+   * Whether jobs discovered from `locations` should be resolved from their
+   * module on each execution.
+   *
+   * This is intended for development with Hot Hook (or a framework such as
+   * AdonisJS that already installs Hot Hook). The queue does not start or
+   * depend on Hot Hook itself; it only keeps the dynamic import boundary needed
+   * for Hot Hook to return the latest job module.
+   *
+   * @default false
+   */
+  hotReload?: boolean
 
   /**
    * Logger used by the queue runtime.
