@@ -697,6 +697,68 @@ test.group('Adapter | Redis', (group) => {
     assert.deepEqual(secondMembers, firstMembers)
   })
 
+  test('backfillDueIndex rebuilds the index in one atomic Redis command', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+    const id = 'atomic-backfill-schedule'
+
+    await connection
+      .multi()
+      .hset(`schedules::${id}`, {
+        id,
+        status: 'active',
+        next_run_at: (Date.now() + 30_000).toString(),
+      })
+      .sadd('schedules::index', id)
+      .exec()
+
+    const { writes } = await withRedisWriteSpy({
+      connection,
+      run: () => adapter.backfillDueIndex(),
+    })
+
+    assert.equal(writes, 1)
+  })
+
+  test('concurrent migration and schedule writes leave the due index canonical', async ({
+    assert,
+    cleanup,
+  }) => {
+    const secondConnection = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+      keyPrefix: KEY_PREFIX,
+      db: 15,
+    })
+    cleanup(async () => {
+      await secondConnection.quit()
+    })
+
+    const adapter = new RedisAdapter(connection)
+    const secondAdapter = new RedisAdapter(secondConnection)
+
+    for (let i = 0; i < 20; i++) {
+      const id = `migration-write-schedule-${i}`
+      const nextRunAt = Date.now() + 30_000 + i
+
+      await Promise.all([
+        adapter.backfillDueIndex(),
+        secondAdapter.upsertSchedule({
+          id,
+          name: 'MigrationWriteJob',
+          payload: {},
+          everyMs: 60_000,
+          timezone: 'UTC',
+        }),
+      ])
+      await Promise.all([
+        adapter.backfillDueIndex(),
+        secondAdapter.updateSchedule(id, { nextRunAt: new Date(nextRunAt) }),
+      ])
+
+      assert.equal(Number(await connection.zscore('schedules::due', id)), nextRunAt)
+    }
+  })
+
   test('stale ZSET score is self-healed during claim', async ({ assert }) => {
     const adapter = new RedisAdapter(connection)
     const id = 'stale-score-schedule'
@@ -758,6 +820,121 @@ test.group('Adapter | Redis', (group) => {
     await adapter.updateSchedule(id, { nextRunAt: new Date(firstRunAt) })
     await adapter.deleteSchedule(id)
     assert.isNull(await connection.zscore('schedules::due', id))
+  })
+
+  test('schedule mutations update canonical state and its index in one command', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+    const id = 'atomic-schedule-mutation'
+
+    const { writes: upsertWrites } = await withRedisWriteSpy({
+      connection,
+      run: () =>
+        adapter.upsertSchedule({
+          id,
+          name: 'AtomicJob',
+          payload: {},
+          everyMs: 60_000,
+          timezone: 'UTC',
+        }),
+    })
+    assert.equal(upsertWrites, 1)
+
+    const { writes: updateWrites } = await withRedisWriteSpy({
+      connection,
+      run: () => adapter.updateSchedule(id, { nextRunAt: new Date(Date.now() + 30_000) }),
+    })
+    assert.equal(updateWrites, 1)
+  })
+
+  test('concurrent resume and next-run updates leave the due index canonical', async ({
+    assert,
+    cleanup,
+  }) => {
+    const secondConnection = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+      keyPrefix: KEY_PREFIX,
+      db: 15,
+    })
+    cleanup(async () => {
+      await secondConnection.quit()
+    })
+
+    const adapter = new RedisAdapter(connection)
+    const secondAdapter = new RedisAdapter(secondConnection)
+    const id = 'concurrent-resume-schedule'
+
+    await adapter.upsertSchedule({
+      id,
+      name: 'ConcurrentJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+
+    for (let i = 0; i < 20; i++) {
+      const nextRunAt = Date.now() + 30_000 + i
+      await adapter.updateSchedule(id, { status: 'paused' })
+
+      await Promise.all([
+        adapter.updateSchedule(id, { nextRunAt: new Date(nextRunAt) }),
+        secondAdapter.updateSchedule(id, { status: 'active' }),
+      ])
+
+      const schedule = await adapter.getSchedule(id)
+      assert.equal(schedule!.status, 'active')
+      assert.equal(Number(await connection.zscore('schedules::due', id)), nextRunAt)
+    }
+  })
+
+  test('concurrent upsert and next-run updates leave the due index canonical', async ({
+    assert,
+    cleanup,
+  }) => {
+    const secondConnection = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+      keyPrefix: KEY_PREFIX,
+      db: 15,
+    })
+    cleanup(async () => {
+      await secondConnection.quit()
+    })
+
+    const adapter = new RedisAdapter(connection)
+    const secondAdapter = new RedisAdapter(secondConnection)
+    const id = 'concurrent-upsert-schedule'
+
+    await adapter.upsertSchedule({
+      id,
+      name: 'ConcurrentJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+
+    for (let i = 0; i < 20; i++) {
+      const nextRunAt = Date.now() + 60_000 + i
+      await adapter.updateSchedule(id, { status: 'paused' })
+
+      await Promise.all([
+        adapter.updateSchedule(id, { nextRunAt: new Date(nextRunAt) }),
+        secondAdapter.upsertSchedule({
+          id,
+          name: 'ConcurrentJob',
+          payload: { iteration: i },
+          everyMs: 60_000,
+          timezone: 'UTC',
+        }),
+      ])
+
+      const schedule = await adapter.getSchedule(id)
+      assert.equal(schedule!.status, 'active')
+      assert.equal(schedule!.nextRunAt!.getTime(), nextRunAt)
+      assert.equal(Number(await connection.zscore('schedules::due', id)), nextRunAt)
+    }
   })
 
   test('interval claims update the due index from the canonical hash', async ({ assert }) => {

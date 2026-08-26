@@ -491,6 +491,109 @@ ${REDIS_JOB_STORAGE_LUA}
   })
 `
 
+const SCHEDULE_DUE_INDEX_LUA = `
+  local function sync_schedule_due_index(schedule_key, due_key, id)
+    local status = redis.call('HGET', schedule_key, 'status')
+    local next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
+    local score = next_run_at and tonumber(next_run_at) or nil
+
+    if status == 'active' and score then
+      redis.call('ZADD', due_key, score, id)
+    else
+      redis.call('ZREM', due_key, id)
+    end
+  end
+`
+
+/**
+ * Atomically upserts schedule configuration while preserving runtime fields
+ * and synchronizing the derived due index from the resulting hash.
+ */
+export const UPSERT_SCHEDULE_SCRIPT = `
+  local schedule_key = KEYS[1]
+  local schedules_index_key = KEYS[2]
+  local due_key = KEYS[3]
+  local id = ARGV[1]
+  local now = ARGV[2]
+  local schedule = cjson.decode(ARGV[3])
+
+${SCHEDULE_DUE_INDEX_LUA}
+
+  local run_count = redis.call('HGET', schedule_key, 'run_count') or '0'
+  local created_at = redis.call('HGET', schedule_key, 'created_at') or now
+
+  redis.call(
+    'HDEL',
+    schedule_key,
+    'cron_expression',
+    'every_ms',
+    'from_date',
+    'to_date',
+    'run_limit'
+  )
+
+  for field, value in pairs(schedule) do
+    redis.call('HSET', schedule_key, field, value)
+  end
+
+  redis.call('HSET', schedule_key, 'run_count', run_count, 'created_at', created_at)
+  redis.call('SADD', schedules_index_key, id)
+  sync_schedule_due_index(schedule_key, due_key, id)
+
+  return id
+`
+
+/**
+ * Atomically updates schedule runtime fields and synchronizes the derived due
+ * index from the resulting canonical hash.
+ */
+export const UPDATE_SCHEDULE_SCRIPT = `
+  local schedule_key = KEYS[1]
+  local due_key = KEYS[2]
+  local id = ARGV[1]
+  local updates = cjson.decode(ARGV[2])
+
+${SCHEDULE_DUE_INDEX_LUA}
+
+  for field, value in pairs(updates) do
+    redis.call('HSET', schedule_key, field, value)
+  end
+
+  sync_schedule_due_index(schedule_key, due_key, id)
+
+  return 1
+`
+
+/**
+ * Atomically rebuilds the derived due index from canonical schedule hashes.
+ * This is an explicit O(N) migration and blocks concurrent Redis commands
+ * until the complete index reflects one consistent point in time.
+ */
+export const BACKFILL_SCHEDULE_DUE_INDEX_SCRIPT = `
+  local schedules_index_key = KEYS[1]
+  local due_key = KEYS[2]
+  local schedule_key_prefix = KEYS[3]
+  local ids = redis.call('SMEMBERS', schedules_index_key)
+  local count = 0
+
+  redis.call('DEL', due_key)
+
+  for i = 1, #ids do
+    local id = ids[i]
+    local schedule_key = schedule_key_prefix .. id
+    local status = redis.call('HGET', schedule_key, 'status')
+    local next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
+    local score = next_run_at and tonumber(next_run_at) or nil
+
+    if status == 'active' and score then
+      redis.call('ZADD', due_key, score, id)
+      count = count + 1
+    end
+  end
+
+  return count
+`
+
 /**
  * Lua script for atomically claiming a due schedule using a sorted set index.
  *

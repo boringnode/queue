@@ -16,6 +16,7 @@ import { resolveRetention } from '../utils.js'
 import { encodeRedisJobPayloadOverlay, hydrateRedisJob } from './redis_job_storage.js'
 import {
   ACQUIRE_JOB_SCRIPT,
+  BACKFILL_SCHEDULE_DUE_INDEX_SCRIPT,
   CLAIM_SCHEDULE_SCRIPT,
   FINALIZE_JOB_SCRIPT,
   GET_JOB_SCRIPT,
@@ -26,6 +27,8 @@ import {
   REMOVE_JOB_SCRIPT,
   RENEW_JOBS_SCRIPT,
   RETRY_JOB_SCRIPT,
+  UPDATE_SCHEDULE_SCRIPT,
+  UPSERT_SCHEDULE_SCRIPT,
 } from './redis_scripts.js'
 
 const redisKey = 'jobs'
@@ -433,12 +436,6 @@ export class RedisAdapter implements Adapter {
     const id = config.id ?? randomUUID()
     const now = Date.now()
     const scheduleKey = `${schedulesKey}::${id}`
-    const [existingRunCount, existingCreatedAt, existingNextRunAt] = await this.#connection.hmget(
-      scheduleKey,
-      'run_count',
-      'created_at',
-      'next_run_at'
-    )
 
     const scheduleData: Record<string, string> = {
       id,
@@ -446,8 +443,6 @@ export class RedisAdapter implements Adapter {
       payload: JSON.stringify(config.payload),
       timezone: config.timezone,
       status: 'active',
-      run_count: existingRunCount ?? '0',
-      created_at: existingCreatedAt ?? now.toString(),
     }
 
     if (config.cronExpression !== undefined) scheduleData.cron_expression = config.cronExpression
@@ -456,19 +451,16 @@ export class RedisAdapter implements Adapter {
     if (config.to !== undefined) scheduleData.to_date = config.to.getTime().toString()
     if (config.limit !== undefined) scheduleData.run_limit = config.limit.toString()
 
-    const multi = this.#connection
-      .multi()
-      .hdel(scheduleKey, 'cron_expression', 'every_ms', 'from_date', 'to_date', 'run_limit')
-      .hset(scheduleKey, scheduleData)
-      .sadd(schedulesIndexKey, id)
-
-    if (existingNextRunAt) {
-      multi.zadd(schedulesDueKey, Number.parseInt(existingNextRunAt, 10), id)
-    } else {
-      multi.zrem(schedulesDueKey, id)
-    }
-
-    await multi.exec()
+    await this.#connection.eval(
+      UPSERT_SCHEDULE_SCRIPT,
+      3,
+      scheduleKey,
+      schedulesIndexKey,
+      schedulesDueKey,
+      id,
+      now.toString(),
+      JSON.stringify(scheduleData)
+    )
 
     return id
   }
@@ -546,37 +538,14 @@ export class RedisAdapter implements Adapter {
 
     if (Object.keys(data).length === 0) return
 
-    let dueStatus = updates.status
-    let dueAt = updates.nextRunAt === undefined ? undefined : (updates.nextRunAt?.getTime() ?? null)
-
-    if (
-      (updates.status !== undefined || updates.nextRunAt !== undefined) &&
-      (dueStatus === undefined || dueAt === undefined)
-    ) {
-      const [existingStatus, existingNextRunAt] = await this.#connection.hmget(
-        scheduleKey,
-        'status',
-        'next_run_at'
-      )
-      if (dueStatus === undefined) {
-        dueStatus = existingStatus === 'paused' ? 'paused' : 'active'
-      }
-      if (dueAt === undefined) {
-        dueAt = existingNextRunAt ? Number.parseInt(existingNextRunAt, 10) : null
-      }
-    }
-
-    const multi = this.#connection.multi().hset(scheduleKey, data)
-
-    if (updates.status !== undefined || updates.nextRunAt !== undefined) {
-      if (dueStatus === 'active' && dueAt !== null && dueAt !== undefined) {
-        multi.zadd(schedulesDueKey, dueAt, id)
-      } else {
-        multi.zrem(schedulesDueKey, id)
-      }
-    }
-
-    await multi.exec()
+    await this.#connection.eval(
+      UPDATE_SCHEDULE_SCRIPT,
+      2,
+      scheduleKey,
+      schedulesDueKey,
+      id,
+      JSON.stringify(data)
+    )
   }
 
   async deleteSchedule(id: string): Promise<void> {
@@ -650,35 +619,13 @@ export class RedisAdapter implements Adapter {
   }
 
   async backfillDueIndex(): Promise<number> {
-    const ids = await this.#connection.smembers(schedulesIndexKey)
-    if (ids.length === 0) {
-      await this.#connection.del(schedulesDueKey)
-      return 0
-    }
-
-    const pipeline = this.#connection.pipeline()
-    for (const id of ids) {
-      pipeline.hmget(`${schedulesKey}::${id}`, 'next_run_at', 'status')
-    }
-    const results = await pipeline.exec()
-    if (!results) return 0
-
-    const rebuild = this.#connection.multi().del(schedulesDueKey)
-    let count = 0
-
-    for (let i = 0; i < ids.length; i++) {
-      const [err, values] = results[i]
-      if (err || !values) continue
-      const [nextRunAt, status] = values as [string | null, string | null]
-      const score = nextRunAt ? Number.parseInt(nextRunAt, 10) : Number.NaN
-      if (Number.isFinite(score) && status === 'active') {
-        rebuild.zadd(schedulesDueKey, score, ids[i])
-        count++
-      }
-    }
-
-    await rebuild.exec()
-    return count
+    return (await this.#connection.eval(
+      BACKFILL_SCHEDULE_DUE_INDEX_SCRIPT,
+      3,
+      schedulesIndexKey,
+      schedulesDueKey,
+      `${schedulesKey}::`
+    )) as number
   }
 
   #hashToScheduleData(data: Record<string, string>): ScheduleData {
