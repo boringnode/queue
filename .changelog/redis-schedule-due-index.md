@@ -10,6 +10,11 @@ Schedule hashes remain the source of truth. Creating, updating, pausing, resumin
 claiming schedules maintain the derived index, while claiming repairs stale entries when the hash
 and index disagree.
 
+Schedule hash and index writes are atomic, and index consistency is preserved across concurrent
+lifecycle changes. Cron finalization now rejects stale calculations when a schedule is paused,
+deleted, or reconfigured while its next run is being calculated. Claiming also discards malformed
+due scores instead of allowing one corrupt entry to block later schedules.
+
 ## Upgrade Notes
 
 This change requires an explicit migration for existing Redis schedules. The `Adapter` contract now
