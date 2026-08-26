@@ -1119,6 +1119,98 @@ test.group('Adapter | Redis', (group) => {
     assert.isNull(await connection.zscore('schedules::due', id))
   })
 
+  test('cron finalization survives a concurrent manual trigger metadata update', async ({
+    assert,
+    cleanup,
+  }) => {
+    const secondConnection = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+      keyPrefix: KEY_PREFIX,
+      db: 15,
+    })
+    cleanup(async () => {
+      await secondConnection.quit()
+    })
+
+    const adapter = new RedisAdapter(connection)
+    const secondAdapter = new RedisAdapter(secondConnection)
+    const id = 'cron-finalize-concurrent-trigger'
+
+    await adapter.upsertSchedule({
+      id,
+      name: 'CronTriggerJob',
+      payload: {},
+      cronExpression: '* * * * *',
+      timezone: 'UTC',
+    })
+    await adapter.updateSchedule(id, { nextRunAt: new Date(Date.now() - 1_000) })
+
+    const originalEval = connection.eval.bind(connection)
+    let releaseClaim!: () => void
+    let claimReturned!: () => void
+    const claimReleased = new Promise<void>((resolve) => {
+      releaseClaim = resolve
+    })
+    const claimHasReturned = new Promise<void>((resolve) => {
+      claimReturned = resolve
+    })
+    let gateNextEval = true
+
+    connection.eval = (async (...args: Parameters<typeof connection.eval>) => {
+      const result = await originalEval(...args)
+      if (gateNextEval) {
+        gateNextEval = false
+        claimReturned()
+        await claimReleased
+      }
+      return result
+    }) as typeof connection.eval
+
+    const claim = adapter.claimDueSchedule()
+    await claimHasReturned
+    await secondAdapter.updateSchedule(id, {
+      runCount: 2,
+      lastRunAt: new Date(),
+    })
+
+    releaseClaim()
+    await claim
+    connection.eval = originalEval
+
+    const schedule = await adapter.getSchedule(id)
+    assert.equal(schedule!.runCount, 2)
+    assert.isNotNull(schedule!.nextRunAt)
+    assert.equal(
+      Number(await connection.zscore('schedules::due', id)),
+      schedule!.nextRunAt!.getTime()
+    )
+  })
+
+  test('updating a deleted schedule does not recreate or index it', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+    const id = 'update-after-delete'
+
+    await adapter.upsertSchedule({
+      id,
+      name: 'DeletedScheduleJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+    await adapter.deleteSchedule(id)
+
+    await adapter.updateSchedule(id, {
+      status: 'active',
+      nextRunAt: new Date(Date.now() - 1_000),
+      runCount: 0,
+    })
+
+    assert.isNull(await adapter.getSchedule(id))
+    assert.isNull(await connection.zscore('schedules::due', id))
+    assert.isNull(await adapter.claimDueSchedule())
+  })
+
   test('claim removes a malformed due score and continues to a valid schedule', async ({
     assert,
   }) => {

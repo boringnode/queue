@@ -565,6 +565,11 @@ export const UPDATE_SCHEDULE_SCRIPT = `
 
 ${SCHEDULE_DUE_INDEX_LUA}
 
+  if redis.call('EXISTS', schedule_key) == 0 then
+    redis.call('ZREM', due_key, id)
+    return 0
+  end
+
   for field, value in pairs(updates) do
     redis.call('HSET', schedule_key, field, value)
   end
@@ -582,11 +587,9 @@ export const FINALIZE_CRON_SCHEDULE_SCRIPT = `
   local schedule_key = KEYS[1]
   local due_key = KEYS[2]
   local id = ARGV[1]
-  local expected_run_count = ARGV[2]
-  local expected_last_run_at = ARGV[3]
-  local expected_cron_expression = ARGV[4]
-  local expected_config_revision = ARGV[5]
-  local next_run_at = ARGV[6]
+  local expected_cron_expression = ARGV[2]
+  local expected_config_revision = ARGV[3]
+  local next_run_at = ARGV[4]
 
 ${SCHEDULE_DUE_INDEX_LUA}
 
@@ -596,20 +599,26 @@ ${SCHEDULE_DUE_INDEX_LUA}
   end
 
   local status = redis.call('HGET', schedule_key, 'status')
-  local run_count = redis.call('HGET', schedule_key, 'run_count')
-  local last_run_at = redis.call('HGET', schedule_key, 'last_run_at')
   local current_next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
   local cron_expression = redis.call('HGET', schedule_key, 'cron_expression')
   local config_revision = redis.call('HGET', schedule_key, 'config_revision') or ''
 
   if status ~= 'active'
-    or run_count ~= expected_run_count
-    or last_run_at ~= expected_last_run_at
     or current_next_run_at ~= ''
     or cron_expression ~= expected_cron_expression
     or config_revision ~= expected_config_revision then
     sync_schedule_due_index(schedule_key, due_key, id)
     return 0
+  end
+
+  local run_count = tonumber(redis.call('HGET', schedule_key, 'run_count') or '0')
+  local run_limit = tonumber(redis.call('HGET', schedule_key, 'run_limit') or '')
+  local to_date = tonumber(redis.call('HGET', schedule_key, 'to_date') or '')
+  local next_score = tonumber(next_run_at)
+
+  if (run_limit and run_count >= run_limit)
+    or (to_date and next_score and next_score > to_date) then
+    next_run_at = ''
   end
 
   redis.call('HSET', schedule_key, 'next_run_at', next_run_at)

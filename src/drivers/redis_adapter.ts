@@ -608,8 +608,6 @@ export class RedisAdapter implements Adapter {
         `${schedulesKey}::${data.id}`,
         schedulesDueKey,
         data.id,
-        runCount.toString(),
-        now.toString(),
         data.cron_expression,
         data.config_revision || '',
         newNextRunAt.toString()
