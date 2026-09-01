@@ -55,7 +55,7 @@
     "c8": "^11.0.0",
     "del-cli": "^7.0.0",
     "hot-hook": "^1.0.0",
-    "ioredis": "^5.11.1",
+    "ioredis": "^6.0.0",
     "knex": "3.1.0",
     "kysely": "^0.29.2",
     "mysql2": "^3.0.0",
@@ -71,7 +71,7 @@
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/core": "^1.30.0 || ^2.0.0",
     "@opentelemetry/instrumentation": "^0.200.0",
-    "ioredis": "^5.0.0",
+    "ioredis": "^5.0.0 || ^6.0.0",
     "knex": "^3.0.0",
     "kysely": "^0.29.0"
   },
