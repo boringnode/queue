@@ -444,87 +444,108 @@ export class KnexAdapter implements Adapter {
     dedup: NonNullable<JobData['dedup']>
   ): Promise<PushResult> {
     return this.#connection.transaction(async (trx) => {
-      const existing = await trx(this.#jobsTable)
+      const now = Date.now()
+      const existingResult = await this.#resolveExistingDedup(trx, queue, jobData, dedup, now)
+      if (existingResult) return existingResult
+
+      return this.#insertDedup(trx, queue, jobData.id, insertRow, dedup, now)
+    })
+  }
+
+  async #resolveExistingDedup(
+    trx: Knex.Transaction,
+    queue: string,
+    jobData: JobData,
+    dedup: NonNullable<JobData['dedup']>,
+    now: number
+  ): Promise<PushResult | null> {
+    const existing = await trx(this.#jobsTable)
+      .where('queue', queue)
+      .where('dedup_id', dedup.id)
+      .orderBy('dedup_at', 'desc')
+      .forUpdate()
+      .first()
+
+    if (!existing) return null
+
+    const dedupAt = existing.dedup_at != null ? Number(existing.dedup_at) : null
+    const dedupTtl = existing.dedup_ttl != null ? Number(existing.dedup_ttl) : null
+    const withinTtl = dedupTtl === null || (dedupAt !== null && now - dedupAt < dedupTtl)
+
+    if (withinTtl) {
+      const status = existing.status as JobStatus
+      const replaceable = status === 'pending' || status === 'delayed'
+
+      if (dedup.replace && replaceable) {
+        const storedData =
+          typeof existing.data === 'string' ? JSON.parse(existing.data) : existing.data
+        const newData = { ...storedData, payload: jobData.payload }
+        const updates: Record<string, unknown> = { data: JSON.stringify(newData) }
+        if (dedup.extend && dedupTtl) {
+          updates.dedup_at = now
+        }
+        await trx(this.#jobsTable).where({ id: existing.id, queue }).update(updates)
+        return { outcome: 'replaced' as DedupOutcome, jobId: existing.id as string }
+      }
+
+      if (dedup.extend && dedupTtl) {
+        await trx(this.#jobsTable).where({ id: existing.id, queue }).update({ dedup_at: now })
+        return { outcome: 'extended' as DedupOutcome, jobId: existing.id as string }
+      }
+
+      return { outcome: 'skipped' as DedupOutcome, jobId: existing.id as string }
+    }
+
+    // Release the expired dedup slot. The old job keeps running to completion.
+    const status = existing.status as JobStatus
+    if (status === 'pending' || status === 'delayed' || status === 'active') {
+      await trx(this.#jobsTable)
+        .where({ id: existing.id, queue })
+        .update({ dedup_id: null, dedup_at: null, dedup_ttl: null })
+    }
+
+    return null
+  }
+
+  async #insertDedup(
+    trx: Knex.Transaction,
+    queue: string,
+    jobId: string,
+    insertRow: Record<string, unknown>,
+    dedup: NonNullable<JobData['dedup']>,
+    now: number
+  ): Promise<PushResult> {
+    let raceLost = false
+    try {
+      await trx.transaction(async (sp) => {
+        await sp(this.#jobsTable).insert({
+          ...insertRow,
+          dedup_id: dedup.id,
+          dedup_at: now,
+          dedup_ttl: dedup.ttl ?? null,
+        })
+      })
+    } catch (err) {
+      if (this.#isUniqueViolation(err)) {
+        raceLost = true
+      } else {
+        throw err
+      }
+    }
+
+    if (raceLost) {
+      const winner = await trx(this.#jobsTable)
         .where('queue', queue)
         .where('dedup_id', dedup.id)
+        .whereIn('status', ['pending', 'delayed'])
         .orderBy('dedup_at', 'desc')
-        .forUpdate()
         .first()
-
-      const now = Date.now()
-
-      if (existing) {
-        const dedupAt = existing.dedup_at != null ? Number(existing.dedup_at) : null
-        const dedupTtl = existing.dedup_ttl != null ? Number(existing.dedup_ttl) : null
-        const withinTtl = dedupTtl === null || (dedupAt !== null && now - dedupAt < dedupTtl)
-
-        if (withinTtl) {
-          const status = existing.status as JobStatus
-          const replaceable = status === 'pending' || status === 'delayed'
-
-          if (dedup.replace && replaceable) {
-            const storedData =
-              typeof existing.data === 'string' ? JSON.parse(existing.data) : existing.data
-            const newData = { ...storedData, payload: jobData.payload }
-            const updates: Record<string, unknown> = { data: JSON.stringify(newData) }
-            if (dedup.extend && dedupTtl) {
-              updates.dedup_at = now
-            }
-            await trx(this.#jobsTable).where({ id: existing.id, queue }).update(updates)
-            return { outcome: 'replaced' as DedupOutcome, jobId: existing.id as string }
-          }
-
-          if (dedup.extend && dedupTtl) {
-            await trx(this.#jobsTable).where({ id: existing.id, queue }).update({ dedup_at: now })
-            return { outcome: 'extended' as DedupOutcome, jobId: existing.id as string }
-          }
-
-          return { outcome: 'skipped' as DedupOutcome, jobId: existing.id as string }
-        }
-        // TTL expired — release the dedup slot from the old row so the new
-        // insert can claim it. The old job keeps running to completion; only
-        // its dedup identity is cleared. Retained history rows are excluded
-        // from the partial unique index predicate, so no update needed there.
-        const status = existing.status as JobStatus
-        if (status === 'pending' || status === 'delayed' || status === 'active') {
-          await trx(this.#jobsTable)
-            .where({ id: existing.id, queue })
-            .update({ dedup_id: null, dedup_at: null, dedup_ttl: null })
-        }
+      if (winner) {
+        return { outcome: 'skipped' as DedupOutcome, jobId: winner.id as string }
       }
+    }
 
-      let raceLost = false
-      try {
-        await trx.transaction(async (sp) => {
-          await sp(this.#jobsTable).insert({
-            ...insertRow,
-            dedup_id: dedup.id,
-            dedup_at: now,
-            dedup_ttl: dedup.ttl ?? null,
-          })
-        })
-      } catch (err) {
-        if (this.#isUniqueViolation(err)) {
-          raceLost = true
-        } else {
-          throw err
-        }
-      }
-
-      if (raceLost) {
-        const winner = await trx(this.#jobsTable)
-          .where('queue', queue)
-          .where('dedup_id', dedup.id)
-          .whereIn('status', ['pending', 'delayed'])
-          .orderBy('dedup_at', 'desc')
-          .first()
-        if (winner) {
-          return { outcome: 'skipped' as DedupOutcome, jobId: winner.id as string }
-        }
-      }
-
-      return { outcome: 'added' as DedupOutcome, jobId: jobData.id }
-    })
+    return { outcome: 'added' as DedupOutcome, jobId }
   }
 
   #isUniqueViolation(err: unknown): boolean {

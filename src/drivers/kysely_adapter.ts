@@ -416,104 +416,12 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   ): Promise<PushResult> {
     try {
       return await this.#withTransaction(connection, async (trx) => {
-        let existingQuery = this.#jobs(trx)
-          .selectFrom(this.#jobsTable)
-          .selectAll()
-          .where('queue', '=', queue)
-          .where('dedup_id', '=', jobData.dedup!.id)
-          .orderBy('dedup_at', 'desc')
-          .limit(1)
-
-        if (this.#supportsSkipLocked()) existingQuery = existingQuery.forUpdate()
-
-        const existing = await existingQuery.executeTakeFirst()
         const now = Date.now()
         const dedup = jobData.dedup!
+        const existingResult = await this.#resolveExistingDedup(trx, queue, jobData, dedup, now)
+        if (existingResult) return existingResult
 
-        if (existing) {
-          const dedupAt = existing.dedup_at == null ? null : Number(existing.dedup_at)
-          const dedupTtl = existing.dedup_ttl == null ? null : Number(existing.dedup_ttl)
-          const withinTtl = dedupTtl === null || (dedupAt !== null && now - dedupAt < dedupTtl)
-
-          if (withinTtl) {
-            const replaceable = existing.status === 'pending' || existing.status === 'delayed'
-
-            if (dedup.replace && replaceable) {
-              const storedData = JSON.parse(existing.data) as JobData
-              const updates: Updateable<QueueJobTable> = {
-                data: JSON.stringify({ ...storedData, payload: jobData.payload }),
-              }
-              if (dedup.extend && dedupTtl) updates.dedup_at = now
-
-              await this.#jobs(trx)
-                .updateTable(this.#jobsTable)
-                .set(updates)
-                .where('id', '=', existing.id)
-                .where('queue', '=', queue)
-                .execute()
-              return { outcome: 'replaced', jobId: existing.id }
-            }
-
-            if (dedup.extend && dedupTtl) {
-              await this.#jobs(trx)
-                .updateTable(this.#jobsTable)
-                .set({ dedup_at: now })
-                .where('id', '=', existing.id)
-                .where('queue', '=', queue)
-                .execute()
-              return { outcome: 'extended', jobId: existing.id }
-            }
-
-            return { outcome: 'skipped', jobId: existing.id }
-          }
-
-          if (
-            existing.status === 'pending' ||
-            existing.status === 'delayed' ||
-            existing.status === 'active'
-          ) {
-            await this.#jobs(trx)
-              .updateTable(this.#jobsTable)
-              .set({ dedup_id: null, dedup_at: null, dedup_ttl: null })
-              .where('id', '=', existing.id)
-              .where('queue', '=', queue)
-              .execute()
-          }
-        }
-
-        const savepoint = `queue_dedup_${randomUUID().replaceAll('-', '')}`
-        await sql`savepoint ${sql.id(savepoint)}`.execute(trx)
-
-        try {
-          await this.#jobs(trx)
-            .insertInto(this.#jobsTable)
-            .values({
-              ...insertRow,
-              dedup_id: dedup.id,
-              dedup_at: now,
-              dedup_ttl: dedup.ttl ?? null,
-            })
-            .execute()
-          await sql`release savepoint ${sql.id(savepoint)}`.execute(trx)
-          return { outcome: 'added', jobId: jobData.id }
-        } catch (error) {
-          await sql`rollback to savepoint ${sql.id(savepoint)}`.execute(trx)
-          await sql`release savepoint ${sql.id(savepoint)}`.execute(trx)
-          if (!this.#isUniqueViolation(error)) throw error
-        }
-
-        const winner = await this.#jobs(trx)
-          .selectFrom(this.#jobsTable)
-          .select('id')
-          .where('queue', '=', queue)
-          .where('dedup_id', '=', dedup.id)
-          .where('status', 'in', ['pending', 'delayed'])
-          .orderBy('dedup_at', 'desc')
-          .executeTakeFirst()
-
-        if (!winner)
-          throw new Error(`Unable to resolve concurrent dedup dispatch for "${dedup.id}"`)
-        return { outcome: 'skipped', jobId: winner.id }
+        return this.#insertDedup(trx, queue, jobData.id, insertRow, dedup, now)
       })
     } catch (error) {
       if (this.#isMissingDedupColumn(error)) {
@@ -524,6 +432,120 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
       }
       throw error
     }
+  }
+
+  async #resolveExistingDedup(
+    trx: Transaction<DB>,
+    queue: string,
+    jobData: JobData,
+    dedup: NonNullable<JobData['dedup']>,
+    now: number
+  ): Promise<PushResult | null> {
+    let existingQuery = this.#jobs(trx)
+      .selectFrom(this.#jobsTable)
+      .selectAll()
+      .where('queue', '=', queue)
+      .where('dedup_id', '=', dedup.id)
+      .orderBy('dedup_at', 'desc')
+      .limit(1)
+
+    if (this.#supportsSkipLocked()) existingQuery = existingQuery.forUpdate()
+
+    const existing = await existingQuery.executeTakeFirst()
+    if (!existing) return null
+
+    const dedupAt = existing.dedup_at == null ? null : Number(existing.dedup_at)
+    const dedupTtl = existing.dedup_ttl == null ? null : Number(existing.dedup_ttl)
+    const withinTtl = dedupTtl === null || (dedupAt !== null && now - dedupAt < dedupTtl)
+
+    if (withinTtl) {
+      const replaceable = existing.status === 'pending' || existing.status === 'delayed'
+
+      if (dedup.replace && replaceable) {
+        const storedData = JSON.parse(existing.data) as JobData
+        const updates: Updateable<QueueJobTable> = {
+          data: JSON.stringify({ ...storedData, payload: jobData.payload }),
+        }
+        if (dedup.extend && dedupTtl) updates.dedup_at = now
+
+        await this.#jobs(trx)
+          .updateTable(this.#jobsTable)
+          .set(updates)
+          .where('id', '=', existing.id)
+          .where('queue', '=', queue)
+          .execute()
+        return { outcome: 'replaced', jobId: existing.id }
+      }
+
+      if (dedup.extend && dedupTtl) {
+        await this.#jobs(trx)
+          .updateTable(this.#jobsTable)
+          .set({ dedup_at: now })
+          .where('id', '=', existing.id)
+          .where('queue', '=', queue)
+          .execute()
+        return { outcome: 'extended', jobId: existing.id }
+      }
+
+      return { outcome: 'skipped', jobId: existing.id }
+    }
+
+    if (
+      existing.status === 'pending' ||
+      existing.status === 'delayed' ||
+      existing.status === 'active'
+    ) {
+      await this.#jobs(trx)
+        .updateTable(this.#jobsTable)
+        .set({ dedup_id: null, dedup_at: null, dedup_ttl: null })
+        .where('id', '=', existing.id)
+        .where('queue', '=', queue)
+        .execute()
+    }
+
+    return null
+  }
+
+  async #insertDedup(
+    trx: Transaction<DB>,
+    queue: string,
+    jobId: string,
+    insertRow: Partial<JobRow> & Pick<JobRow, 'id' | 'queue' | 'status' | 'data'>,
+    dedup: NonNullable<JobData['dedup']>,
+    now: number
+  ): Promise<PushResult> {
+    const savepoint = `queue_dedup_${randomUUID().replaceAll('-', '')}`
+    await sql`savepoint ${sql.id(savepoint)}`.execute(trx)
+
+    try {
+      await this.#jobs(trx)
+        .insertInto(this.#jobsTable)
+        .values({
+          ...insertRow,
+          dedup_id: dedup.id,
+          dedup_at: now,
+          dedup_ttl: dedup.ttl ?? null,
+        })
+        .execute()
+      await sql`release savepoint ${sql.id(savepoint)}`.execute(trx)
+      return { outcome: 'added', jobId }
+    } catch (error) {
+      await sql`rollback to savepoint ${sql.id(savepoint)}`.execute(trx)
+      await sql`release savepoint ${sql.id(savepoint)}`.execute(trx)
+      if (!this.#isUniqueViolation(error)) throw error
+    }
+
+    const winner = await this.#jobs(trx)
+      .selectFrom(this.#jobsTable)
+      .select('id')
+      .where('queue', '=', queue)
+      .where('dedup_id', '=', dedup.id)
+      .where('status', 'in', ['pending', 'delayed'])
+      .orderBy('dedup_at', 'desc')
+      .executeTakeFirst()
+
+    if (!winner) throw new Error(`Unable to resolve concurrent dedup dispatch for "${dedup.id}"`)
+    return { outcome: 'skipped', jobId: winner.id }
   }
 
   async pushMany(jobs: JobData[]): Promise<void> {
