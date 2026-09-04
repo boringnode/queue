@@ -491,43 +491,246 @@ ${REDIS_JOB_STORAGE_LUA}
   })
 `
 
-/**
- * Lua script for atomically claiming a due schedule.
- * Iterates the schedule index server-side and claims the first due schedule.
- * Returns the schedule data if claimed, nil otherwise.
- */
-export const CLAIM_SCHEDULE_SCRIPT = `
-  local schedules_index_key = KEYS[1]
-  local schedule_key_prefix = KEYS[2]
-  local now = tonumber(ARGV[1])
+const SCHEDULE_DUE_INDEX_LUA = `
+  local function sync_schedule_due_index(schedule_key, due_key, id)
+    local status = redis.call('HGET', schedule_key, 'status')
+    local next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
+    local score = next_run_at and tonumber(next_run_at) or nil
 
+    if status == 'active' and score then
+      redis.call('ZADD', due_key, score, id)
+    else
+      redis.call('ZREM', due_key, id)
+    end
+  end
+`
+
+/**
+ * Atomically upserts schedule configuration while preserving runtime fields
+ * and synchronizing the derived due index from the resulting hash.
+ */
+export const UPSERT_SCHEDULE_SCRIPT = `
+  local schedule_key = KEYS[1]
+  local schedules_index_key = KEYS[2]
+  local due_key = KEYS[3]
+  local id = ARGV[1]
+  local now = ARGV[2]
+  local schedule = cjson.decode(ARGV[3])
+
+${SCHEDULE_DUE_INDEX_LUA}
+
+  local run_count = redis.call('HGET', schedule_key, 'run_count') or '0'
+  local created_at = redis.call('HGET', schedule_key, 'created_at') or now
+  local config_revision = tonumber(redis.call('HGET', schedule_key, 'config_revision') or '0') + 1
+
+  redis.call(
+    'HDEL',
+    schedule_key,
+    'cron_expression',
+    'every_ms',
+    'from_date',
+    'to_date',
+    'run_limit',
+    'claim_token'
+  )
+
+  for field, value in pairs(schedule) do
+    redis.call('HSET', schedule_key, field, value)
+  end
+
+  redis.call(
+    'HSET',
+    schedule_key,
+    'run_count',
+    run_count,
+    'created_at',
+    created_at,
+    'config_revision',
+    tostring(config_revision)
+  )
+  redis.call('SADD', schedules_index_key, id)
+  sync_schedule_due_index(schedule_key, due_key, id)
+
+  return id
+`
+
+/**
+ * Atomically updates schedule runtime fields and synchronizes the derived due
+ * index from the resulting canonical hash.
+ */
+export const UPDATE_SCHEDULE_SCRIPT = `
+  local schedule_key = KEYS[1]
+  local due_key = KEYS[2]
+  local id = ARGV[1]
+  local updates = cjson.decode(ARGV[2])
+
+${SCHEDULE_DUE_INDEX_LUA}
+
+  if redis.call('EXISTS', schedule_key) == 0 then
+    redis.call('ZREM', due_key, id)
+    return 0
+  end
+
+  for field, value in pairs(updates) do
+    redis.call('HSET', schedule_key, field, value)
+  end
+
+  sync_schedule_due_index(schedule_key, due_key, id)
+
+  return 1
+`
+
+/**
+ * Finalizes the JS-calculated next run for a cron claim only when the same
+ * claimed occurrence still owns the canonical hash.
+ */
+export const FINALIZE_CRON_SCHEDULE_SCRIPT = `
+  local schedule_key = KEYS[1]
+  local due_key = KEYS[2]
+  local id = ARGV[1]
+  local expected_cron_expression = ARGV[2]
+  local expected_config_revision = ARGV[3]
+  local expected_claim_token = ARGV[4]
+  local next_run_at = ARGV[5]
+
+${SCHEDULE_DUE_INDEX_LUA}
+
+  if redis.call('EXISTS', schedule_key) == 0 then
+    redis.call('ZREM', due_key, id)
+    return 0
+  end
+
+  local status = redis.call('HGET', schedule_key, 'status')
+  local current_next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
+  local cron_expression = redis.call('HGET', schedule_key, 'cron_expression')
+  local config_revision = redis.call('HGET', schedule_key, 'config_revision') or ''
+  local claim_token = redis.call('HGET', schedule_key, 'claim_token') or ''
+
+  if status ~= 'active'
+    or current_next_run_at ~= ''
+    or cron_expression ~= expected_cron_expression
+    or config_revision ~= expected_config_revision
+    or claim_token ~= expected_claim_token then
+    if claim_token == expected_claim_token then
+      redis.call('HDEL', schedule_key, 'claim_token')
+    end
+    sync_schedule_due_index(schedule_key, due_key, id)
+    return 0
+  end
+
+  local run_count = tonumber(redis.call('HGET', schedule_key, 'run_count') or '0')
+  local run_limit = tonumber(redis.call('HGET', schedule_key, 'run_limit') or '')
+  local to_date = tonumber(redis.call('HGET', schedule_key, 'to_date') or '')
+  local next_score = tonumber(next_run_at)
+
+  if (run_limit and run_count >= run_limit)
+    or (to_date and next_score and next_score > to_date) then
+    next_run_at = ''
+  end
+
+  redis.call('HSET', schedule_key, 'next_run_at', next_run_at)
+  redis.call('HDEL', schedule_key, 'claim_token')
+  sync_schedule_due_index(schedule_key, due_key, id)
+
+  return 1
+`
+
+/**
+ * Atomically rebuilds the derived due index from canonical schedule hashes.
+ * This is an explicit O(N) migration and blocks concurrent Redis commands
+ * until the complete index reflects one consistent point in time.
+ */
+export const BACKFILL_SCHEDULE_DUE_INDEX_SCRIPT = `
+  local schedules_index_key = KEYS[1]
+  local due_key = KEYS[2]
+  local schedule_key_prefix = KEYS[3]
   local ids = redis.call('SMEMBERS', schedules_index_key)
+  local count = 0
+
+  redis.call('DEL', due_key)
 
   for i = 1, #ids do
-    local schedule_key = schedule_key_prefix .. ids[i]
+    local id = ids[i]
+    local schedule_key = schedule_key_prefix .. id
+    local status = redis.call('HGET', schedule_key, 'status')
+    local next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
+    local score = next_run_at and tonumber(next_run_at) or nil
+
+    if status == 'active' and score then
+      redis.call('ZADD', due_key, score, id)
+      count = count + 1
+    end
+  end
+
+  return count
+`
+
+/**
+ * Lua script for atomically claiming a due schedule using a sorted set index.
+ *
+ * Uses ZRANGEBYSCORE on schedules::due (scored by next_run_at) for O(log N)
+ * lookup instead of scanning all schedule hashes via SMEMBERS.
+ *
+ * Stale entries (paused, exhausted, deleted) are cleaned from the ZSET on
+ * sight so subsequent calls skip them.
+ *
+ * KEYS[1] = schedules::due (the ZSET)
+ * KEYS[2] = schedule key prefix (e.g. "schedules::")
+ * ARGV[1] = now (epoch milliseconds)
+ */
+export const CLAIM_SCHEDULE_SCRIPT = `
+  local due_key = KEYS[1]
+  local prefix = KEYS[2]
+  local now = tonumber(ARGV[1])
+  local claim_token = ARGV[2]
+
+  while true do
+    local candidates = redis.call('ZRANGEBYSCORE', due_key, '-inf', tostring(now), 'LIMIT', 0, 1)
+
+    if #candidates == 0 then
+      return nil
+    end
+
+    local id = candidates[1]
+    local schedule_key = prefix .. id
 
     -- Get schedule data
     local data = redis.call('HGETALL', schedule_key)
-    if #data > 0 then
+
+    -- Deleted schedule still in ZSET
+    if #data == 0 then
+      redis.call('ZREM', due_key, id)
+    else
       -- Convert HGETALL result to table
       local schedule = {}
       for j = 1, #data, 2 do
         schedule[data[j]] = data[j + 1]
       end
 
-      -- Check if schedule is due
-      if schedule.status == 'active' then
-        local next_run_at = tonumber(schedule.next_run_at)
-
-        if next_run_at and next_run_at <= now then
+      -- Check if schedule is active
+      if schedule.status ~= 'active' then
+        redis.call('ZREM', due_key, id)
+      else
+        -- Hash is the source of truth for next_run_at.
+        -- If the ZSET score is stale, repair it and skip this candidate.
+        local hash_nra = schedule.next_run_at
+        local hash_score = hash_nra and tonumber(hash_nra) or nil
+        if not hash_score then
+          redis.call('ZREM', due_key, id)
+        elseif hash_score > now then
+          redis.call('ZADD', due_key, hash_score, id)
+        else
           local run_count = tonumber(schedule.run_count or '0')
           local run_limit = schedule.run_limit and tonumber(schedule.run_limit) or nil
           local to_date = schedule.to_date and tonumber(schedule.to_date) or nil
 
           -- Check limits
-          if not (run_limit and run_count >= run_limit) and not (to_date and now > to_date) then
+          if (run_limit and run_count >= run_limit) or (to_date and now > to_date) then
+            redis.call('ZREM', due_key, id)
+          else
             -- This schedule is claimable - atomically update it
             local new_run_count = run_count + 1
+            local new_claim_token = ''
 
             -- Calculate new next_run_at (simple interval-based for now)
             -- Complex cron calculation happens in the caller
@@ -535,6 +738,8 @@ export const CLAIM_SCHEDULE_SCRIPT = `
             local every_ms = schedule.every_ms and tonumber(schedule.every_ms) or nil
             if every_ms then
               new_next_run_at = tostring(now + every_ms)
+            elseif schedule.cron_expression then
+              new_claim_token = claim_token
             end
 
             -- Check if we've hit the limit after this run
@@ -551,7 +756,15 @@ export const CLAIM_SCHEDULE_SCRIPT = `
             redis.call('HSET', schedule_key,
               'next_run_at', new_next_run_at,
               'last_run_at', tostring(now),
-              'run_count', tostring(new_run_count))
+              'run_count', tostring(new_run_count),
+              'claim_token', new_claim_token)
+
+            -- Update or remove from ZSET
+            if new_next_run_at ~= '' then
+              redis.call('ZADD', due_key, tonumber(new_next_run_at), id)
+            else
+              redis.call('ZREM', due_key, id)
+            end
 
             -- Return the schedule data (before update) as JSON
             return cjson.encode(schedule)
@@ -560,6 +773,4 @@ export const CLAIM_SCHEDULE_SCRIPT = `
       end
     end
   end
-
-  return nil
 `

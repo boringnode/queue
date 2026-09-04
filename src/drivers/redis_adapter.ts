@@ -16,8 +16,10 @@ import { resolveRetention } from '../utils.js'
 import { encodeRedisJobPayloadOverlay, hydrateRedisJob } from './redis_job_storage.js'
 import {
   ACQUIRE_JOB_SCRIPT,
+  BACKFILL_SCHEDULE_DUE_INDEX_SCRIPT,
   CLAIM_SCHEDULE_SCRIPT,
   FINALIZE_JOB_SCRIPT,
+  FINALIZE_CRON_SCHEDULE_SCRIPT,
   GET_JOB_SCRIPT,
   PUSH_DEDUP_JOB_SCRIPT,
   PUSH_DELAYED_JOB_SCRIPT,
@@ -26,11 +28,14 @@ import {
   REMOVE_JOB_SCRIPT,
   RENEW_JOBS_SCRIPT,
   RETRY_JOB_SCRIPT,
+  UPDATE_SCHEDULE_SCRIPT,
+  UPSERT_SCHEDULE_SCRIPT,
 } from './redis_scripts.js'
 
 const redisKey = 'jobs'
 const schedulesKey = 'schedules'
 const schedulesIndexKey = 'schedules::index'
+const schedulesDueKey = 'schedules::due'
 type RedisConfig = Redis | RedisOptions
 
 function isRedisConnection(config?: RedisConfig): config is Redis {
@@ -70,7 +75,6 @@ export class RedisAdapter implements Adapter {
   readonly #connection: Redis
   readonly #ownsConnection: boolean
   #workerId: string = ''
-
   constructor(connection: Redis, ownsConnection: boolean = false) {
     this.#connection = connection
     this.#ownsConnection = ownsConnection
@@ -433,11 +437,6 @@ export class RedisAdapter implements Adapter {
     const id = config.id ?? randomUUID()
     const now = Date.now()
     const scheduleKey = `${schedulesKey}::${id}`
-    const [existingRunCount, existingCreatedAt] = await this.#connection.hmget(
-      scheduleKey,
-      'run_count',
-      'created_at'
-    )
 
     const scheduleData: Record<string, string> = {
       id,
@@ -445,8 +444,6 @@ export class RedisAdapter implements Adapter {
       payload: JSON.stringify(config.payload),
       timezone: config.timezone,
       status: 'active',
-      run_count: existingRunCount ?? '0',
-      created_at: existingCreatedAt ?? now.toString(),
     }
 
     if (config.cronExpression !== undefined) scheduleData.cron_expression = config.cronExpression
@@ -455,13 +452,16 @@ export class RedisAdapter implements Adapter {
     if (config.to !== undefined) scheduleData.to_date = config.to.getTime().toString()
     if (config.limit !== undefined) scheduleData.run_limit = config.limit.toString()
 
-    // Upsert schedule and clear stale optional fields from previous config.
-    await this.#connection
-      .multi()
-      .hdel(scheduleKey, 'cron_expression', 'every_ms', 'from_date', 'to_date', 'run_limit')
-      .hset(scheduleKey, scheduleData)
-      .sadd(schedulesIndexKey, id)
-      .exec()
+    await this.#connection.eval(
+      UPSERT_SCHEDULE_SCRIPT,
+      3,
+      scheduleKey,
+      schedulesIndexKey,
+      schedulesDueKey,
+      id,
+      now.toString(),
+      JSON.stringify(scheduleData)
+    )
 
     return id
   }
@@ -537,24 +537,42 @@ export class RedisAdapter implements Adapter {
     }
     if (updates.runCount !== undefined) data.run_count = updates.runCount.toString()
 
-    if (Object.keys(data).length > 0) {
-      await this.#connection.hset(scheduleKey, data)
-    }
+    if (Object.keys(data).length === 0) return
+
+    await this.#connection.eval(
+      UPDATE_SCHEDULE_SCRIPT,
+      2,
+      scheduleKey,
+      schedulesDueKey,
+      id,
+      JSON.stringify(data)
+    )
   }
 
   async deleteSchedule(id: string): Promise<void> {
     const scheduleKey = `${schedulesKey}::${id}`
-    await this.#connection.multi().del(scheduleKey).srem(schedulesIndexKey, id).exec()
+    await this.#connection
+      .multi()
+      .del(scheduleKey)
+      .srem(schedulesIndexKey, id)
+      .zrem(schedulesDueKey, id)
+      .exec()
+  }
+
+  async migrate(): Promise<void> {
+    await this.backfillDueIndex()
   }
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
     const now = Date.now()
+    const claimToken = randomUUID()
     const result = await this.#connection.eval(
       CLAIM_SCHEDULE_SCRIPT,
       2,
-      schedulesIndexKey,
+      schedulesDueKey,
       `${schedulesKey}::`,
-      now.toString()
+      now.toString(),
+      claimToken
     )
 
     if (!result) {
@@ -574,7 +592,6 @@ export class RedisAdapter implements Adapter {
       })
       const nextRun = cron.next().toDate().getTime()
 
-      // Check limits before updating
       const runCount = Number.parseInt(data.run_count || '0', 10) + 1
       const runLimit = data.run_limit ? Number.parseInt(data.run_limit, 10) : null
       const toDate = data.to_date ? Number.parseInt(data.to_date, 10) : null
@@ -587,14 +604,30 @@ export class RedisAdapter implements Adapter {
         newNextRunAt = ''
       }
 
-      await this.#connection.hset(
+      await this.#connection.eval(
+        FINALIZE_CRON_SCHEDULE_SCRIPT,
+        2,
         `${schedulesKey}::${data.id}`,
-        'next_run_at',
+        schedulesDueKey,
+        data.id,
+        data.cron_expression,
+        data.config_revision || '',
+        claimToken,
         newNextRunAt.toString()
       )
     }
 
     return this.#hashToScheduleData(data)
+  }
+
+  async backfillDueIndex(): Promise<number> {
+    return (await this.#connection.eval(
+      BACKFILL_SCHEDULE_DUE_INDEX_SCRIPT,
+      3,
+      schedulesIndexKey,
+      schedulesDueKey,
+      `${schedulesKey}::`
+    )) as number
   }
 
   #hashToScheduleData(data: Record<string, string>): ScheduleData {

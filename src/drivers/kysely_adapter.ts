@@ -122,6 +122,8 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     // The Kysely instance is always owned by the application.
   }
 
+  async migrate(): Promise<void> {}
+
   async pop(): Promise<AcquiredJob | null> {
     return this.popFrom('default')
   }

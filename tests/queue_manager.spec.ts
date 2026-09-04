@@ -263,6 +263,7 @@ test.group('QueueManager', () => {
       destroy: async () => {
         destroyedCount++
       },
+      migrate: async () => {},
       upsertSchedule: async () => 'schedule-id',
       createSchedule: async () => 'schedule-id',
       getSchedule: async () => null,
@@ -330,6 +331,7 @@ test.group('QueueManager', () => {
       size: async () => 0,
       sizeOf: async () => 0,
       destroy: async () => {},
+      migrate: async () => {},
       upsertSchedule: async () => 'schedule-id',
       createSchedule: async () => 'schedule-id',
       getSchedule: async () => null,
