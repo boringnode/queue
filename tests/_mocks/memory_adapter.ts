@@ -312,6 +312,10 @@ export class MemoryAdapter implements Adapter {
     return Promise.resolve()
   }
 
+  migrate(): Promise<void> {
+    return Promise.resolve()
+  }
+
   async upsertSchedule(config: ScheduleConfig): Promise<string> {
     const id = config.id ?? randomUUID()
     const existing = this.#schedules.get(id)

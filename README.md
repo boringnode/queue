@@ -334,6 +334,26 @@ const connection = new Redis({ host: 'localhost' })
 const adapter = redis(connection)
 ```
 
+#### Migrating Redis schedules after an upgrade
+
+The Redis adapter uses a `schedules::due` sorted-set index to find due schedules. When upgrading
+from a version that predates this index, run the adapter migration once during deployment, before
+starting any workers:
+
+```typescript
+import { QueueManager, Worker } from '@boringnode/queue'
+
+await QueueManager.init(config)
+await QueueManager.use('redis').migrate()
+
+const worker = new Worker(config)
+await worker.start(['default'])
+```
+
+The migration is idempotent and rebuilds the derived index from the canonical schedule hashes.
+Existing Redis schedules will not fire through the new index until it has run. Do not run the
+`O(number of schedules)` migration from the worker polling loop.
+
 ### Knex (PostgreSQL, MySQL, SQLite)
 
 ```typescript

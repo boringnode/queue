@@ -117,6 +117,10 @@ export class SyncAdapter implements Adapter {
     return Promise.resolve()
   }
 
+  migrate(): Promise<void> {
+    return Promise.resolve()
+  }
+
   upsertSchedule(_config: ScheduleConfig): Promise<string> {
     // No-op: schedules don't make sense for sync adapter
     // Return a fake ID so code doesn't break in dev

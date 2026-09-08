@@ -224,6 +224,16 @@ export interface Adapter {
   destroy(): Promise<void>
 
   /**
+   * Run adapter-specific migrations needed after a major version upgrade.
+   *
+   * This method is idempotent — it is always safe to call multiple times.
+   * Adapters that have no pending migrations return immediately.
+   *
+   * Call this once during your deployment process before starting workers.
+   */
+  migrate(): Promise<void>
+
+  /**
    * Create or update a schedule.
    *
    * If a schedule with the given id exists, it will be updated (upsert).

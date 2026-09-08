@@ -88,6 +88,8 @@ export class KnexAdapter implements Adapter {
     }
   }
 
+  async migrate(): Promise<void> {}
+
   async pop(): Promise<AcquiredJob | null> {
     return this.popFrom('default')
   }
