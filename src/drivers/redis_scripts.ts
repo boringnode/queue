@@ -600,14 +600,13 @@ ${SCHEDULE_DUE_INDEX_LUA}
     return 0
   end
 
-  local status = redis.call('HGET', schedule_key, 'status')
   local current_next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
   local cron_expression = redis.call('HGET', schedule_key, 'cron_expression')
   local config_revision = redis.call('HGET', schedule_key, 'config_revision') or ''
   local claim_token = redis.call('HGET', schedule_key, 'claim_token') or ''
 
-  if status ~= 'active'
-    or current_next_run_at ~= ''
+  -- Preserve the next run while paused; index synchronization excludes it until resume.
+  if current_next_run_at ~= ''
     or cron_expression ~= expected_cron_expression
     or config_revision ~= expected_config_revision
     or claim_token ~= expected_claim_token then

@@ -1047,6 +1047,25 @@ test.group('Adapter | Redis', (group) => {
         assert.isNull(await adapter.getSchedule(id))
       }
       assert.isNull(await connection.zscore('schedules::due', id))
+
+      if (mutation === 'pause') {
+        const schedule = await adapter.getSchedule(id)
+        assert.isNotNull(schedule!.nextRunAt)
+
+        await secondAdapter.updateSchedule(id, { status: 'active' })
+        assert.equal(
+          Number(await connection.zscore('schedules::due', id)),
+          schedule!.nextRunAt!.getTime()
+        )
+
+        const originalNow = Date.now
+        Date.now = () => schedule!.nextRunAt!.getTime()
+        try {
+          assert.equal((await adapter.claimDueSchedule())?.id, id)
+        } finally {
+          Date.now = originalNow
+        }
+      }
     }
   })
 
