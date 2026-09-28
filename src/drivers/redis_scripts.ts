@@ -635,16 +635,81 @@ ${SCHEDULE_DUE_INDEX_LUA}
 `
 
 /**
- * Atomically rebuilds the derived due index from canonical schedule hashes.
+ * Atomically migrates schedule storage to the current layout.
+ *
+ * 1. Moves schedule hashes from `schedules::<id>` (0.7 and earlier) to
+ *    `schedules::data::<id>`. A hash already stored at the new key is kept and
+ *    the legacy copy is dropped.
+ * 2. Rebuilds the derived due index from the canonical schedule hashes.
+ *
+ * Legacy keys can overlap new ones: the 0.7 hash of the id `data::x` is stored
+ * at the new key of the id `x`. A key is treated as legacy only when its `id`
+ * field matches, and every legacy hash is removed before any is written back.
+ * The move also runs before the index rebuild because a 0.7 schedule with the
+ * id `due` is stored at the due index key.
+ *
+ * Every destination is validated before anything changes. A destination that
+ * holds anything other than this schedule, such as the `next_run_at`-only hash
+ * a 0.7 cron finalization recreates after a delete, aborts the migration.
+ *
  * This is an explicit O(N) migration and blocks concurrent Redis commands
  * until the complete index reflects one consistent point in time.
+ * Returns the number of indexed schedules.
  */
-export const BACKFILL_SCHEDULE_DUE_INDEX_SCRIPT = `
+export const MIGRATE_SCHEDULES_SCRIPT = `
   local schedules_index_key = KEYS[1]
   local due_key = KEYS[2]
   local schedule_key_prefix = KEYS[3]
+  local legacy_schedule_key_prefix = KEYS[4]
   local ids = redis.call('SMEMBERS', schedules_index_key)
   local count = 0
+
+  local legacy_schedules = {}
+  local legacy_keys = {}
+
+  for i = 1, #ids do
+    local id = ids[i]
+    local legacy_key = legacy_schedule_key_prefix .. id
+
+    if redis.call('TYPE', legacy_key).ok == 'hash'
+      and redis.call('HGET', legacy_key, 'id') == id then
+      legacy_schedules[#legacy_schedules + 1] = {
+        id = id,
+        legacy_key = legacy_key,
+        schedule_key = schedule_key_prefix .. id,
+        fields = redis.call('HGETALL', legacy_key),
+      }
+      legacy_keys[legacy_key] = true
+    end
+  end
+
+  for i = 1, #legacy_schedules do
+    local schedule = legacy_schedules[i]
+    local schedule_key = schedule.schedule_key
+
+    -- A destination freed by this migration is not a conflict.
+    if not legacy_keys[schedule_key] and redis.call('EXISTS', schedule_key) == 1 then
+      if redis.call('TYPE', schedule_key).ok ~= 'hash'
+        or redis.call('HGET', schedule_key, 'id') ~= schedule.id then
+        return redis.error_reply(
+          'Cannot migrate schedule "' .. schedule.id .. '": ' .. schedule_key ..
+          ' already exists and does not belong to it. Remove or rename that key, then run migrate() again.'
+        )
+      end
+      schedule.already_migrated = true
+    end
+  end
+
+  for i = 1, #legacy_schedules do
+    redis.call('DEL', legacy_schedules[i].legacy_key)
+  end
+
+  for i = 1, #legacy_schedules do
+    local schedule = legacy_schedules[i]
+    if not schedule.already_migrated then
+      redis.call('HSET', schedule.schedule_key, unpack(schedule.fields))
+    end
+  end
 
   redis.call('DEL', due_key)
 
@@ -674,7 +739,7 @@ export const BACKFILL_SCHEDULE_DUE_INDEX_SCRIPT = `
  * sight so subsequent calls skip them.
  *
  * KEYS[1] = schedules::due (the ZSET)
- * KEYS[2] = schedule key prefix (e.g. "schedules::")
+ * KEYS[2] = schedule key prefix (e.g. "schedules::data::")
  * ARGV[1] = now (epoch milliseconds)
  */
 export const CLAIM_SCHEDULE_SCRIPT = `

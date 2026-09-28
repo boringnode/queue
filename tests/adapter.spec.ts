@@ -160,7 +160,7 @@ test.group('Adapter | Redis', (group) => {
       },
     })
 
-    const scheduleExists = await connection.exists(`schedules::${id}`)
+    const scheduleExists = await connection.exists(`schedules::data::${id}`)
     const indexContains = await connection.sismember('schedules::index', id)
 
     assert.equal(scheduleExists, 0)
@@ -666,7 +666,134 @@ test.group('Adapter | Redis', (group) => {
     assert.equal(afterBackfill!.id, id)
   })
 
-  test('backfillDueIndex is idempotent', async ({ assert }) => {
+  test('migrate moves 0.7 schedule hashes, including one whose id is due', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+    const pastRunAt = (Date.now() - 5_000).toString()
+    const legacySchedule = (id: string) => ({
+      id,
+      name: 'LegacyJob',
+      payload: JSON.stringify({ id }),
+      status: 'active',
+      every_ms: '60000',
+      timezone: 'UTC',
+      next_run_at: pastRunAt,
+      run_count: '0',
+      created_at: Date.now().toString(),
+    })
+
+    // In 0.7, the hash of a schedule with the id `due` lives at the due index key.
+    await connection
+      .multi()
+      .hset('schedules::due', legacySchedule('due'))
+      .hset('schedules::legacy', legacySchedule('legacy'))
+      .sadd('schedules::index', 'due', 'legacy')
+      .exec()
+
+    await adapter.migrate()
+
+    assert.equal(await connection.exists('schedules::legacy'), 0)
+    assert.equal(await connection.type('schedules::due'), 'zset')
+    assert.deepEqual((await adapter.getSchedule('due'))!.payload, { id: 'due' })
+    assert.deepEqual((await adapter.getSchedule('legacy'))!.payload, { id: 'legacy' })
+    assert.sameMembers(
+      [(await adapter.claimDueSchedule())!.id, (await adapter.claimDueSchedule())!.id],
+      ['due', 'legacy']
+    )
+  })
+
+  test('migrate keeps the current hash when a legacy copy also exists', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+    const id = 'migrated-twice'
+
+    await adapter.upsertSchedule({
+      id,
+      name: 'CurrentJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+    await connection.hset(`schedules::${id}`, { id, name: 'LegacyJob', status: 'active' })
+
+    await adapter.migrate()
+
+    assert.equal(await connection.exists(`schedules::${id}`), 0)
+    assert.equal((await adapter.getSchedule(id))!.name, 'CurrentJob')
+  })
+
+  test('migrate handles a 0.7 id whose legacy key is the new key of another id', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+
+    // The 0.7 hash of `data::x` is stored at `schedules::data::x`, the new key of `x`.
+    await connection
+      .multi()
+      .hset('schedules::x', { id: 'x', name: 'XJob', status: 'active' })
+      .hset('schedules::data::x', { id: 'data::x', name: 'DataXJob', status: 'active' })
+      .sadd('schedules::index', 'x', 'data::x')
+      .exec()
+
+    await adapter.migrate()
+
+    assert.equal((await adapter.getSchedule('x'))!.name, 'XJob')
+    assert.equal((await adapter.getSchedule('data::x'))!.name, 'DataXJob')
+  })
+
+  test('migrate aborts without changes when a destination belongs to another key', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+
+    // 0.7 cron finalization recreates `schedules::data::foo` with only `next_run_at` when
+    // the schedule `data::foo` is deleted while it is being finalized. That key is not
+    // indexed and is the new key of the schedule `foo`.
+    await connection
+      .multi()
+      .hset('schedules::foo', { id: 'foo', name: 'FooJob', status: 'active' })
+      .hset('schedules::data::foo', { next_run_at: Date.now().toString() })
+      .sadd('schedules::index', 'foo')
+      .exec()
+
+    await assert.rejects(() => adapter.migrate(), /Cannot migrate schedule "foo"/)
+    assert.equal(await connection.hget('schedules::foo', 'name'), 'FooJob')
+
+    await connection.del('schedules::data::foo')
+    await adapter.migrate()
+
+    assert.equal((await adapter.getSchedule('foo'))!.name, 'FooJob')
+  })
+
+  test('schedules named after index keys do not collide with them', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+    const ids = ['due', 'index', 'regular']
+    const dueAt = new Date(Date.now() - 1_000)
+
+    for (const id of ids) {
+      await adapter.upsertSchedule({
+        id,
+        name: 'TestJob',
+        payload: { id },
+        everyMs: 60_000,
+        timezone: 'UTC',
+      })
+      await adapter.updateSchedule(id, { nextRunAt: dueAt })
+    }
+
+    assert.sameMembers(
+      (await adapter.listSchedules()).map((schedule) => schedule.id),
+      ids
+    )
+
+    const claimed: string[] = []
+    for (const _ of ids) {
+      claimed.push((await adapter.claimDueSchedule())!.id)
+    }
+
+    assert.sameMembers(claimed, ids)
+    assert.deepEqual((await adapter.getSchedule('index'))!.payload, { id: 'index' })
+  })
+
+  test('migrate is idempotent', async ({ assert }) => {
     const adapter = new RedisAdapter(connection)
     const nextRunAt = Date.now() + 30_000
 
@@ -687,23 +814,23 @@ test.group('Adapter | Redis', (group) => {
       .zadd('schedules::due', Date.now() - 10_000, 'orphaned-schedule')
       .exec()
 
-    await adapter.backfillDueIndex()
+    await adapter.migrate()
     const firstMembers = await connection.zrange('schedules::due', 0, -1, 'WITHSCORES')
 
-    await adapter.backfillDueIndex()
+    await adapter.migrate()
     const secondMembers = await connection.zrange('schedules::due', 0, -1, 'WITHSCORES')
 
     assert.deepEqual(firstMembers, ['idempotent-schedule', nextRunAt.toString()])
     assert.deepEqual(secondMembers, firstMembers)
   })
 
-  test('backfillDueIndex rebuilds the index in one atomic Redis command', async ({ assert }) => {
+  test('migrate runs in one atomic Redis command', async ({ assert }) => {
     const adapter = new RedisAdapter(connection)
     const id = 'atomic-backfill-schedule'
 
     await connection
       .multi()
-      .hset(`schedules::${id}`, {
+      .hset(`schedules::data::${id}`, {
         id,
         status: 'active',
         next_run_at: (Date.now() + 30_000).toString(),
@@ -713,7 +840,7 @@ test.group('Adapter | Redis', (group) => {
 
     const { writes } = await withRedisWriteSpy({
       connection,
-      run: () => adapter.backfillDueIndex(),
+      run: () => adapter.migrate(),
     })
 
     assert.equal(writes, 1)
@@ -741,7 +868,7 @@ test.group('Adapter | Redis', (group) => {
       const nextRunAt = Date.now() + 30_000 + i
 
       await Promise.all([
-        adapter.backfillDueIndex(),
+        adapter.migrate(),
         secondAdapter.upsertSchedule({
           id,
           name: 'MigrationWriteJob',
@@ -751,7 +878,7 @@ test.group('Adapter | Redis', (group) => {
         }),
       ])
       await Promise.all([
-        adapter.backfillDueIndex(),
+        adapter.migrate(),
         secondAdapter.updateSchedule(id, { nextRunAt: new Date(nextRunAt) }),
       ])
 
@@ -1347,7 +1474,7 @@ test.group('Adapter | Redis', (group) => {
 
     await connection
       .multi()
-      .hset(`schedules::${malformedId}`, {
+      .hset(`schedules::data::${malformedId}`, {
         id: malformedId,
         status: 'active',
         next_run_at: 'not-a-number',

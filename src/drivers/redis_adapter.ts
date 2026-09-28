@@ -16,11 +16,11 @@ import { resolveRetention } from '../utils.js'
 import { encodeRedisJobPayloadOverlay, hydrateRedisJob } from './redis_job_storage.js'
 import {
   ACQUIRE_JOB_SCRIPT,
-  BACKFILL_SCHEDULE_DUE_INDEX_SCRIPT,
   CLAIM_SCHEDULE_SCRIPT,
   FINALIZE_JOB_SCRIPT,
   FINALIZE_CRON_SCHEDULE_SCRIPT,
   GET_JOB_SCRIPT,
+  MIGRATE_SCHEDULES_SCRIPT,
   PUSH_DEDUP_JOB_SCRIPT,
   PUSH_DELAYED_JOB_SCRIPT,
   PUSH_JOB_SCRIPT,
@@ -33,9 +33,11 @@ import {
 } from './redis_scripts.js'
 
 const redisKey = 'jobs'
-const schedulesKey = 'schedules'
 const schedulesIndexKey = 'schedules::index'
 const schedulesDueKey = 'schedules::due'
+// Schedule hashes live one level below the index keys so no schedule id can collide with them.
+const scheduleDataPrefix = 'schedules::data::'
+const legacyScheduleDataPrefix = 'schedules::'
 type RedisConfig = Redis | RedisOptions
 
 function isRedisConnection(config?: RedisConfig): config is Redis {
@@ -436,7 +438,7 @@ export class RedisAdapter implements Adapter {
   async upsertSchedule(config: ScheduleConfig): Promise<string> {
     const id = config.id ?? randomUUID()
     const now = Date.now()
-    const scheduleKey = `${schedulesKey}::${id}`
+    const scheduleKey = `${scheduleDataPrefix}${id}`
 
     const scheduleData: Record<string, string> = {
       id,
@@ -474,7 +476,7 @@ export class RedisAdapter implements Adapter {
   }
 
   async getSchedule(id: string): Promise<ScheduleData | null> {
-    const scheduleKey = `${schedulesKey}::${id}`
+    const scheduleKey = `${scheduleDataPrefix}${id}`
     const data = await this.#connection.hgetall(scheduleKey)
 
     if (!data || Object.keys(data).length === 0) {
@@ -493,7 +495,7 @@ export class RedisAdapter implements Adapter {
     const pipeline = this.#connection.pipeline()
 
     for (const id of ids) {
-      pipeline.hgetall(`${schedulesKey}::${id}`)
+      pipeline.hgetall(`${scheduleDataPrefix}${id}`)
     }
 
     const results = await pipeline.exec()
@@ -525,7 +527,7 @@ export class RedisAdapter implements Adapter {
     id: string,
     updates: Partial<Pick<ScheduleData, 'status' | 'nextRunAt' | 'lastRunAt' | 'runCount'>>
   ): Promise<void> {
-    const scheduleKey = `${schedulesKey}::${id}`
+    const scheduleKey = `${scheduleDataPrefix}${id}`
     const data: Record<string, string> = {}
 
     if (updates.status !== undefined) data.status = updates.status
@@ -550,7 +552,7 @@ export class RedisAdapter implements Adapter {
   }
 
   async deleteSchedule(id: string): Promise<void> {
-    const scheduleKey = `${schedulesKey}::${id}`
+    const scheduleKey = `${scheduleDataPrefix}${id}`
     await this.#connection
       .multi()
       .del(scheduleKey)
@@ -560,7 +562,14 @@ export class RedisAdapter implements Adapter {
   }
 
   async migrate(): Promise<void> {
-    await this.backfillDueIndex()
+    await this.#connection.eval(
+      MIGRATE_SCHEDULES_SCRIPT,
+      4,
+      schedulesIndexKey,
+      schedulesDueKey,
+      scheduleDataPrefix,
+      legacyScheduleDataPrefix
+    )
   }
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
@@ -570,7 +579,7 @@ export class RedisAdapter implements Adapter {
       CLAIM_SCHEDULE_SCRIPT,
       2,
       schedulesDueKey,
-      `${schedulesKey}::`,
+      scheduleDataPrefix,
       now.toString(),
       claimToken
     )
@@ -607,7 +616,7 @@ export class RedisAdapter implements Adapter {
       await this.#connection.eval(
         FINALIZE_CRON_SCHEDULE_SCRIPT,
         2,
-        `${schedulesKey}::${data.id}`,
+        `${scheduleDataPrefix}${data.id}`,
         schedulesDueKey,
         data.id,
         data.cron_expression,
@@ -618,16 +627,6 @@ export class RedisAdapter implements Adapter {
     }
 
     return this.#hashToScheduleData(data)
-  }
-
-  async backfillDueIndex(): Promise<number> {
-    return (await this.#connection.eval(
-      BACKFILL_SCHEDULE_DUE_INDEX_SCRIPT,
-      3,
-      schedulesIndexKey,
-      schedulesDueKey,
-      `${schedulesKey}::`
-    )) as number
   }
 
   #hashToScheduleData(data: Record<string, string>): ScheduleData {

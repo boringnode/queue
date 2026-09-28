@@ -336,9 +336,9 @@ const adapter = redis(connection)
 
 #### Migrating Redis schedules after an upgrade
 
-The Redis adapter uses a `schedules::due` sorted-set index to find due schedules. When upgrading
-from a version that predates this index, run the adapter migration once during deployment, before
-starting any workers:
+The Redis adapter stores each schedule at `schedules::data::<id>` and uses a `schedules::due`
+sorted-set index to find due schedules. When upgrading from 0.7 or earlier, stop every process that
+runs the previous version, then run the adapter migration once, before starting any workers:
 
 ```typescript
 import { QueueManager, Worker } from '@boringnode/queue'
@@ -350,9 +350,17 @@ const worker = new Worker(config)
 await worker.start(['default'])
 ```
 
-The migration is idempotent and rebuilds the derived index from the canonical schedule hashes.
-Existing Redis schedules will not fire through the new index until it has run. Do not run the
-`O(number of schedules)` migration from the worker polling loop.
+The migration is idempotent. It moves schedules from their 0.7 location (`schedules::<id>`) and
+rebuilds the derived index from the canonical schedule hashes. Existing Redis schedules are not
+visible to the new version until it has run. Do not run the `O(number of schedules)` migration from
+the worker polling loop.
+
+Processes still running 0.7 do not see migrated schedules, and the migration cannot be rolled back
+by downgrading. Do not mix 0.7 and newer processes during the deployment.
+
+If a destination key already holds something other than the schedule being moved, the migration
+stops without changing anything and its error names that key. Remove or rename the key, then run the
+migration again.
 
 ### Knex (PostgreSQL, MySQL, SQLite)
 
