@@ -314,6 +314,32 @@ test.group('JobExecutionRuntime', () => {
     })
   })
 
+  test('fails a Job with an invalid timeout without running or retrying it', async ({ assert }) => {
+    for (const timeout of ['30d', 0.5, 1.5]) {
+      let executed = false
+
+      class InvalidTimeoutJob extends Job {
+        static options = { timeout, maxRetries: 3, removeOnFail: false }
+
+        async execute() {
+          executed = true
+        }
+      }
+
+      const runtime = new JobExecutionRuntime({
+        resolveJob: async () => InvalidTimeoutJob,
+        configResolver: new QueueConfigResolver({}),
+      })
+      const outcome = await runtime.execute(acquiredJob(), 'default')
+
+      assert.equal(outcome.type, 'initialization-failed', `timeout ${timeout}`)
+      if (outcome.type !== 'initialization-failed') return
+      assert.instanceOf(outcome.error, errors.E_INVALID_TIMEOUT)
+      assert.isFalse(outcome.removeOnFail)
+      assert.isFalse(executed)
+    }
+  })
+
   test('handles a synchronous throw from a Job with a timeout', async ({ assert, cleanup }) => {
     const unhandled: unknown[] = []
     const onUnhandled = (reason: unknown) => unhandled.push(reason)

@@ -5,6 +5,7 @@ import { consoleLogger, type Logger } from './logger.js'
 import { FakeAdapter } from './drivers/fake_adapter.js'
 import { QueueConfigResolver } from './queue_config_resolver.js'
 import { JobExecutionRuntime } from './job_runtime.js'
+import { parseTimeout } from './utils.js'
 import type { Adapter } from './contracts/adapter.js'
 import type { AdapterFactory, JobFactory, QueueManagerConfig } from './types/main.js'
 
@@ -422,6 +423,13 @@ class QueueManagerSingleton {
       if (typeof factory !== 'function') {
         throw new errors.E_CONFIGURATION_ERROR([`Adapter "${name}" must be a factory function`])
       }
+    }
+
+    // Fail at startup rather than when the first job runs.
+    parseTimeout(config.worker?.timeout)
+    parseTimeout(config.defaultJobOptions?.timeout)
+    for (const queueConfig of Object.values(config.queues ?? {})) {
+      parseTimeout(queueConfig.defaultJobOptions?.timeout)
     }
   }
 

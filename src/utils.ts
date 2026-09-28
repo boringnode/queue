@@ -57,6 +57,28 @@ export function parse(duration: Duration): number {
   return milliseconds
 }
 
+/** Longest delay Node timers support: 2^31 - 1 ms, about 24.8 days. */
+const MAX_TIMEOUT = 2_147_483_647
+
+/**
+ * Parse a job timeout into milliseconds. `undefined` and 0 mean no timeout.
+ * Throws for anything `AbortSignal.timeout()` would reject or mishandle: a
+ * fraction of a millisecond, a negative timeout, or one longer than Node
+ * timers support (which would fire after 1 ms).
+ */
+export function parseTimeout(timeout: Duration | undefined): number | undefined {
+  if (timeout === undefined) return undefined
+
+  const milliseconds = parse(timeout)
+  if (milliseconds === 0) return undefined
+
+  if (!Number.isInteger(milliseconds) || milliseconds < 1 || milliseconds > MAX_TIMEOUT) {
+    throw new errors.E_INVALID_TIMEOUT([String(timeout)])
+  }
+
+  return milliseconds
+}
+
 /**
  * Calculate the score for job ordering in the queue.
  * Lower scores are processed first.

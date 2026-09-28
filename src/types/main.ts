@@ -281,6 +281,9 @@ export interface JobOptions {
   /**
    * Maximum execution time before timeout.
    *
+   * `0` disables the timeout, including one set by default. Must not exceed
+   * 2^31 - 1 ms (about 24.8 days).
+   *
    * @default undefined (no timeout)
    */
   timeout?: Duration
@@ -489,7 +492,8 @@ export interface WorkerConfig {
 
   /**
    * Maximum duration a job can run before being timed out.
-   * Can be overridden per job via JobOptions.timeout.
+   * Can be overridden per job via JobOptions.timeout. `0` means no timeout.
+   * Must not exceed 2^31 - 1 ms (about 24.8 days).
    * @default undefined (no timeout)
    */
   timeout?: Duration

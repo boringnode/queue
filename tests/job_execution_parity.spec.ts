@@ -148,7 +148,7 @@ test.group('Job execution parity', () => {
     let path: ExecutionPath = 'sync'
 
     class TimedOutJob extends Job {
-      static options = { timeout: 0, failOnTimeout: true, maxRetries: 2 }
+      static options = { timeout: 1, failOnTimeout: true, maxRetries: 2 }
 
       async execute() {
         attempts[path]++

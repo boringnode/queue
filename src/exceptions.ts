@@ -50,6 +50,12 @@ export const E_JOB_TIMEOUT = createError<[jobName: string, timeout: number]>(
   'E_JOB_TIMEOUT'
 )
 
+export const E_INVALID_TIMEOUT = createError<[timeout: string]>(
+  'Invalid timeout "%s": use 0 for no timeout, or a whole number of milliseconds from 1 to 2147483647 (about 24.8 days)',
+  'E_INVALID_TIMEOUT',
+  500
+)
+
 export const E_QUEUE_NOT_INITIALIZED = createError(
   'QueueManager is not initialized. Call QueueManager.init() before using it.',
   'E_QUEUE_NOT_INITIALIZED',

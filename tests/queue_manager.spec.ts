@@ -8,6 +8,43 @@ import SendEmailJob from '../examples/jobs/send_email_job.js'
 import type { Adapter } from '../src/contracts/adapter.js'
 
 test.group('QueueManager', () => {
+  test('should reject an invalid timeout in the config', async ({ assert }) => {
+    const base = { default: 'sync', adapters: { sync: sync() } }
+
+    await assert.rejects(
+      () => QueueManager.init({ ...base, worker: { timeout: '30d' } }),
+      errors.E_INVALID_TIMEOUT
+    )
+    await assert.rejects(
+      () => QueueManager.init({ ...base, defaultJobOptions: { timeout: -1 } }),
+      errors.E_INVALID_TIMEOUT
+    )
+    await assert.rejects(
+      () => QueueManager.init({ ...base, worker: { timeout: 0.5 } }),
+      errors.E_INVALID_TIMEOUT
+    )
+    await assert.rejects(
+      () => QueueManager.init({ ...base, defaultJobOptions: { timeout: 1.5 } }),
+      errors.E_INVALID_TIMEOUT
+    )
+    await assert.rejects(
+      () =>
+        QueueManager.init({
+          ...base,
+          queues: { reports: { defaultJobOptions: { timeout: 1.5 } } },
+        }),
+      errors.E_INVALID_TIMEOUT
+    )
+    await assert.rejects(
+      () =>
+        QueueManager.init({
+          ...base,
+          queues: { reports: { defaultJobOptions: { timeout: '60d' } } },
+        }),
+      errors.E_INVALID_TIMEOUT
+    )
+  })
+
   test('should validate adapter presence', async ({ assert }) => {
     assert.plan(2)
 

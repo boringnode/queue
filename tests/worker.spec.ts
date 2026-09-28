@@ -537,21 +537,23 @@ test.group('Worker', () => {
     assert.isBelow(failedAt - startTime, 150)
   })
 
-  test('should apply timeout when timeout is set to 0', async ({ assert, cleanup }) => {
-    assert.plan(2)
+  test('should not time out a job whose timeout is 0, even with a default timeout', async ({
+    assert,
+    cleanup,
+  }) => {
+    let completed = false
+    let failedError: Error | undefined
 
-    let failedAt = 0
-
-    class ZeroTimeoutJob extends Job {
+    class NoTimeoutJob extends Job {
       static options = { timeout: 0 }
 
       async execute() {
-        await setTimeout(200)
+        await setTimeout(100)
+        completed = true
       }
 
       async failed(error: Error) {
-        failedAt = Date.now()
-        assert.instanceOf(error, errors.E_JOB_TIMEOUT)
+        failedError = error
       }
     }
 
@@ -560,9 +562,11 @@ test.group('Worker', () => {
     const localConfig = {
       default: 'memory',
       adapters: { memory: () => sharedAdapter },
+      worker: { timeout: 20 },
+      defaultJobOptions: { timeout: 20 },
     }
 
-    Locator.register('ZeroTimeoutJob', ZeroTimeoutJob)
+    Locator.register('NoTimeoutJob', NoTimeoutJob)
 
     const worker = new Worker(localConfig)
 
@@ -573,19 +577,17 @@ test.group('Worker', () => {
 
     await sharedAdapter.push({
       id: 'timeout-zero-job',
-      name: 'ZeroTimeoutJob',
+      name: 'NoTimeoutJob',
       payload: {},
       attempts: 0,
       priority: 0,
     })
 
-    const startTime = Date.now()
-
     await worker.processCycle(['default']) // started
-    await worker.processCycle(['default']) // completed (timeout)
+    await worker.processCycle(['default']) // completed
 
-    // The timeout fires before the handler returns; the cycle ends once it has returned.
-    assert.isBelow(failedAt - startTime, 150)
+    assert.isTrue(completed)
+    assert.isUndefined(failedError)
   })
 
   test('should remove timeout abort listener when job completes before timeout', async ({

@@ -14,7 +14,7 @@ import type {
   RetryConfig,
 } from './types/main.js'
 import type { JobExecuteMessage } from './types/tracing_channels.js'
-import { parse } from './utils.js'
+import { parseTimeout } from './utils.js'
 
 type PermanentFailureReason = 'timeout' | 'no-retries' | 'max-attempts' | 'stalled'
 
@@ -157,13 +157,16 @@ export class JobExecutionRuntime {
     executeMessage: JobExecuteMessage
   ): Promise<JobExecutionOutcome> {
     let instance: Job
-    let options: JobOptions
+    let options: JobOptions | undefined
+    let timeout: number | undefined
 
     try {
       ;({ instance, options } = await this.#instantiate(job))
+      // An invalid Job.options.timeout fails the Job without retrying it.
+      timeout = parseTimeout(this.#configResolver.resolveJobOptions(queue, options).timeout)
     } catch (error) {
       const initializationError = error as Error
-      const retention = this.#configResolver.resolveJobOptions(queue)
+      const retention = this.#configResolver.resolveJobOptions(queue, options)
 
       executeMessage.status = 'failed'
       executeMessage.error = initializationError
@@ -181,7 +184,7 @@ export class JobExecutionRuntime {
     const timedOut: TimedOutExecution = {}
 
     try {
-      await this.#executeJob(instance, job.payload, context, resolvedOptions, timedOut)
+      await this.#executeJob(instance, job.payload, context, timeout, timedOut)
       executeMessage.status = 'completed'
 
       return { type: 'completed', removeOnComplete: resolvedOptions.removeOnComplete }
@@ -240,17 +243,14 @@ export class JobExecutionRuntime {
     instance: Job,
     payload: unknown,
     context: JobContext,
-    options: ResolvedJobOptions,
+    timeout: number | undefined,
     timedOut: TimedOutExecution
   ): Promise<void> {
-    const configuredTimeout = options.timeout
-
-    if (configuredTimeout === undefined) {
+    if (timeout === undefined) {
       instance.$hydrate(payload, context)
       return instance.execute()
     }
 
-    const timeout = parse(configuredTimeout)
     const signal = AbortSignal.timeout(timeout)
     instance.$hydrate(payload, context, signal)
 
