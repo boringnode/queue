@@ -72,14 +72,14 @@ export class WorkerHeartbeat {
   async #renewActiveJobs(): Promise<void> {
     if (this.#pool.isEmpty()) return
 
-    const jobIdsByQueue = this.#pool.activeJobIdsByQueue()
+    const jobsByQueue = this.#pool.activeJobsByQueue()
 
     for (const queue of this.#queues) {
-      const jobIds = jobIdsByQueue.get(queue)
-      if (!jobIds || jobIds.length === 0) continue
+      const jobs = jobsByQueue.get(queue)
+      if (!jobs || jobs.length === 0) continue
 
       try {
-        await this.#wrapInternal(() => this.#adapter.renewJobs(queue, jobIds))
+        await this.#wrapInternal(() => this.#adapter.renewJobs(queue, jobs))
       } catch (error) {
         debug('worker %s: failed to renew jobs on queue %s: %O', this.#workerId, queue, error)
       }

@@ -790,6 +790,12 @@ because the process crashed. A stalled job goes back to the queue up to `maxStal
 After that, the worker that detects it fails it like any other permanent failure: `failed()`
 receives `E_JOB_STALLED`, and `removeOnFail` decides whether the job is kept in history.
 
+A job can also stall while its execution is still running, for example when a CPU-bound handler
+blocks the event loop longer than `stalledThreshold`. Each acquisition of a job gets its own lease:
+once the job is acquired again, the outcome of the earlier execution is ignored, and only the latest
+execution can complete, fail, or retry the job. The earlier execution still runs to the end, with
+its side effects and hooks, so keep handlers idempotent.
+
 ## Logging
 
 ```typescript

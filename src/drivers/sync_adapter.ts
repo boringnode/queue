@@ -1,6 +1,7 @@
 import { setTimeout as sleep } from 'node:timers/promises'
 import { QueueManager } from '../queue_manager.js'
-import type { Adapter, AcquiredJob, StalledJobsRecovery } from '../contracts/adapter.js'
+import { createLeaseToken } from '../utils.js'
+import type { Adapter, AcquiredJob, JobLease, StalledJobsRecovery } from '../contracts/adapter.js'
 import type {
   JobData,
   JobRetention,
@@ -78,21 +79,21 @@ export class SyncAdapter implements Adapter {
     throw new Error('SyncAdapter does not support pop - jobs are executed immediately on push')
   }
 
-  completeJob(_jobId: string, _queue: string, _removeOnComplete?: JobRetention): Promise<void> {
-    return Promise.resolve()
+  completeJob(_job: JobLease, _queue: string, _removeOnComplete?: JobRetention): Promise<boolean> {
+    return Promise.resolve(false)
   }
 
   failJob(
-    _jobId: string,
+    _job: JobLease,
     _queue: string,
     _error?: Error,
     _removeOnFail?: JobRetention
-  ): Promise<void> {
-    return Promise.resolve()
+  ): Promise<boolean> {
+    return Promise.resolve(false)
   }
 
-  retryJob(_jobId: string, _queue: string, _retryAt?: Date): Promise<void> {
-    return Promise.resolve()
+  retryJob(_job: JobLease, _queue: string, _retryAt?: Date): Promise<boolean> {
+    return Promise.resolve(false)
   }
 
   recoverStalledJobs(
@@ -105,7 +106,7 @@ export class SyncAdapter implements Adapter {
     return Promise.resolve({ recovered: 0, exceeded: [] })
   }
 
-  renewJobs(_queue: string, _jobIds: string[]): Promise<number> {
+  renewJobs(_queue: string, _jobs: JobLease[]): Promise<number> {
     // SyncAdapter executes jobs immediately - there is nothing to renew
     return Promise.resolve(0)
   }
@@ -165,7 +166,12 @@ export class SyncAdapter implements Adapter {
 
     while (true) {
       const now = Date.now()
-      const acquiredJob: AcquiredJob = { ...jobData, attempts, acquiredAt: now }
+      const acquiredJob: AcquiredJob = {
+        ...jobData,
+        attempts,
+        acquiredAt: now,
+        leaseToken: createLeaseToken('sync'),
+      }
       const outcome = await runtime.execute(acquiredJob, queue)
 
       if (outcome.type === 'initialization-failed') {

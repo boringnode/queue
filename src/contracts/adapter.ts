@@ -26,7 +26,19 @@ export interface PushResult {
 export interface AcquiredJob extends JobData {
   /** Timestamp (in ms) when the job was acquired by the worker */
   acquiredAt: number
+
+  /**
+   * Token of this acquisition. The adapter stores it with the active job and
+   * generates a new one each time the job is acquired again. Only the holder
+   * of the current token can renew, complete, fail, or retry the job.
+   */
+  leaseToken: string
 }
+
+/**
+ * The part of an acquired job that identifies its lease.
+ */
+export type JobLease = Pick<AcquiredJob, 'id' | 'leaseToken'>
 
 /**
  * Result of a stalled job recovery pass.
@@ -37,8 +49,8 @@ export interface StalledJobsRecovery {
 
   /**
    * Stalled jobs that exceeded `maxStalledCount`. They stay active, reacquired
-   * by the calling worker (the one set via setWorkerId), which fails them
-   * through the regular failure path.
+   * with a new lease token by the calling worker, which fails them through the
+   * regular failure path.
    */
   exceeded: AcquiredJob[]
 }
@@ -64,7 +76,8 @@ export interface StalledJobsRecovery {
 export interface Adapter {
   /**
    * Set the worker ID for this adapter instance.
-   * Required before calling pop methods when consuming jobs.
+   * Required before calling pop methods when consuming jobs. Lease tokens
+   * start with it, which tells which worker holds an active job.
    *
    * @param workerId - Unique identifier for the worker
    */
@@ -93,8 +106,8 @@ export interface Adapter {
    *
    * Jobs within maxStalledCount are moved back to pending.
    * Jobs exceeding maxStalledCount are not removed: up to `maxExceeded` of
-   * them are reacquired atomically by the calling worker (acquiredAt set to
-   * now) and returned so the worker can fail them. The others are left
+   * them are reacquired atomically by the calling worker (new lease token,
+   * acquiredAt set to now) and returned so the worker can fail them. The others are left
    * untouched, still stalled, for a later recovery. If the worker crashes
    * before failing a returned job, it stalls again and comes back later.
    *
@@ -117,45 +130,59 @@ export interface Adapter {
    * A worker calls this periodically for the jobs it is actively processing
    * so that long-running handlers are not mistaken for stalled jobs and
    * re-delivered while they are still running. Only jobs that are still active
-   * AND still owned by the calling worker (the one set via setWorkerId) are
-   * renewed; jobs that have already been recovered/completed, or have since
-   * been re-acquired by another worker, are skipped. This prevents a slow
-   * worker from resurrecting a job or sabotaging the recovery of the worker
-   * that legitimately owns it now with a late heartbeat.
+   * under the given lease token are renewed; jobs that have already been
+   * recovered/completed, or have since been acquired again, are skipped. This
+   * prevents a slow execution from resurrecting a job or sabotaging the
+   * recovery of the execution that holds it now with a late heartbeat.
    *
    * @param queue - The queue the jobs belong to
-   * @param jobIds - The ids of the jobs currently being processed
+   * @param jobs - The leases of the jobs currently being processed
    * @returns Number of jobs whose timestamp was renewed
    */
-  renewJobs(queue: string, jobIds: string[]): Promise<number>
+  renewJobs(queue: string, jobs: JobLease[]): Promise<number>
 
   /**
    * Mark a job as completed and remove it from the queue.
    *
-   * @param jobId - The job ID to complete
+   * Does nothing if the job is no longer active under `job.leaseToken`: it
+   * was recovered as stalled, then acquired again or finalized.
+   *
+   * @param job - The lease of the job to complete
    * @param queue - The queue the job belongs to
    * @param removeOnComplete - Optional retention policy for completed jobs
+   * @returns False if the lease was lost and nothing changed
    */
-  completeJob(jobId: string, queue: string, removeOnComplete?: JobRetention): Promise<void>
+  completeJob(job: JobLease, queue: string, removeOnComplete?: JobRetention): Promise<boolean>
 
   /**
    * Mark a job as failed permanently and remove it from the queue.
    *
-   * @param jobId - The job ID to fail
+   * Does nothing if the job is no longer active under `job.leaseToken`.
+   *
+   * @param job - The lease of the job to fail
    * @param queue - The queue the job belongs to
    * @param error - Optional error that caused the failure
    * @param removeOnFail - Optional retention policy for failed jobs
+   * @returns False if the lease was lost and nothing changed
    */
-  failJob(jobId: string, queue: string, error?: Error, removeOnFail?: JobRetention): Promise<void>
+  failJob(
+    job: JobLease,
+    queue: string,
+    error?: Error,
+    removeOnFail?: JobRetention
+  ): Promise<boolean>
 
   /**
    * Retry a job by moving it back to pending with incremented attempts.
    *
-   * @param jobId - The job ID to retry
+   * Does nothing if the job is no longer active under `job.leaseToken`.
+   *
+   * @param job - The lease of the job to retry
    * @param queue - The queue the job belongs to
    * @param retryAt - Optional future date to delay the retry
+   * @returns False if the lease was lost and nothing changed
    */
-  retryJob(jobId: string, queue: string, retryAt?: Date): Promise<void>
+  retryJob(job: JobLease, queue: string, retryAt?: Date): Promise<boolean>
 
   /**
    * Get a job record by id.

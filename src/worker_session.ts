@@ -463,23 +463,32 @@ export class WorkerSession {
     outcome: JobExecutionOutcome
   ): Promise<void> {
     if (outcome.type === 'completed') {
-      await this.#wrapInternal(() =>
-        this.#adapter.completeJob(job.id, queue, outcome.removeOnComplete)
+      this.#checkLease(
+        job,
+        await this.#wrapInternal(() =>
+          this.#adapter.completeJob(job, queue, outcome.removeOnComplete)
+        )
       )
       return
     }
 
     if (outcome.type === 'initialization-failed') {
       debug('worker %s: failed to initialize job %s (%s)', this.#workerId, job.id, job.name)
-      await this.#wrapInternal(() =>
-        this.#adapter.failJob(job.id, queue, outcome.error, outcome.removeOnFail)
+      this.#checkLease(
+        job,
+        await this.#wrapInternal(() =>
+          this.#adapter.failJob(job, queue, outcome.error, outcome.removeOnFail)
+        )
       )
       return
     }
 
     if (outcome.type === 'failed') {
-      await this.#wrapInternal(() =>
-        this.#adapter.failJob(job.id, queue, outcome.error, outcome.removeOnFail)
+      this.#checkLease(
+        job,
+        await this.#wrapInternal(() =>
+          this.#adapter.failJob(job, queue, outcome.error, outcome.removeOnFail)
+        )
       )
 
       if (outcome.failedHookError) {
@@ -496,10 +505,28 @@ export class WorkerSession {
         job.id,
         outcome.retryAt.toISOString()
       )
-      await this.#wrapInternal(() => this.#adapter.retryJob(job.id, queue, outcome.retryAt))
+      this.#checkLease(
+        job,
+        await this.#wrapInternal(() => this.#adapter.retryJob(job, queue, outcome.retryAt))
+      )
     } else {
-      await this.#wrapInternal(() => this.#adapter.retryJob(job.id, queue))
+      this.#checkLease(job, await this.#wrapInternal(() => this.#adapter.retryJob(job, queue)))
     }
+  }
+
+  /**
+   * The adapter changes nothing once a job has been recovered as stalled and
+   * acquired again or finalized: the execution that holds it now decides.
+   */
+  #checkLease(job: AcquiredJob, applied: boolean): void {
+    if (applied) return
+
+    debug(
+      'worker %s: job %s (%s) lost its lease before finishing, its outcome is ignored',
+      this.#workerId,
+      job.id,
+      job.name
+    )
   }
 
   async #acquireNextJob(): Promise<{ job: AcquiredJob; queue: string } | null> {

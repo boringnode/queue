@@ -213,7 +213,7 @@ test.group('Adapter | Redis', (group) => {
       assert.equal(second && typeof second === 'object' && second.outcome, 'added')
       assert.equal(await inspectorConnection.get(dedupKey), 'raw-ttl-clean-uuid-2')
 
-      await adapter.completeJob(first!.id, queue, true)
+      await adapter.completeJob(first!, queue, true)
 
       assert.equal(await inspectorConnection.get(dedupKey), 'raw-ttl-clean-uuid-2')
 
@@ -263,7 +263,7 @@ test.group('Adapter | Redis', (group) => {
       const first = await adapter.popFrom(queue)
       assert.equal(first!.id, 'raw-finalize-prune-uuid-1')
 
-      await adapter.completeJob(first!.id, queue, { count: 1 })
+      await adapter.completeJob(first!, queue, { count: 1 })
 
       await new Promise((r) => setTimeout(r, 150))
 
@@ -280,7 +280,7 @@ test.group('Adapter | Redis', (group) => {
       const popped = await adapter.popFrom(queue)
       assert.equal(popped!.id, 'raw-finalize-prune-uuid-2')
 
-      await adapter.completeJob(popped!.id, queue, { count: 1 })
+      await adapter.completeJob(popped!, queue, { count: 1 })
 
       assert.equal(await inspectorConnection.get(dedupKey), 'raw-finalize-prune-uuid-2')
 
@@ -347,7 +347,7 @@ test.group('Adapter | Redis', (group) => {
       const { recovered, exceeded } = await adapter.recoverStalledJobs(queue, 10, 0, 100)
       assert.equal(recovered, 0)
       assert.lengthOf(exceeded, 1)
-      await adapter.failJob(exceeded[0].id, queue, new Error('stalled'))
+      await adapter.failJob(exceeded[0], queue, new Error('stalled'))
 
       assert.equal(await inspectorConnection.get(dedupKey), 'raw-stall-dedup-uuid-2')
 
@@ -382,31 +382,31 @@ test.group('Adapter | Redis', (group) => {
       connection.exists(`jobs::${queue}::dedup::${id}`)
 
     await push('prefix-complete', 'completed-job')
-    await adapter.popFrom('prefix-complete')
-    await adapter.completeJob('completed-job', 'prefix-complete')
+    const completed = await adapter.popFrom('prefix-complete')
+    await adapter.completeJob(completed!, 'prefix-complete')
     assert.equal(await dedupExists('prefix-complete', 'completed-job'), 0)
 
     await push('prefix-fail', 'failed-job')
-    await adapter.popFrom('prefix-fail')
-    await adapter.failJob('failed-job', 'prefix-fail', new Error('boom'))
+    const failed = await adapter.popFrom('prefix-fail')
+    await adapter.failJob(failed!, 'prefix-fail', new Error('boom'))
     assert.equal(await dedupExists('prefix-fail', 'failed-job'), 0)
 
     await push('prefix-prune', 'pruned-job')
-    await adapter.popFrom('prefix-prune')
-    await adapter.completeJob('pruned-job', 'prefix-prune', { count: 1 })
+    const pruned = await adapter.popFrom('prefix-prune')
+    await adapter.completeJob(pruned!, 'prefix-prune', { count: 1 })
     // History is ordered by completion time; keep both completions in distinct milliseconds.
     await new Promise((resolve) => setTimeout(resolve, 2))
     await push('prefix-prune', 'kept-job')
-    await adapter.popFrom('prefix-prune')
-    await adapter.completeJob('kept-job', 'prefix-prune', { count: 1 })
+    const kept = await adapter.popFrom('prefix-prune')
+    await adapter.completeJob(kept!, 'prefix-prune', { count: 1 })
     assert.equal(await dedupExists('prefix-prune', 'pruned-job'), 0)
     assert.equal(await dedupExists('prefix-prune', 'kept-job'), 1)
 
     await push('prefix-stalled', 'stalled-job')
     await adapter.popFrom('prefix-stalled')
     await new Promise((resolve) => setTimeout(resolve, 5))
-    await adapter.recoverStalledJobs('prefix-stalled', 0, 0, 100)
-    await adapter.failJob('stalled-job', 'prefix-stalled', new Error('stalled'))
+    const { exceeded } = await adapter.recoverStalledJobs('prefix-stalled', 0, 0, 100)
+    await adapter.failJob(exceeded[0], 'prefix-stalled', new Error('stalled'))
     assert.equal(await dedupExists('prefix-stalled', 'stalled-job'), 0)
   })
 
@@ -437,7 +437,7 @@ test.group('Adapter | Redis', (group) => {
       dedup: { id: dedupId, ttl: 10_000 },
     })
 
-    await adapter.completeJob(first!.id, queue)
+    await adapter.completeJob(first!, queue)
 
     assert.equal(await connection.get(dedupKey), 'prefixed-ttl-clean-uuid-2')
   })
@@ -532,7 +532,7 @@ test.group('Adapter | Redis', (group) => {
     })
 
     const first = await adapter.popFrom(queue)
-    await adapter.retryJob(first!.id, queue)
+    await adapter.retryJob(first!, queue)
 
     const retried = await adapter.popFrom(queue)
 
@@ -570,7 +570,7 @@ test.group('Adapter | Redis', (group) => {
     assert.exists(await connection.hget(metadataKey, 'metadata-retained-uuid-1'))
 
     const job = await adapter.popFrom(queue)
-    await adapter.completeJob(job!.id, queue, false)
+    await adapter.completeJob(job!, queue, false)
 
     const record = await adapter.getJob('metadata-retained-uuid-1', queue)
 
@@ -608,7 +608,7 @@ test.group('Adapter | Redis', (group) => {
     assert.exists(await connection.hget(metadataKey, 'metadata-clean-uuid-1'))
 
     const job = await adapter.popFrom(queue)
-    await adapter.completeJob(job!.id, queue, true)
+    await adapter.completeJob(job!, queue, true)
 
     assert.isNull(await connection.hget(metadataKey, 'metadata-clean-uuid-1'))
   })
@@ -640,7 +640,7 @@ test.group('Adapter | Redis', (group) => {
     assert.exists(await connection.hget(metadataKey, 'metadata-prune-uuid-1'))
 
     const first = await adapter.popFrom(queue)
-    await adapter.completeJob(first!.id, queue, { count: 1 })
+    await adapter.completeJob(first!, queue, { count: 1 })
 
     await new Promise((resolve) => setTimeout(resolve, 5))
 
@@ -663,7 +663,7 @@ test.group('Adapter | Redis', (group) => {
     assert.exists(await connection.hget(metadataKey, 'metadata-prune-uuid-3'))
 
     const second = await adapter.popFrom(queue)
-    await adapter.completeJob(second!.id, queue, { count: 1 })
+    await adapter.completeJob(second!, queue, { count: 1 })
 
     assert.isNull(await connection.hget(metadataKey, 'metadata-prune-uuid-1'))
     assert.exists(await connection.hget(metadataKey, 'metadata-prune-uuid-3'))
@@ -700,7 +700,7 @@ test.group('Adapter | Redis', (group) => {
     assert.equal(recovered, 0)
     assert.lengthOf(exceeded, 1)
 
-    await adapter.failJob(exceeded[0].id, queue, new Error('stalled'))
+    await adapter.failJob(exceeded[0], queue, new Error('stalled'))
 
     assert.isNull(await connection.hget(metadataKey, 'metadata-stalled-uuid-1'))
     assert.isNull(await adapter.getJob('metadata-stalled-uuid-1', queue))
@@ -1999,7 +1999,7 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
 
     assert.equal(second && typeof second === 'object' && second.outcome, 'added')
 
-    await knexAdapter.retryJob(first!.id, queue)
+    await knexAdapter.retryJob(first!, queue)
 
     const availableJobs = [await knexAdapter.popFrom(queue), await knexAdapter.popFrom(queue)]
     const availableIds = availableJobs.map((job) => job?.id).sort()

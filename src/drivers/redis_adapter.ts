@@ -2,7 +2,13 @@ import { randomUUID } from 'node:crypto'
 import { Redis, type RedisOptions } from 'ioredis'
 import { DEFAULT_PRIORITY } from '../constants.js'
 import { calculateScore } from '../utils.js'
-import type { Adapter, AcquiredJob, PushResult, StalledJobsRecovery } from '../contracts/adapter.js'
+import type {
+  Adapter,
+  AcquiredJob,
+  JobLease,
+  PushResult,
+  StalledJobsRecovery,
+} from '../contracts/adapter.js'
 import type { DedupOutcome } from '../types/main.js'
 import type {
   JobData,
@@ -12,7 +18,7 @@ import type {
   ScheduleData,
   ScheduleListOptions,
 } from '../types/main.js'
-import { resolveRetention, resolveSchedulePayload } from '../utils.js'
+import { createLeaseToken, resolveRetention, resolveSchedulePayload } from '../utils.js'
 import { encodeRedisJobPayloadOverlay, hydrateRedisJob } from './redis_job_storage.js'
 import {
   ACQUIRE_JOB_SCRIPT,
@@ -125,6 +131,7 @@ export class RedisAdapter implements Adapter {
   async popFrom(queue: string): Promise<AcquiredJob | null> {
     const keys = this.#getKeys(queue)
     const now = Date.now()
+    const leaseToken = createLeaseToken(this.#workerId)
 
     const result = await this.#connection.eval(
       ACQUIRE_JOB_SCRIPT,
@@ -135,7 +142,8 @@ export class RedisAdapter implements Adapter {
       keys.delayed,
       keys.overlay,
       this.#workerId,
-      now.toString()
+      now.toString(),
+      leaseToken
     )
 
     if (!result) {
@@ -148,28 +156,33 @@ export class RedisAdapter implements Adapter {
       acquiredAt: number
     }
 
-    return { ...hydrateRedisJob(data, overlay), acquiredAt }
+    return { ...hydrateRedisJob(data, overlay), acquiredAt, leaseToken }
   }
 
-  async completeJob(jobId: string, queue: string, removeOnComplete?: JobRetention): Promise<void> {
+  async completeJob(
+    job: JobLease,
+    queue: string,
+    removeOnComplete?: JobRetention
+  ): Promise<boolean> {
     const keys = this.#getKeys(queue)
     const dedupPrefix = this.#getDedupPrefix(queue)
     const { keep, maxAge, maxCount } = resolveRetention(removeOnComplete)
 
     if (!keep) {
-      await this.#connection.eval(
+      const removed = await this.#connection.eval(
         REMOVE_JOB_SCRIPT,
         4,
         keys.data,
         keys.active,
         keys.overlay,
         dedupPrefix,
-        jobId
+        job.id,
+        job.leaseToken
       )
-      return
+      return removed === 1
     }
 
-    await this.#connection.eval(
+    const finalized = await this.#connection.eval(
       FINALIZE_JOB_SCRIPT,
       6,
       keys.data,
@@ -178,38 +191,41 @@ export class RedisAdapter implements Adapter {
       keys.completedIndex,
       keys.overlay,
       dedupPrefix,
-      jobId,
+      job.id,
       Date.now().toString(),
       maxAge.toString(),
       maxCount.toString(),
-      ''
+      '',
+      job.leaseToken
     )
+    return finalized === 1
   }
 
   async failJob(
-    jobId: string,
+    job: JobLease,
     queue: string,
     error?: Error,
     removeOnFail?: JobRetention
-  ): Promise<void> {
+  ): Promise<boolean> {
     const keys = this.#getKeys(queue)
     const dedupPrefix = this.#getDedupPrefix(queue)
     const { keep, maxAge, maxCount } = resolveRetention(removeOnFail)
 
     if (!keep) {
-      await this.#connection.eval(
+      const removed = await this.#connection.eval(
         REMOVE_JOB_SCRIPT,
         4,
         keys.data,
         keys.active,
         keys.overlay,
         dedupPrefix,
-        jobId
+        job.id,
+        job.leaseToken
       )
-      return
+      return removed === 1
     }
 
-    await this.#connection.eval(
+    const finalized = await this.#connection.eval(
       FINALIZE_JOB_SCRIPT,
       6,
       keys.data,
@@ -218,19 +234,21 @@ export class RedisAdapter implements Adapter {
       keys.failedIndex,
       keys.overlay,
       dedupPrefix,
-      jobId,
+      job.id,
       Date.now().toString(),
       maxAge.toString(),
       maxCount.toString(),
-      error?.message || ''
+      error?.message || '',
+      job.leaseToken
     )
+    return finalized === 1
   }
 
-  async retryJob(jobId: string, queue: string, retryAt?: Date): Promise<void> {
+  async retryJob(job: JobLease, queue: string, retryAt?: Date): Promise<boolean> {
     const keys = this.#getKeys(queue)
     const now = Date.now()
 
-    await this.#connection.eval(
+    const retried = await this.#connection.eval(
       RETRY_JOB_SCRIPT,
       5,
       keys.data,
@@ -238,10 +256,12 @@ export class RedisAdapter implements Adapter {
       keys.pending,
       keys.delayed,
       keys.overlay,
-      jobId,
+      job.id,
       retryAt ? retryAt.getTime().toString() : '0',
-      now.toString()
+      now.toString(),
+      job.leaseToken
     )
+    return retried === 1
   }
 
   async getJob(jobId: string, queue: string): Promise<JobRecord | null> {
@@ -403,6 +423,8 @@ export class RedisAdapter implements Adapter {
   ): Promise<StalledJobsRecovery> {
     const keys = this.#getKeys(queue)
     const now = Date.now()
+    // The script appends the job id to get one token per reacquired job.
+    const leaseTokenPrefix = createLeaseToken(this.#workerId)
 
     const [recovered, ...exceeded] = (await this.#connection.eval(
       RECOVER_STALLED_JOBS_SCRIPT,
@@ -415,25 +437,27 @@ export class RedisAdapter implements Adapter {
       stalledThreshold.toString(),
       maxStalledCount.toString(),
       this.#workerId,
-      maxExceeded.toString()
+      maxExceeded.toString(),
+      leaseTokenPrefix
     )) as [number, ...string[]]
 
     return {
       recovered,
       exceeded: exceeded.map((result) => {
-        const { data, overlay, acquiredAt } = JSON.parse(result) as {
+        const { data, overlay, acquiredAt, leaseToken } = JSON.parse(result) as {
           data: string
           overlay?: string
           acquiredAt: number
+          leaseToken: string
         }
 
-        return { ...hydrateRedisJob(data, overlay), acquiredAt }
+        return { ...hydrateRedisJob(data, overlay), acquiredAt, leaseToken }
       }),
     }
   }
 
-  async renewJobs(queue: string, jobIds: string[]): Promise<number> {
-    if (jobIds.length === 0) {
+  async renewJobs(queue: string, jobs: JobLease[]): Promise<number> {
+    if (jobs.length === 0) {
       return 0
     }
 
@@ -445,8 +469,7 @@ export class RedisAdapter implements Adapter {
       1,
       keys.active,
       now.toString(),
-      this.#workerId,
-      ...jobIds
+      ...jobs.flatMap((job) => [job.id, job.leaseToken])
     )
 
     return renewed as number

@@ -3,7 +3,7 @@ import { test } from '@japa/runner'
 import { JobPool } from '../src/job_pool.js'
 import type { AcquiredJob } from '../src/contracts/adapter.js'
 
-function createJob(id: string): AcquiredJob {
+function createJob(id: string, leaseToken = `worker:${id}`): AcquiredJob {
   return {
     id,
     name: 'TestJob',
@@ -11,6 +11,7 @@ function createJob(id: string): AcquiredJob {
     attempts: 0,
     priority: 0,
     acquiredAt: Date.now(),
+    leaseToken,
   }
 }
 
@@ -144,7 +145,7 @@ test.group('JobPool', () => {
     await pool.drain()
   })
 
-  test('ignores a stale completion after an active job id is replaced', async ({ assert }) => {
+  test('ignores a stale completion after an active lease is replaced', async ({ assert }) => {
     const pool = new JobPool()
     const staleExecution = Promise.withResolvers<void>()
     const currentExecution = Promise.withResolvers<void>()
@@ -165,6 +166,28 @@ test.group('JobPool', () => {
 
     currentExecution.resolve()
     assert.equal((await completion).queue, 'current')
+    assert.isTrue(pool.isEmpty())
+  })
+
+  test('tracks each lease of a job acquired again while it still runs', async ({ assert }) => {
+    const pool = new JobPool()
+    const staleExecution = Promise.withResolvers<void>()
+    const currentExecution = Promise.withResolvers<void>()
+    const stale = createJob('job-1', 'worker:first')
+    const current = createJob('job-1', 'worker:second')
+
+    pool.add(stale, 'default', staleExecution.promise)
+    pool.add(current, 'default', currentExecution.promise)
+
+    assert.equal(pool.size, 2)
+    assert.deepEqual(pool.activeJobsByQueue().get('default'), [stale, current])
+
+    staleExecution.resolve()
+    assert.strictEqual((await pool.waitForNextCompletion()).job, stale)
+    assert.deepEqual(pool.activeJobsByQueue().get('default'), [current])
+
+    currentExecution.resolve()
+    assert.strictEqual((await pool.waitForNextCompletion()).job, current)
     assert.isTrue(pool.isEmpty())
   })
 

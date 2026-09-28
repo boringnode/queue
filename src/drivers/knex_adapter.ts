@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import KnexPkg from 'knex'
 import type { Knex } from 'knex'
-import type { Adapter, AcquiredJob, PushResult, StalledJobsRecovery } from '../contracts/adapter.js'
+import type {
+  Adapter,
+  AcquiredJob,
+  JobLease,
+  PushResult,
+  StalledJobsRecovery,
+} from '../contracts/adapter.js'
 import type {
   DedupOutcome,
   JobData,
@@ -13,7 +19,13 @@ import type {
   ScheduleListOptions,
 } from '../types/main.js'
 import { DEFAULT_PRIORITY } from '../constants.js'
-import { calculateScore, epochToDate, resolveRetention, resolveSchedulePayload } from '../utils.js'
+import {
+  calculateScore,
+  createLeaseToken,
+  epochToDate,
+  resolveRetention,
+  resolveSchedulePayload,
+} from '../utils.js'
 
 import { KnexQueueSchemaService } from '../services/knex_queue_schema.js'
 import { scheduleDatesMigrationRequiredMessage } from '../services/schedule_dates.js'
@@ -146,9 +158,11 @@ export class KnexAdapter implements Adapter {
         updateQuery.where('status', 'pending')
       }
 
+      // worker_id holds the lease token of the acquisition.
+      const leaseToken = createLeaseToken(this.#workerId)
       const updated = await updateQuery.update({
         status: 'active',
-        worker_id: this.#workerId,
+        worker_id: leaseToken,
         acquired_at: now,
       })
 
@@ -162,6 +176,7 @@ export class KnexAdapter implements Adapter {
       return {
         ...jobData,
         acquiredAt: now,
+        leaseToken,
       }
     })
   }
@@ -208,74 +223,75 @@ export class KnexAdapter implements Adapter {
     })
   }
 
-  async completeJob(jobId: string, queue: string, removeOnComplete?: JobRetention): Promise<void> {
+  async completeJob(
+    job: JobLease,
+    queue: string,
+    removeOnComplete?: JobRetention
+  ): Promise<boolean> {
     const { keep, maxAge, maxCount } = resolveRetention(removeOnComplete)
 
     if (!keep) {
-      await this.#connection(this.#jobsTable)
-        .where('id', jobId)
-        .where('queue', queue)
-        .where('status', 'active')
-        .delete()
-      return
+      const deleted = await this.#leasedJob(job, queue).delete()
+      return deleted > 0
     }
 
     const now = Date.now()
 
-    const updated = await this.#connection(this.#jobsTable)
-      .where('id', jobId)
-      .where('queue', queue)
-      .where('status', 'active')
-      .update({
-        status: 'completed',
-        worker_id: null,
-        acquired_at: null,
-        finished_at: now,
-      })
+    const updated = await this.#leasedJob(job, queue).update({
+      status: 'completed',
+      worker_id: null,
+      acquired_at: null,
+      finished_at: now,
+    })
 
     if (!updated) {
-      return
+      return false
     }
 
     await this.#pruneHistory(queue, 'completed', maxAge, maxCount, now)
+    return true
   }
 
   async failJob(
-    jobId: string,
+    job: JobLease,
     queue: string,
     error?: Error,
     removeOnFail?: JobRetention
-  ): Promise<void> {
+  ): Promise<boolean> {
     const { keep, maxAge, maxCount } = resolveRetention(removeOnFail)
 
     if (!keep) {
-      await this.#connection(this.#jobsTable)
-        .where('id', jobId)
-        .where('queue', queue)
-        .where('status', 'active')
-        .delete()
-      return
+      const deleted = await this.#leasedJob(job, queue).delete()
+      return deleted > 0
     }
 
     const now = Date.now()
 
-    const updated = await this.#connection(this.#jobsTable)
-      .where('id', jobId)
-      .where('queue', queue)
-      .where('status', 'active')
-      .update({
-        status: 'failed',
-        worker_id: null,
-        acquired_at: null,
-        finished_at: now,
-        error: error?.message || null,
-      })
+    const updated = await this.#leasedJob(job, queue).update({
+      status: 'failed',
+      worker_id: null,
+      acquired_at: null,
+      finished_at: now,
+      error: error?.message || null,
+    })
 
     if (!updated) {
-      return
+      return false
     }
 
     await this.#pruneHistory(queue, 'failed', maxAge, maxCount, now)
+    return true
+  }
+
+  /**
+   * Query on a job still active under the given lease token.
+   */
+  #leasedJob(job: JobLease, queue: string) {
+    return this.#connection(this.#jobsTable)
+      .where('id', job.id)
+      .where('queue', queue)
+      .where('status', 'active')
+      .where('worker_id', job.leaseToken)
   }
 
   async getJob(jobId: string, queue: string): Promise<JobRecord | null> {
@@ -330,26 +346,22 @@ export class KnexAdapter implements Adapter {
     }
   }
 
-  async retryJob(jobId: string, queue: string, retryAt?: Date): Promise<void> {
+  async retryJob(job: JobLease, queue: string, retryAt?: Date): Promise<boolean> {
     const now = Date.now()
 
-    // Get the active job
-    const activeJob = await this.#connection(this.#jobsTable)
-      .where('id', jobId)
-      .where('queue', queue)
-      .where('status', 'active')
-      .first()
+    const activeJob = await this.#leasedJob(job, queue).first()
 
-    if (!activeJob) return
+    if (!activeJob) return false
 
     const jobData: JobData = JSON.parse(activeJob.data)
     jobData.attempts = (jobData.attempts || 0) + 1
 
     const updatedData = JSON.stringify(jobData)
 
+    // The update checks the lease again: it may have been lost since the read.
     if (retryAt && retryAt.getTime() > now) {
       // Move to delayed
-      await this.#connection(this.#jobsTable).where('id', jobId).where('queue', queue).update({
+      const updated = await this.#leasedJob(job, queue).update({
         status: 'delayed',
         data: updatedData,
         worker_id: null,
@@ -357,20 +369,22 @@ export class KnexAdapter implements Adapter {
         score: null,
         execute_at: retryAt.getTime(),
       })
-    } else {
-      // Move back to pending
-      const priority = jobData.priority ?? DEFAULT_PRIORITY
-      const score = calculateScore(priority, now)
-
-      await this.#connection(this.#jobsTable).where('id', jobId).where('queue', queue).update({
-        status: 'pending',
-        data: updatedData,
-        worker_id: null,
-        acquired_at: null,
-        score,
-        execute_at: null,
-      })
+      return updated > 0
     }
+
+    // Move back to pending
+    const priority = jobData.priority ?? DEFAULT_PRIORITY
+    const score = calculateScore(priority, now)
+
+    const updated = await this.#leasedJob(job, queue).update({
+      status: 'pending',
+      data: updatedData,
+      worker_id: null,
+      acquired_at: null,
+      score,
+      execute_at: null,
+    })
+    return updated > 0
   }
 
   async push(jobData: JobData): Promise<PushResult | void> {
@@ -652,13 +666,14 @@ export class KnexAdapter implements Adapter {
           if (exceeded.length >= maxExceeded) continue
 
           // Reacquire for this worker, which fails it through the regular path.
+          const leaseToken = createLeaseToken(this.#workerId)
           const updated = await trx(this.#jobsTable)
             .where('id', row.id)
             .where('queue', queue)
             .where('status', 'active')
-            .update({ worker_id: this.#workerId, acquired_at: now })
+            .update({ worker_id: leaseToken, acquired_at: now })
 
-          if (updated > 0) exceeded.push({ ...jobData, acquiredAt: now })
+          if (updated > 0) exceeded.push({ ...jobData, acquiredAt: now, leaseToken })
         } else {
           // Recover: increment stalledCount and put back in pending
           jobData.stalledCount = currentStalledCount + 1
@@ -684,21 +699,28 @@ export class KnexAdapter implements Adapter {
     })
   }
 
-  async renewJobs(queue: string, jobIds: string[]): Promise<number> {
-    if (jobIds.length === 0) {
+  async renewJobs(queue: string, jobs: JobLease[]): Promise<number> {
+    if (jobs.length === 0) {
       return 0
     }
 
     const now = Date.now()
 
-    // Only renew jobs that are still active AND still owned by this worker; a
-    // job that was already recovered, finalized, or re-acquired by another
-    // worker will not match and is therefore never resurrected.
+    // Only renew jobs that are still active under their lease token; a job
+    // that was already recovered, finalized, or acquired again will not match
+    // and is therefore never resurrected. A token belongs to one acquisition of
+    // one job, so matching ids and tokens separately cannot mix up two jobs.
     const renewed = await this.#connection(this.#jobsTable)
       .where('queue', queue)
       .where('status', 'active')
-      .where('worker_id', this.#workerId)
-      .whereIn('id', jobIds)
+      .whereIn(
+        'id',
+        jobs.map((job) => job.id)
+      )
+      .whereIn(
+        'worker_id',
+        jobs.map((job) => job.leaseToken)
+      )
       .update({ acquired_at: now })
 
     return renewed

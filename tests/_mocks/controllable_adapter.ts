@@ -108,15 +108,15 @@ export class ControllableAdapter extends MemoryAdapter {
     return this.acquisitions.run(() => super.popFrom(queue))
   }
 
-  override async completeJob(...args: Parameters<MemoryAdapter['completeJob']>): Promise<void> {
+  override async completeJob(...args: Parameters<MemoryAdapter['completeJob']>): Promise<boolean> {
     return this.finalizations.run(() => super.completeJob(...args))
   }
 
-  override async failJob(...args: Parameters<MemoryAdapter['failJob']>): Promise<void> {
+  override async failJob(...args: Parameters<MemoryAdapter['failJob']>): Promise<boolean> {
     return this.finalizations.run(() => super.failJob(...args))
   }
 
-  override async retryJob(...args: Parameters<MemoryAdapter['retryJob']>): Promise<void> {
+  override async retryJob(...args: Parameters<MemoryAdapter['retryJob']>): Promise<boolean> {
     return this.finalizations.run(() => super.retryJob(...args))
   }
 

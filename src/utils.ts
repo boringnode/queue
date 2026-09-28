@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { parse as parseDuration } from '@lukeed/ms'
 import type { Duration, JobRetention } from './types/main.js'
 import * as errors from './exceptions.js'
@@ -66,4 +67,12 @@ export function parse(duration: Duration): number {
  */
 export function calculateScore(priority: number, timestamp: number): number {
   return priority * PRIORITY_SCORE_MULTIPLIER + timestamp
+}
+
+/**
+ * Create the lease token of a new acquisition. It starts with the worker id,
+ * so a stored token tells which worker holds the job.
+ */
+export function createLeaseToken(workerId: string): string {
+  return `${workerId}:${randomUUID()}`
 }

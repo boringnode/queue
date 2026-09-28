@@ -117,6 +117,7 @@ export const ACQUIRE_JOB_SCRIPT = `
   local overlay_key = KEYS[5]
   local worker_id = ARGV[1]
   local now = tonumber(ARGV[2])
+  local lease_token = ARGV[3]
 
 ${REDIS_JOB_STORAGE_LUA}
 
@@ -151,13 +152,28 @@ ${REDIS_JOB_STORAGE_LUA}
   -- Store in active hash (without data, it's in data_key)
   local active_data = cjson.encode({
     workerId = worker_id,
-    acquiredAt = now
+    acquiredAt = now,
+    leaseToken = lease_token
   })
   redis.call('HSET', active_key, job_id, active_data)
 
   return encode_job_result(job_data, overlay_key, job_id, {
     acquiredAt = now
   })
+`
+
+/**
+ * True if the active hash holds the job under the given lease token.
+ */
+const REDIS_LEASE_LUA = `
+  local function holds_lease(active_key, job_id, lease_token)
+    local active_data = redis.call('HGET', active_key, job_id)
+    if not active_data then
+      return false
+    end
+
+    return cjson.decode(active_data).leaseToken == lease_token
+  end
 `
 
 /**
@@ -170,10 +186,12 @@ export const REMOVE_JOB_SCRIPT = `
   local overlay_key = KEYS[3]
   local dedup_prefix = KEYS[4]
   local job_id = ARGV[1]
+  local lease_token = ARGV[2]
 
 ${REDIS_JOB_STORAGE_LUA}
+${REDIS_LEASE_LUA}
 
-  if redis.call('HEXISTS', active_key, job_id) == 0 then
+  if not holds_lease(active_key, job_id, lease_token) then
     return 0
   end
 
@@ -212,11 +230,13 @@ export const FINALIZE_JOB_SCRIPT = `
   local max_age = tonumber(ARGV[3])
   local max_count = tonumber(ARGV[4])
   local error_message = ARGV[5]
+  local lease_token = ARGV[6]
 
 ${REDIS_JOB_STORAGE_LUA}
+${REDIS_LEASE_LUA}
 
-  -- Verify job is active
-  if redis.call('HEXISTS', active_key, job_id) == 0 then
+  -- Verify the caller still holds the job
+  if not holds_lease(active_key, job_id, lease_token) then
     return 0
   end
 
@@ -281,7 +301,7 @@ ${REDIS_JOB_STORAGE_LUA}
 
 /**
  * Lua script for retrying a job.
- * 1. Verify job is active
+ * 1. Verify the caller still holds the job
  * 2. Remove from active hash
  * 3. Increment attempts in data
  * 4. Add back to pending (or delayed if retryAt is set)
@@ -295,11 +315,13 @@ export const RETRY_JOB_SCRIPT = `
   local job_id = ARGV[1]
   local retry_at = tonumber(ARGV[2])
   local now = tonumber(ARGV[3])
+  local lease_token = ARGV[4]
 
 ${REDIS_JOB_STORAGE_LUA}
+${REDIS_LEASE_LUA}
 
-  -- Verify job is active
-  if redis.call('HEXISTS', active_key, job_id) == 0 then
+  -- Verify the caller still holds the job
+  if not holds_lease(active_key, job_id, lease_token) then
     return 0
   end
 
@@ -351,6 +373,7 @@ export const RECOVER_STALLED_JOBS_SCRIPT = `
   local max_stalled_count = tonumber(ARGV[3])
   local worker_id = ARGV[4]
   local max_exceeded = tonumber(ARGV[5])
+  local lease_token_prefix = ARGV[6]
 
 ${REDIS_JOB_STORAGE_LUA}
 
@@ -381,12 +404,15 @@ ${REDIS_JOB_STORAGE_LUA}
           -- Reacquire for the calling worker, which fails it through the regular
           -- path. Past max_exceeded, the job stays stalled for a later recovery.
           if #result - 1 < max_exceeded then
+            local lease_token = lease_token_prefix .. ':' .. job_id
             redis.call('HSET', active_key, job_id, cjson.encode({
               workerId = worker_id,
-              acquiredAt = now
+              acquiredAt = now,
+              leaseToken = lease_token
             }))
             result[#result + 1] = encode_job_result(job_data, overlay_key, job_id, {
-              acquiredAt = now
+              acquiredAt = now,
+              leaseToken = lease_token
             })
           end
         else
@@ -410,25 +436,26 @@ ${REDIS_JOB_STORAGE_LUA}
 
 /**
  * Lua script for renewing the acquired timestamp of in-flight jobs (heartbeat).
- * Only entries still present in the active hash AND still owned by the calling
- * worker are renewed, so a job that was already recovered, finalized, or
- * re-acquired by another worker is never resurrected by a late heartbeat.
+ * Only entries still present in the active hash under the given lease token
+ * are renewed, so a job that was already recovered, finalized, or acquired
+ * again is never resurrected by a late heartbeat.
  * Preserves the existing worker info, updating only acquiredAt.
+ * ARGV = now, then job id and lease token pairs.
  * Returns the number of jobs renewed.
  */
 export const RENEW_JOBS_SCRIPT = `
   local active_key = KEYS[1]
   local now = tonumber(ARGV[1])
-  local worker_id = ARGV[2]
 
   local renewed = 0
-  for i = 3, #ARGV do
+  for i = 2, #ARGV, 2 do
     local job_id = ARGV[i]
+    local lease_token = ARGV[i + 1]
     local active_data = redis.call('HGET', active_key, job_id)
     if active_data then
       local active = cjson.decode(active_data)
-      -- Only the worker that currently owns the lease may renew it.
-      if active.workerId == worker_id then
+      -- Only the current holder of the lease may renew it.
+      if active.leaseToken == lease_token then
         active.acquiredAt = now
         redis.call('HSET', active_key, job_id, cjson.encode(active))
         renewed = renewed + 1

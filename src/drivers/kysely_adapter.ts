@@ -1,6 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { sql, type ColumnType, type Kysely, type Transaction, type Updateable } from 'kysely'
-import type { Adapter, AcquiredJob, PushResult, StalledJobsRecovery } from '../contracts/adapter.js'
+import type {
+  Adapter,
+  AcquiredJob,
+  JobLease,
+  PushResult,
+  StalledJobsRecovery,
+} from '../contracts/adapter.js'
 import type {
   JobData,
   JobRecord,
@@ -11,7 +17,13 @@ import type {
   ScheduleListOptions,
 } from '../types/main.js'
 import { DEFAULT_PRIORITY } from '../constants.js'
-import { calculateScore, epochToDate, resolveRetention, resolveSchedulePayload } from '../utils.js'
+import {
+  calculateScore,
+  createLeaseToken,
+  epochToDate,
+  resolveRetention,
+  resolveSchedulePayload,
+} from '../utils.js'
 import type { KyselyDialect } from '../services/kysely_queue_schema.js'
 
 import { KyselyQueueSchemaService } from '../services/kysely_queue_schema.js'
@@ -166,9 +178,11 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
       const job = await query.executeTakeFirst()
       if (!job) return null
 
+      // worker_id holds the lease token of the acquisition.
+      const leaseToken = createLeaseToken(this.#workerId)
       let update = this.#jobs(trx)
         .updateTable(this.#jobsTable)
-        .set({ status: 'active', worker_id: this.#workerId, acquired_at: now })
+        .set({ status: 'active', worker_id: leaseToken, acquired_at: now })
         .where('id', '=', job.id)
         .where('queue', '=', queue)
 
@@ -179,7 +193,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
       const result = await update.executeTakeFirst()
       if (result.numUpdatedRows === 0n) return null
 
-      return { ...(JSON.parse(job.data) as JobData), acquiredAt: now }
+      return { ...(JSON.parse(job.data) as JobData), acquiredAt: now, leaseToken }
     })
   }
 
@@ -214,17 +228,22 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     })
   }
 
-  async completeJob(jobId: string, queue: string, removeOnComplete?: JobRetention): Promise<void> {
+  async completeJob(
+    job: JobLease,
+    queue: string,
+    removeOnComplete?: JobRetention
+  ): Promise<boolean> {
     const { keep, maxAge, maxCount } = resolveRetention(removeOnComplete)
 
     if (!keep) {
-      await this.#jobs(this.#connection)
+      const result = await this.#jobs(this.#connection)
         .deleteFrom(this.#jobsTable)
-        .where('id', '=', jobId)
+        .where('id', '=', job.id)
         .where('queue', '=', queue)
         .where('status', '=', 'active')
-        .execute()
-      return
+        .where('worker_id', '=', job.leaseToken)
+        .executeTakeFirst()
+      return result.numDeletedRows > 0n
     }
 
     const now = Date.now()
@@ -236,32 +255,35 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
         acquired_at: null,
         finished_at: now,
       })
-      .where('id', '=', jobId)
+      .where('id', '=', job.id)
       .where('queue', '=', queue)
       .where('status', '=', 'active')
+      .where('worker_id', '=', job.leaseToken)
       .executeTakeFirst()
 
-    if (result.numUpdatedRows > 0n) {
-      await this.#pruneHistory(this.#connection, queue, 'completed', maxAge, maxCount, now)
-    }
+    if (result.numUpdatedRows === 0n) return false
+
+    await this.#pruneHistory(this.#connection, queue, 'completed', maxAge, maxCount, now)
+    return true
   }
 
   async failJob(
-    jobId: string,
+    job: JobLease,
     queue: string,
     error?: Error,
     removeOnFail?: JobRetention
-  ): Promise<void> {
+  ): Promise<boolean> {
     const { keep, maxAge, maxCount } = resolveRetention(removeOnFail)
 
     if (!keep) {
-      await this.#jobs(this.#connection)
+      const result = await this.#jobs(this.#connection)
         .deleteFrom(this.#jobsTable)
-        .where('id', '=', jobId)
+        .where('id', '=', job.id)
         .where('queue', '=', queue)
         .where('status', '=', 'active')
-        .execute()
-      return
+        .where('worker_id', '=', job.leaseToken)
+        .executeTakeFirst()
+      return result.numDeletedRows > 0n
     }
 
     const now = Date.now()
@@ -274,14 +296,16 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
         finished_at: now,
         error: error?.message ?? null,
       })
-      .where('id', '=', jobId)
+      .where('id', '=', job.id)
       .where('queue', '=', queue)
       .where('status', '=', 'active')
+      .where('worker_id', '=', job.leaseToken)
       .executeTakeFirst()
 
-    if (result.numUpdatedRows > 0n) {
-      await this.#pruneHistory(this.#connection, queue, 'failed', maxAge, maxCount, now)
-    }
+    if (result.numUpdatedRows === 0n) return false
+
+    await this.#pruneHistory(this.#connection, queue, 'failed', maxAge, maxCount, now)
+    return true
   }
 
   async getJob(jobId: string, queue: string): Promise<JobRecord | null> {
@@ -342,53 +366,51 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     }
   }
 
-  async retryJob(jobId: string, queue: string, retryAt?: Date): Promise<void> {
+  async retryJob(job: JobLease, queue: string, retryAt?: Date): Promise<boolean> {
     const activeJob = await this.#jobs(this.#connection)
       .selectFrom(this.#jobsTable)
       .selectAll()
-      .where('id', '=', jobId)
+      .where('id', '=', job.id)
       .where('queue', '=', queue)
       .where('status', '=', 'active')
+      .where('worker_id', '=', job.leaseToken)
       .executeTakeFirst()
 
-    if (!activeJob) return
+    if (!activeJob) return false
 
     const now = Date.now()
     const jobData = JSON.parse(activeJob.data) as JobData
     jobData.attempts = (jobData.attempts || 0) + 1
 
-    if (retryAt && retryAt.getTime() > now) {
-      await this.#jobs(this.#connection)
-        .updateTable(this.#jobsTable)
-        .set({
-          status: 'delayed',
-          data: JSON.stringify(jobData),
-          worker_id: null,
-          acquired_at: null,
-          score: null,
-          execute_at: retryAt.getTime(),
-        })
-        .where('id', '=', jobId)
-        .where('queue', '=', queue)
-        .where('status', '=', 'active')
-        .execute()
-      return
-    }
-
-    await this.#jobs(this.#connection)
+    // The update checks the lease again: it may have been lost since the read.
+    const result = await this.#jobs(this.#connection)
       .updateTable(this.#jobsTable)
-      .set({
-        status: 'pending',
-        data: JSON.stringify(jobData),
-        worker_id: null,
-        acquired_at: null,
-        score: calculateScore(jobData.priority ?? DEFAULT_PRIORITY, now),
-        execute_at: null,
-      })
-      .where('id', '=', jobId)
+      .set(
+        retryAt && retryAt.getTime() > now
+          ? {
+              status: 'delayed',
+              data: JSON.stringify(jobData),
+              worker_id: null,
+              acquired_at: null,
+              score: null,
+              execute_at: retryAt.getTime(),
+            }
+          : {
+              status: 'pending',
+              data: JSON.stringify(jobData),
+              worker_id: null,
+              acquired_at: null,
+              score: calculateScore(jobData.priority ?? DEFAULT_PRIORITY, now),
+              execute_at: null,
+            }
+      )
+      .where('id', '=', job.id)
       .where('queue', '=', queue)
       .where('status', '=', 'active')
-      .execute()
+      .where('worker_id', '=', job.leaseToken)
+      .executeTakeFirst()
+
+    return result.numUpdatedRows > 0n
   }
 
   async push(jobData: JobData): Promise<PushResult | void> {
@@ -638,14 +660,15 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
           if (exceeded.length >= maxExceeded) continue
 
           // Reacquire for this worker, which fails it through the regular path.
+          const leaseToken = createLeaseToken(this.#workerId)
           const result = await this.#jobs(trx)
             .updateTable(this.#jobsTable)
-            .set({ worker_id: this.#workerId, acquired_at: now })
+            .set({ worker_id: leaseToken, acquired_at: now })
             .where('id', '=', row.id)
             .where('queue', '=', queue)
             .where('status', '=', 'active')
             .executeTakeFirst()
-          if (result.numUpdatedRows > 0n) exceeded.push({ ...jobData, acquiredAt: now })
+          if (result.numUpdatedRows > 0n) exceeded.push({ ...jobData, acquiredAt: now, leaseToken })
           continue
         }
 
@@ -670,16 +693,26 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     })
   }
 
-  async renewJobs(queue: string, jobIds: string[]): Promise<number> {
-    if (jobIds.length === 0) return 0
+  async renewJobs(queue: string, jobs: JobLease[]): Promise<number> {
+    if (jobs.length === 0) return 0
 
+    // A token belongs to one acquisition of one job, so matching ids and
+    // tokens separately cannot mix up two jobs.
     const result = await this.#jobs(this.#connection)
       .updateTable(this.#jobsTable)
       .set({ acquired_at: Date.now() })
       .where('queue', '=', queue)
       .where('status', '=', 'active')
-      .where('worker_id', '=', this.#workerId)
-      .where('id', 'in', jobIds)
+      .where(
+        'id',
+        'in',
+        jobs.map((job) => job.id)
+      )
+      .where(
+        'worker_id',
+        'in',
+        jobs.map((job) => job.leaseToken)
+      )
       .executeTakeFirst()
 
     return Number(result.numUpdatedRows)

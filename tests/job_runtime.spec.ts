@@ -16,6 +16,7 @@ const acquiredJob = (overrides: Partial<AcquiredJob> = {}): AcquiredJob => ({
   priority: 2,
   stalledCount: 1,
   acquiredAt: Date.parse('2026-07-09T12:00:00.000Z'),
+  leaseToken: 'worker:lease',
   ...overrides,
 })
 
