@@ -366,6 +366,79 @@ test.group('Adapter | Redis', (group) => {
     }
   })
 
+  test('dedup keys are removed when the connection uses a key prefix', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+    const push = (queue: string, id: string) =>
+      adapter.pushOn(queue, {
+        id,
+        name: 'TestJob',
+        payload: {},
+        attempts: 0,
+        dedup: { id },
+      })
+    const dedupExists = (queue: string, id: string) =>
+      connection.exists(`jobs::${queue}::dedup::${id}`)
+
+    await push('prefix-complete', 'completed-job')
+    await adapter.popFrom('prefix-complete')
+    await adapter.completeJob('completed-job', 'prefix-complete')
+    assert.equal(await dedupExists('prefix-complete', 'completed-job'), 0)
+
+    await push('prefix-fail', 'failed-job')
+    await adapter.popFrom('prefix-fail')
+    await adapter.failJob('failed-job', 'prefix-fail', new Error('boom'))
+    assert.equal(await dedupExists('prefix-fail', 'failed-job'), 0)
+
+    await push('prefix-prune', 'pruned-job')
+    await adapter.popFrom('prefix-prune')
+    await adapter.completeJob('pruned-job', 'prefix-prune', { count: 1 })
+    // History is ordered by completion time; keep both completions in distinct milliseconds.
+    await new Promise((resolve) => setTimeout(resolve, 2))
+    await push('prefix-prune', 'kept-job')
+    await adapter.popFrom('prefix-prune')
+    await adapter.completeJob('kept-job', 'prefix-prune', { count: 1 })
+    assert.equal(await dedupExists('prefix-prune', 'pruned-job'), 0)
+    assert.equal(await dedupExists('prefix-prune', 'kept-job'), 1)
+
+    await push('prefix-stalled', 'stalled-job')
+    await adapter.popFrom('prefix-stalled')
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    await adapter.recoverStalledJobs('prefix-stalled', 0, 0)
+    assert.equal(await dedupExists('prefix-stalled', 'stalled-job'), 0)
+  })
+
+  test('completeJob does not delete a newer dedup lock when the connection uses a key prefix', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+    const queue = 'prefixed-ttl-clean-queue'
+    const dedupId = 'TestJob::prefixed-ttl-clean-1'
+    const dedupKey = `jobs::${queue}::dedup::${dedupId}`
+
+    await adapter.pushOn(queue, {
+      id: 'prefixed-ttl-clean-uuid-1',
+      name: 'TestJob',
+      payload: { n: 1 },
+      attempts: 0,
+      dedup: { id: dedupId, ttl: 80 },
+    })
+    const first = await adapter.popFrom(queue)
+
+    // The first lock expires while its job is still running, so a second job takes the id.
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    await adapter.pushOn(queue, {
+      id: 'prefixed-ttl-clean-uuid-2',
+      name: 'TestJob',
+      payload: { n: 2 },
+      attempts: 0,
+      dedup: { id: dedupId, ttl: 10_000 },
+    })
+
+    await adapter.completeJob(first!.id, queue)
+
+    assert.equal(await connection.get(dedupKey), 'prefixed-ttl-clean-uuid-2')
+  })
+
   test('dedup replace should return skipped when stored job_data is malformed JSON', async ({
     assert,
   }) => {

@@ -168,8 +168,8 @@ export const REMOVE_JOB_SCRIPT = `
   local data_key = KEYS[1]
   local active_key = KEYS[2]
   local overlay_key = KEYS[3]
+  local dedup_prefix = KEYS[4]
   local job_id = ARGV[1]
-  local dedup_prefix = ARGV[2]
 
 ${REDIS_JOB_STORAGE_LUA}
 
@@ -206,12 +206,12 @@ export const FINALIZE_JOB_SCRIPT = `
   local history_key = KEYS[3]
   local index_key = KEYS[4]
   local overlay_key = KEYS[5]
+  local dedup_prefix = KEYS[6]
   local job_id = ARGV[1]
   local now = tonumber(ARGV[2])
   local max_age = tonumber(ARGV[3])
   local max_count = tonumber(ARGV[4])
   local error_message = ARGV[5]
-  local dedup_prefix = ARGV[6]
 
 ${REDIS_JOB_STORAGE_LUA}
 
@@ -344,10 +344,10 @@ export const RECOVER_STALLED_JOBS_SCRIPT = `
   local active_key = KEYS[2]
   local pending_key = KEYS[3]
   local overlay_key = KEYS[4]
+  local dedup_prefix = KEYS[5]
   local now = tonumber(ARGV[1])
   local stalled_threshold = tonumber(ARGV[2])
   local max_stalled_count = tonumber(ARGV[3])
-  local dedup_prefix = ARGV[4]
 
 ${REDIS_JOB_STORAGE_LUA}
 

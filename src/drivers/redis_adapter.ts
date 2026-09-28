@@ -100,6 +100,10 @@ export class RedisAdapter implements Adapter {
     return `${this.#getDedupPrefix(queue)}${dedupId}`
   }
 
+  /**
+   * Scripts that build dedup keys from this prefix must receive it in KEYS so
+   * ioredis applies the connection key prefix to it.
+   */
   #getDedupPrefix(queue: string): string {
     return `${redisKey}::${queue}::dedup::`
   }
@@ -155,30 +159,30 @@ export class RedisAdapter implements Adapter {
     if (!keep) {
       await this.#connection.eval(
         REMOVE_JOB_SCRIPT,
-        3,
+        4,
         keys.data,
         keys.active,
         keys.overlay,
-        jobId,
-        dedupPrefix
+        dedupPrefix,
+        jobId
       )
       return
     }
 
     await this.#connection.eval(
       FINALIZE_JOB_SCRIPT,
-      5,
+      6,
       keys.data,
       keys.active,
       keys.completed,
       keys.completedIndex,
       keys.overlay,
+      dedupPrefix,
       jobId,
       Date.now().toString(),
       maxAge.toString(),
       maxCount.toString(),
-      '',
-      dedupPrefix
+      ''
     )
   }
 
@@ -195,30 +199,30 @@ export class RedisAdapter implements Adapter {
     if (!keep) {
       await this.#connection.eval(
         REMOVE_JOB_SCRIPT,
-        3,
+        4,
         keys.data,
         keys.active,
         keys.overlay,
-        jobId,
-        dedupPrefix
+        dedupPrefix,
+        jobId
       )
       return
     }
 
     await this.#connection.eval(
       FINALIZE_JOB_SCRIPT,
-      5,
+      6,
       keys.data,
       keys.active,
       keys.failed,
       keys.failedIndex,
       keys.overlay,
+      dedupPrefix,
       jobId,
       Date.now().toString(),
       maxAge.toString(),
       maxCount.toString(),
-      error?.message || '',
-      dedupPrefix
+      error?.message || ''
     )
   }
 
@@ -401,15 +405,15 @@ export class RedisAdapter implements Adapter {
 
     const recovered = await this.#connection.eval(
       RECOVER_STALLED_JOBS_SCRIPT,
-      4,
+      5,
       keys.data,
       keys.active,
       keys.pending,
       keys.overlay,
+      this.#getDedupPrefix(queue),
       now.toString(),
       stalledThreshold.toString(),
-      maxStalledCount.toString(),
-      this.#getDedupPrefix(queue)
+      maxStalledCount.toString()
     )
 
     return recovered as number
