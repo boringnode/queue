@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { sql, type ColumnType, type Kysely, type Transaction, type Updateable } from 'kysely'
-import type { Adapter, AcquiredJob, PushResult } from '../contracts/adapter.js'
+import type { Adapter, AcquiredJob, PushResult, StalledJobsRecovery } from '../contracts/adapter.js'
 import type {
   JobData,
   JobRecord,
@@ -593,8 +593,9 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   async recoverStalledJobs(
     queue: string,
     stalledThreshold: number,
-    maxStalledCount: number
-  ): Promise<number> {
+    maxStalledCount: number,
+    maxExceeded: number
+  ): Promise<StalledJobsRecovery> {
     const now = Date.now()
 
     return this.#withTransaction(this.#connection, async (trx) => {
@@ -609,18 +610,25 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
 
       const stalledJobs = await query.execute()
       let recovered = 0
+      const exceeded: AcquiredJob[] = []
 
       for (const row of stalledJobs) {
         const jobData = JSON.parse(row.data) as JobData
         const stalledCount = jobData.stalledCount ?? 0
 
         if (stalledCount >= maxStalledCount) {
-          await this.#jobs(trx)
-            .deleteFrom(this.#jobsTable)
+          // Past maxExceeded, the job stays stalled for a later recovery.
+          if (exceeded.length >= maxExceeded) continue
+
+          // Reacquire for this worker, which fails it through the regular path.
+          const result = await this.#jobs(trx)
+            .updateTable(this.#jobsTable)
+            .set({ worker_id: this.#workerId, acquired_at: now })
             .where('id', '=', row.id)
             .where('queue', '=', queue)
             .where('status', '=', 'active')
-            .execute()
+            .executeTakeFirst()
+          if (result.numUpdatedRows > 0n) exceeded.push({ ...jobData, acquiredAt: now })
           continue
         }
 
@@ -641,7 +649,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
         if (result.numUpdatedRows > 0n) recovered++
       }
 
-      return recovered
+      return { recovered, exceeded }
     })
   }
 

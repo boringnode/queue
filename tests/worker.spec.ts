@@ -1205,8 +1205,21 @@ test.group('Worker', () => {
       },
     }
 
+    let executed = false
+    let hookError: Error | undefined
+    let hookPayload: unknown
+
     class TestJob extends Job {
-      async execute() {}
+      static options = { removeOnFail: false }
+
+      async execute() {
+        executed = true
+      }
+
+      async failed(error: Error) {
+        hookError = error
+        hookPayload = this.payload
+      }
     }
 
     Locator.register('TestJob', TestJob)
@@ -1216,7 +1229,7 @@ test.group('Worker', () => {
     await sharedAdapter.pushOn('default', {
       id: 'multi-stalled-job',
       name: 'TestJob',
-      payload: {},
+      payload: { orderId: 42 },
       attempts: 0,
       stalledCount: 1, // Already stalled once
     })
@@ -1227,7 +1240,7 @@ test.group('Worker', () => {
     // Wait for it to become stalled
     await setTimeout(100)
 
-    // Now start a worker - it should detect the stalled job but fail it permanently
+    // Now start a worker - it should detect the stalled job and fail it permanently
     // because stalledCount (1) >= maxStalledCount (1)
     const worker = new Worker(localConfig)
 
@@ -1236,7 +1249,7 @@ test.group('Worker', () => {
       await worker.stop()
     })
 
-    // Run cycles - job should NOT be recovered, just removed
+    // Run cycles - the job must not run again
     let cycles = 0
     let foundJob = false
     while (cycles < 5) {
@@ -1253,6 +1266,132 @@ test.group('Worker', () => {
     }
 
     assert.isFalse(foundJob, 'Job should not have been recovered - it exceeded maxStalledCount')
+    assert.isFalse(executed)
+
+    // It went through the regular failure path: failed() hook and retention
+    assert.instanceOf(hookError, errors.E_JOB_STALLED)
+    assert.deepEqual(hookPayload, { orderId: 42 })
+
+    const record = await sharedAdapter.getJob('multi-stalled-job', 'default')
+    assert.equal(record!.status, 'failed')
+    assert.equal(record!.error, hookError!.message)
+  })
+
+  test('should keep processing and renewing while a stalled job runs failed()', async ({
+    assert,
+    cleanup,
+  }) => {
+    const sharedAdapter = memory()()
+    const hook = Promise.withResolvers<void>()
+    let hookCalls = 0
+    let executedJobId: string | undefined
+
+    class TestJob extends Job {
+      async execute() {
+        executedJobId = this.context.jobId
+      }
+
+      async failed() {
+        hookCalls++
+        await hook.promise
+      }
+    }
+
+    Locator.register('TestJob', TestJob)
+
+    sharedAdapter.setWorkerId('crashed-worker')
+    await sharedAdapter.pushOn('default', {
+      id: 'stalled-slow-hook',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      stalledCount: 1,
+    })
+    await sharedAdapter.popFrom('default')
+    await setTimeout(100)
+
+    await sharedAdapter.pushOn('default', {
+      id: 'fresh-job',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+    })
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      worker: { concurrency: 2, stalledThreshold: 50, stalledInterval: 50, maxStalledCount: 1 },
+    })
+
+    cleanup(async () => {
+      hook.resolve()
+      Locator.clear()
+      await worker.stop()
+    })
+
+    // The stalled job's failed() hangs, but the worker still starts the fresh job.
+    const started = await worker.processCycle(['default'])
+    assert.equal(started?.type, 'started')
+    assert.equal(started?.type === 'started' && started.job.id, 'fresh-job')
+    assert.equal(hookCalls, 1)
+
+    // The heartbeat keeps renewing the stalled job while failed() runs.
+    await setTimeout(120)
+    sharedAdapter.setWorkerId('another-worker')
+    const { exceeded } = await sharedAdapter.recoverStalledJobs('default', 50, 1, 100)
+    assert.deepEqual(exceeded, [])
+
+    hook.resolve()
+    await worker.stop()
+
+    assert.equal(executedJobId, 'fresh-job')
+    assert.equal(hookCalls, 1)
+    assert.isNull(await sharedAdapter.getJob('stalled-slow-hook', 'default'))
+  })
+
+  test('should remove a failed stalled job with the default retention', async ({
+    assert,
+    cleanup,
+  }) => {
+    const sharedAdapter = memory()()
+    let hookCalls = 0
+
+    class TestJob extends Job {
+      async execute() {}
+
+      async failed() {
+        hookCalls++
+      }
+    }
+
+    Locator.register('TestJob', TestJob)
+
+    sharedAdapter.setWorkerId('crashed-worker')
+    await sharedAdapter.pushOn('default', {
+      id: 'stalled-default-retention',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      stalledCount: 1,
+    })
+    await sharedAdapter.popFrom('default')
+    await setTimeout(100)
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      worker: { stalledThreshold: 50, stalledInterval: 50, maxStalledCount: 1 },
+    })
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await worker.processCycle(['default'])
+
+    assert.equal(hookCalls, 1)
+    assert.isNull(await sharedAdapter.getJob('stalled-default-retention', 'default'))
   })
 
   test('should not process the same job multiple times with concurrency > 1', async ({

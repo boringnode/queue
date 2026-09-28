@@ -475,7 +475,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     adapter.setWorkerId('worker-1')
 
     // No jobs at all
-    const recovered = await adapter.recoverStalledJobs('test-queue', 1000, 1)
+    const { recovered } = await adapter.recoverStalledJobs('test-queue', 1000, 1, 100)
     assert.equal(recovered, 0)
   })
 
@@ -495,7 +495,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.isNotNull(job)
 
     // Try to recover with a long threshold (job is not stalled yet)
-    const recovered = await adapter.recoverStalledJobs('test-queue', 60000, 1)
+    const { recovered } = await adapter.recoverStalledJobs('test-queue', 60000, 1, 100)
     assert.equal(recovered, 0)
 
     // Job should still be active, not back in pending
@@ -519,7 +519,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     // Wait a bit and recover with a very short threshold
     await new Promise((resolve) => setTimeout(resolve, 50))
-    const recovered = await adapter.recoverStalledJobs('test-queue', 10, 1)
+    const { recovered } = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
     assert.equal(recovered, 1)
 
     // Job should be back in pending queue
@@ -548,7 +548,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     await adapter.popFrom('test-queue')
     await new Promise((resolve) => setTimeout(resolve, 20))
-    await adapter.recoverStalledJobs('test-queue', 10, 3)
+    await adapter.recoverStalledJobs('test-queue', 10, 3, 100)
 
     const recovered = await adapter.popFrom('test-queue')
 
@@ -576,7 +576,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     // First stall cycle
     await adapter.popFrom('test-queue')
     await new Promise((resolve) => setTimeout(resolve, 50))
-    await adapter.recoverStalledJobs('test-queue', 10, 3)
+    await adapter.recoverStalledJobs('test-queue', 10, 3, 100)
 
     const job1 = await adapter.popFrom('test-queue')
     assert.isNotNull(job1)
@@ -584,14 +584,59 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     // Second stall cycle
     await new Promise((resolve) => setTimeout(resolve, 50))
-    await adapter.recoverStalledJobs('test-queue', 10, 3)
+    await adapter.recoverStalledJobs('test-queue', 10, 3, 100)
 
     const job2 = await adapter.popFrom('test-queue')
     assert.isNotNull(job2)
     assert.equal(job2!.stalledCount, 2)
   })
 
-  test('recoverStalledJobs should fail job permanently when maxStalledCount exceeded', async ({
+  test('recoverStalledJobs should hand back jobs that exceeded maxStalledCount', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('test-queue', {
+      id: 'job-1',
+      name: 'TestJob',
+      payload: { foo: 'bar' },
+      attempts: 0,
+      stalledCount: 0,
+    })
+
+    // First stall - recovered back to pending (stalledCount becomes 1)
+    await adapter.popFrom('test-queue')
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const first = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
+    assert.equal(first.recovered, 1)
+    assert.deepEqual(first.exceeded, [])
+
+    // Second stall - exceeds maxStalledCount=1 and is reacquired by the recovering worker
+    await adapter.popFrom('test-queue')
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    adapter.setWorkerId('recovering-worker')
+    const before = Date.now()
+    const second = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
+
+    assert.equal(second.recovered, 0)
+    assert.lengthOf(second.exceeded, 1)
+    assert.equal(second.exceeded[0].id, 'job-1')
+    assert.deepEqual(second.exceeded[0].payload, { foo: 'bar' })
+    assert.equal(second.exceeded[0].stalledCount, 1)
+    assert.isAtLeast(second.exceeded[0].acquiredAt, before)
+
+    // The job stays active: it is neither pending nor removed
+    assert.isNull(await adapter.popFrom('test-queue'))
+    assert.equal((await adapter.getJob('job-1', 'test-queue'))!.status, 'active')
+
+    // Only the recovering worker owns the lease now
+    assert.equal(await adapter.renewJobs('test-queue', ['job-1']), 1)
+    adapter.setWorkerId('worker-1')
+    assert.equal(await adapter.renewJobs('test-queue', ['job-1']), 0)
+  })
+
+  test('recoverStalledJobs should hand back an exceeded job again if it is not failed', async ({
     assert,
   }) => {
     const adapter = await options.createAdapter()
@@ -602,24 +647,77 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: {},
       attempts: 0,
-      stalledCount: 0,
+      stalledCount: 1,
     })
 
-    // First stall - should recover (stalledCount becomes 1)
     await adapter.popFrom('test-queue')
     await new Promise((resolve) => setTimeout(resolve, 50))
-    let recovered = await adapter.recoverStalledJobs('test-queue', 10, 1)
-    assert.equal(recovered, 1)
+    const first = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
+    assert.lengthOf(first.exceeded, 1)
 
-    // Second stall - should fail permanently (stalledCount would be 2, exceeds maxStalledCount=1)
+    // The recovering worker crashed before failing it: the job stalls again
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const second = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
+    assert.equal(second.recovered, 0)
+    assert.lengthOf(second.exceeded, 1)
+    assert.equal(second.exceeded[0].id, 'job-1')
+    assert.equal(second.exceeded[0].stalledCount, 1)
+  })
+
+  test('recoverStalledJobs should reacquire at most maxExceeded exceeded jobs', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    for (const id of ['job-1', 'job-2']) {
+      await adapter.pushOn('test-queue', {
+        id,
+        name: 'TestJob',
+        payload: {},
+        attempts: 0,
+        stalledCount: 1,
+      })
+      await adapter.popFrom('test-queue')
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // No free slot: exceeded jobs are left stalled
+    const none = await adapter.recoverStalledJobs('test-queue', 10, 1, 0)
+    assert.deepEqual(none.exceeded, [])
+
+    const first = await adapter.recoverStalledJobs('test-queue', 10, 1, 1)
+    assert.lengthOf(first.exceeded, 1)
+
+    // The other job is still stalled and comes back on the next pass
+    const second = await adapter.recoverStalledJobs('test-queue', 10, 1, 1)
+    assert.lengthOf(second.exceeded, 1)
+    assert.notEqual(second.exceeded[0].id, first.exceeded[0].id)
+  })
+
+  test('failJob should finalize a job handed back by recoverStalledJobs', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('test-queue', {
+      id: 'job-1',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      stalledCount: 1,
+    })
+
     await adapter.popFrom('test-queue')
     await new Promise((resolve) => setTimeout(resolve, 50))
-    recovered = await adapter.recoverStalledJobs('test-queue', 10, 1)
-    assert.equal(recovered, 0) // Not recovered, but failed
+    const { exceeded } = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
+    assert.lengthOf(exceeded, 1)
 
-    // Job should be gone (failed permanently)
-    const nextJob = await adapter.popFrom('test-queue')
-    assert.isNull(nextJob)
+    await adapter.failJob('job-1', 'test-queue', new Error('stalled'), false)
+
+    const record = await adapter.getJob('job-1', 'test-queue')
+    assert.equal(record!.status, 'failed')
+    assert.equal(record!.error, 'stalled')
   })
 
   test('recoverStalledJobs should handle multiple stalled jobs', async ({ assert }) => {
@@ -645,7 +743,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     // Recover all stalled jobs
     await new Promise((resolve) => setTimeout(resolve, 50))
-    const recovered = await adapter.recoverStalledJobs('test-queue', 10, 1)
+    const { recovered } = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
     assert.equal(recovered, 2)
 
     // Both jobs should be back
@@ -684,7 +782,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     await new Promise((resolve) => setTimeout(resolve, 50))
 
-    const recoveredA = await adapter.recoverStalledJobs('queue-a', 10, 1)
+    const { recovered: recoveredA } = await adapter.recoverStalledJobs('queue-a', 10, 1, 100)
     assert.equal(recoveredA, 1)
 
     const recoveredJobA = await adapter.popFrom('queue-a')
@@ -696,7 +794,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     await new Promise((resolve) => setTimeout(resolve, 50))
 
-    const recoveredB = await adapter.recoverStalledJobs('queue-b', 10, 1)
+    const { recovered: recoveredB } = await adapter.recoverStalledJobs('queue-b', 10, 1, 100)
     assert.equal(recoveredB, 1)
 
     const recoveredJobB = await adapter.popFrom('queue-b')
@@ -728,7 +826,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
       // Even though more than 30ms has elapsed in total, the job is never
       // stalled because each renewal refreshes its acquired timestamp.
-      const recovered = await adapter.recoverStalledJobs('test-queue', 30, 1)
+      const { recovered } = await adapter.recoverStalledJobs('test-queue', 30, 1, 100)
       assert.equal(recovered, 0)
     }
 
@@ -753,7 +851,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     // Let it stall and recover it back to pending.
     await new Promise((resolve) => setTimeout(resolve, 30))
-    const recovered = await adapter.recoverStalledJobs('test-queue', 10, 1)
+    const { recovered } = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
     assert.equal(recovered, 1)
 
     // A late heartbeat for the (no longer active) job must not resurrect it.

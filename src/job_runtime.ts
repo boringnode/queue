@@ -16,7 +16,7 @@ import type {
 import type { JobExecuteMessage } from './types/tracing_channels.js'
 import { parse } from './utils.js'
 
-type PermanentFailureReason = 'timeout' | 'no-retries' | 'max-attempts'
+type PermanentFailureReason = 'timeout' | 'no-retries' | 'max-attempts' | 'stalled'
 
 export type JobExecutionOutcome =
   | { type: 'completed'; removeOnComplete?: JobRetention }
@@ -92,6 +92,58 @@ export class JobExecutionRuntime {
     return this.#executionWrapper(run, job, queue)
   }
 
+  /**
+   * Fail a Job that stalled more than `maxStalledCount` times, without running it.
+   *
+   * The `failed()` hook receives `E_JOB_STALLED`, and the outcome carries the
+   * Job's own retention so the caller finalizes it like any permanent failure.
+   * The attempt is not traced, since the Job does not execute.
+   */
+  async failStalled(
+    job: AcquiredJob,
+    queue: string,
+    maxStalledCount: number
+  ): Promise<JobExecutionOutcome> {
+    let instance: Job
+    let options: JobOptions
+
+    try {
+      ;({ instance, options } = await this.#instantiate(job))
+    } catch (error) {
+      return {
+        type: 'initialization-failed',
+        error: error as Error,
+        removeOnFail: this.#configResolver.resolveJobOptions(queue).removeOnFail,
+      }
+    }
+
+    const error = new errors.E_JOB_STALLED([job.name, maxStalledCount])
+    const retention = this.#configResolver.resolveJobOptions(queue, options)
+    instance.$hydrate(job.payload, this.#createContext(job, queue))
+
+    let failedHookError: Error | undefined
+    try {
+      await instance.failed?.(error)
+    } catch (hookError) {
+      failedHookError = hookError as Error
+    }
+
+    return {
+      type: 'failed',
+      reason: 'stalled',
+      error,
+      removeOnFail: retention.removeOnFail,
+      failedHookError,
+    }
+  }
+
+  async #instantiate(job: AcquiredJob): Promise<{ instance: Job; options: JobOptions }> {
+    const JobClass = await this.#resolveJob(job.name)
+    const instance = this.#jobFactory ? await this.#jobFactory(JobClass) : new JobClass()
+
+    return { instance, options: JobClass.options || {} }
+  }
+
   async #executeAttempt(
     job: AcquiredJob,
     queue: string,
@@ -101,9 +153,7 @@ export class JobExecutionRuntime {
     let options: JobOptions
 
     try {
-      const JobClass = await this.#resolveJob(job.name)
-      options = JobClass.options || {}
-      instance = this.#jobFactory ? await this.#jobFactory(JobClass) : new JobClass()
+      ;({ instance, options } = await this.#instantiate(job))
     } catch (error) {
       const initializationError = error as Error
       const retention = this.#configResolver.resolveJobOptions(queue)

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { CronExpressionParser } from 'cron-parser'
-import type { Adapter, AcquiredJob, PushResult } from '../contracts/adapter.js'
+import type { Adapter, AcquiredJob, PushResult, StalledJobsRecovery } from '../contracts/adapter.js'
 import type {
   JobData,
   JobClass,
@@ -308,10 +308,12 @@ export class FakeAdapter implements Adapter {
   async recoverStalledJobs(
     queue: string,
     stalledThreshold: number,
-    maxStalledCount: number
-  ): Promise<number> {
+    maxStalledCount: number,
+    maxExceeded: number
+  ): Promise<StalledJobsRecovery> {
     const now = Date.now()
     let recovered = 0
+    const exceeded: AcquiredJob[] = []
 
     for (const [jobId, active] of this.#activeJobs.entries()) {
       if (active.queue !== queue) {
@@ -328,9 +330,13 @@ export class FakeAdapter implements Adapter {
 
       // Check if job has exceeded max stalled count
       if (currentStalledCount >= maxStalledCount) {
-        // Fail permanently - just remove from active
-        this.#activeJobs.delete(jobId)
-        this.#cleanupDedupForJob(active.queue, active.job)
+        // Past maxExceeded, the job stays stalled for a later recovery.
+        if (exceeded.length >= maxExceeded) continue
+
+        // Reacquire for this worker, which fails it through the regular path.
+        active.acquiredAt = now
+        active.workerId = this.#workerId
+        exceeded.push({ ...active.job, acquiredAt: now })
         continue
       }
 
@@ -346,7 +352,7 @@ export class FakeAdapter implements Adapter {
       recovered++
     }
 
-    return recovered
+    return { recovered, exceeded }
   }
 
   async renewJobs(queue: string, jobIds: string[]): Promise<number> {

@@ -211,6 +211,108 @@ test.group('JobExecutionRuntime', () => {
     assert.isNumber(traceMessage?.duration)
   })
 
+  test('fails a stalled Job through failed() without executing or tracing it', async ({
+    assert,
+    cleanup,
+  }) => {
+    let executed = false
+    let traced = false
+    let hookError: Error | undefined
+    let hookPayload: unknown
+    let hookContext: Job['context'] | undefined
+    const captureTrace = () => {
+      traced = true
+    }
+
+    executeChannel.start.subscribe(captureTrace)
+    cleanup(() => executeChannel.start.unsubscribe(captureTrace))
+
+    class StalledJob extends Job {
+      static options = { removeOnFail: { count: 5 } }
+
+      async execute() {
+        executed = true
+      }
+
+      async failed(error: Error) {
+        hookError = error
+        hookPayload = this.payload
+        hookContext = this.context
+      }
+    }
+
+    const runtime = new JobExecutionRuntime({
+      resolveJob: async () => StalledJob,
+      configResolver: new QueueConfigResolver({ globalJobOptions: { removeOnFail: false } }),
+      executionWrapper: async () => {
+        throw new Error('the execution wrapper must not run')
+      },
+    })
+
+    const outcome = await runtime.failStalled(acquiredJob(), 'default', 1)
+
+    assert.isFalse(executed)
+    assert.isFalse(traced)
+    assert.equal(outcome.type, 'failed')
+    if (outcome.type !== 'failed') return
+
+    assert.equal(outcome.reason, 'stalled')
+    assert.instanceOf(outcome.error, errors.E_JOB_STALLED)
+    assert.equal(outcome.error.message, 'The job "TestJob" stalled more than the allowed 1 time(s)')
+    assert.deepEqual(outcome.removeOnFail, { count: 5 })
+    assert.isUndefined(outcome.failedHookError)
+    assert.strictEqual(hookError, outcome.error)
+    assert.deepEqual(hookPayload, { value: 42 })
+    assert.equal(hookContext?.jobId, 'job-1')
+    assert.equal(hookContext?.stalledCount, 1)
+  })
+
+  test('keeps the stalled failure when failed() throws', async ({ assert }) => {
+    const hookFailure = new Error('hook failed')
+
+    class StalledJob extends Job {
+      async execute() {}
+
+      async failed() {
+        throw hookFailure
+      }
+    }
+
+    const runtime = new JobExecutionRuntime({
+      resolveJob: async () => StalledJob,
+      configResolver: new QueueConfigResolver({}),
+    })
+
+    const outcome = await runtime.failStalled(acquiredJob(), 'default', 1)
+
+    assert.equal(outcome.type, 'failed')
+    if (outcome.type !== 'failed') return
+
+    assert.instanceOf(outcome.error, errors.E_JOB_STALLED)
+    assert.strictEqual(outcome.failedHookError, hookFailure)
+  })
+
+  test('returns initialization-failed when a stalled Job cannot be instantiated', async ({
+    assert,
+  }) => {
+    const initializationError = new Error('unknown job')
+
+    const runtime = new JobExecutionRuntime({
+      resolveJob: async () => {
+        throw initializationError
+      },
+      configResolver: new QueueConfigResolver({ globalJobOptions: { removeOnFail: false } }),
+    })
+
+    const outcome = await runtime.failStalled(acquiredJob(), 'default', 1)
+
+    assert.deepEqual(outcome, {
+      type: 'initialization-failed',
+      error: initializationError,
+      removeOnFail: false,
+    })
+  })
+
   test('aborts timed out Jobs and removes the abort listener', async ({ assert, cleanup }) => {
     const controller = new AbortController()
     const originalTimeout = AbortSignal.timeout
@@ -252,7 +354,8 @@ test.group('JobExecutionRuntime', () => {
       configResolver: new QueueConfigResolver({}),
     })
     const execution = runtime.execute(acquiredJob(), 'default')
-    await Promise.resolve()
+    // Let the runtime resolve the Job and register its abort listener before aborting.
+    await new Promise((resolve) => setImmediate(resolve))
 
     controller.abort()
     const outcome = await execution

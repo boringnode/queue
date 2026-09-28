@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { Redis, type RedisOptions } from 'ioredis'
 import { DEFAULT_PRIORITY } from '../constants.js'
 import { calculateScore } from '../utils.js'
-import type { Adapter, AcquiredJob, PushResult } from '../contracts/adapter.js'
+import type { Adapter, AcquiredJob, PushResult, StalledJobsRecovery } from '../contracts/adapter.js'
 import type { DedupOutcome } from '../types/main.js'
 import type {
   JobData,
@@ -398,25 +398,38 @@ export class RedisAdapter implements Adapter {
   async recoverStalledJobs(
     queue: string,
     stalledThreshold: number,
-    maxStalledCount: number
-  ): Promise<number> {
+    maxStalledCount: number,
+    maxExceeded: number
+  ): Promise<StalledJobsRecovery> {
     const keys = this.#getKeys(queue)
     const now = Date.now()
 
-    const recovered = await this.#connection.eval(
+    const [recovered, ...exceeded] = (await this.#connection.eval(
       RECOVER_STALLED_JOBS_SCRIPT,
-      5,
+      4,
       keys.data,
       keys.active,
       keys.pending,
       keys.overlay,
-      this.#getDedupPrefix(queue),
       now.toString(),
       stalledThreshold.toString(),
-      maxStalledCount.toString()
-    )
+      maxStalledCount.toString(),
+      this.#workerId,
+      maxExceeded.toString()
+    )) as [number, ...string[]]
 
-    return recovered as number
+    return {
+      recovered,
+      exceeded: exceeded.map((result) => {
+        const { data, overlay, acquiredAt } = JSON.parse(result) as {
+          data: string
+          overlay?: string
+          acquiredAt: number
+        }
+
+        return { ...hydrateRedisJob(data, overlay), acquiredAt }
+      }),
+    }
   }
 
   async renewJobs(queue: string, jobIds: string[]): Promise<number> {

@@ -40,6 +40,11 @@ export const E_JOB_MAX_ATTEMPTS_REACHED = createError<[jobName: string]>(
   'E_JOB_MAX_ATTEMPTS_REACHED'
 )
 
+export const E_JOB_STALLED = createError<[jobName: string, maxStalledCount: number]>(
+  'The job "%s" stalled more than the allowed %d time(s)',
+  'E_JOB_STALLED'
+)
+
 export const E_JOB_TIMEOUT = createError<[jobName: string, timeout: number]>(
   'The job "%s" has exceeded the timeout of %dms',
   'E_JOB_TIMEOUT'

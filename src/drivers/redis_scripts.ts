@@ -336,22 +336,27 @@ ${REDIS_JOB_STORAGE_LUA}
  * Lua script for recovering stalled jobs.
  * Scans the active hash for jobs that have been active too long.
  * - Jobs within maxStalledCount: move back to pending with incremented stalledCount
- * - Jobs exceeding maxStalledCount: remove permanently (fail)
- * Returns the number of recovered jobs (not including failed ones).
+ * - Jobs exceeding maxStalledCount: up to max_exceeded of them stay active,
+ *   reacquired by the calling worker, and are returned so the worker fails
+ *   them through the regular path. The others are left stalled.
+ * Returns {recovered, exceeded job 1, exceeded job 2, ...}.
  */
 export const RECOVER_STALLED_JOBS_SCRIPT = `
   local data_key = KEYS[1]
   local active_key = KEYS[2]
   local pending_key = KEYS[3]
   local overlay_key = KEYS[4]
-  local dedup_prefix = KEYS[5]
   local now = tonumber(ARGV[1])
   local stalled_threshold = tonumber(ARGV[2])
   local max_stalled_count = tonumber(ARGV[3])
+  local worker_id = ARGV[4]
+  local max_exceeded = tonumber(ARGV[5])
 
 ${REDIS_JOB_STORAGE_LUA}
 
   local recovered = 0
+  -- The first element is replaced by the recovered count before returning.
+  local result = { 0 }
   local stalled_cutoff = now - stalled_threshold
 
   -- Get all active jobs
@@ -371,20 +376,21 @@ ${REDIS_JOB_STORAGE_LUA}
         local overlay = read_job_overlay(overlay_key, job_id)
         local current_stalled_count = overlay.stalledCount or job.stalledCount or 0
 
-        -- Remove from active hash
-        redis.call('HDEL', active_key, job_id)
-
         -- Check if job has exceeded max stalled count
         if current_stalled_count >= max_stalled_count then
-          -- Job failed permanently, remove data + dedup key (only if pointer still ours)
-          if job.dedup and job.dedup.id then
-            local dkey = dedup_prefix .. job.dedup.id
-            if redis.call('GET', dkey) == job_id then
-              redis.call('DEL', dkey)
-            end
+          -- Reacquire for the calling worker, which fails it through the regular
+          -- path. Past max_exceeded, the job stays stalled for a later recovery.
+          if #result - 1 < max_exceeded then
+            redis.call('HSET', active_key, job_id, cjson.encode({
+              workerId = worker_id,
+              acquiredAt = now
+            }))
+            result[#result + 1] = encode_job_result(job_data, overlay_key, job_id, {
+              acquiredAt = now
+            })
           end
-          delete_job_data(data_key, overlay_key, job_id)
         else
+          redis.call('HDEL', active_key, job_id)
           -- Recover: increment stalledCount without rewriting opaque job JSON.
           overlay.stalledCount = current_stalled_count + 1
           write_job_overlay(overlay_key, job_id, overlay)
@@ -398,7 +404,8 @@ ${REDIS_JOB_STORAGE_LUA}
     end
   end
 
-  return recovered
+  result[1] = recovered
+  return result
 `
 
 /**

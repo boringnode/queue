@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import KnexPkg from 'knex'
 import type { Knex } from 'knex'
-import type { Adapter, AcquiredJob, PushResult } from '../contracts/adapter.js'
+import type { Adapter, AcquiredJob, PushResult, StalledJobsRecovery } from '../contracts/adapter.js'
 import type {
   DedupOutcome,
   JobData,
@@ -602,14 +602,16 @@ export class KnexAdapter implements Adapter {
   async recoverStalledJobs(
     queue: string,
     stalledThreshold: number,
-    maxStalledCount: number
-  ): Promise<number> {
+    maxStalledCount: number,
+    maxExceeded: number
+  ): Promise<StalledJobsRecovery> {
     const now = Date.now()
     const stalledCutoff = now - stalledThreshold
 
     // Use a transaction with row locking to prevent race conditions
     return this.#connection.transaction(async (trx) => {
       let recovered = 0
+      const exceeded: AcquiredJob[] = []
 
       let query = trx(this.#jobsTable)
         .where('queue', queue)
@@ -628,8 +630,17 @@ export class KnexAdapter implements Adapter {
         const currentStalledCount = jobData.stalledCount ?? 0
 
         if (currentStalledCount >= maxStalledCount) {
-          // Fail permanently - remove the job
-          await trx(this.#jobsTable).where('id', row.id).where('queue', queue).delete()
+          // Past maxExceeded, the job stays stalled for a later recovery.
+          if (exceeded.length >= maxExceeded) continue
+
+          // Reacquire for this worker, which fails it through the regular path.
+          const updated = await trx(this.#jobsTable)
+            .where('id', row.id)
+            .where('queue', queue)
+            .where('status', 'active')
+            .update({ worker_id: this.#workerId, acquired_at: now })
+
+          if (updated > 0) exceeded.push({ ...jobData, acquiredAt: now })
         } else {
           // Recover: increment stalledCount and put back in pending
           jobData.stalledCount = currentStalledCount + 1
@@ -651,7 +662,7 @@ export class KnexAdapter implements Adapter {
         }
       }
 
-      return recovered
+      return { recovered, exceeded }
     })
   }
 

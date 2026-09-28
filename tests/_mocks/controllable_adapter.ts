@@ -122,7 +122,7 @@ export class ControllableAdapter extends MemoryAdapter {
 
   override async recoverStalledJobs(
     ...args: Parameters<MemoryAdapter['recoverStalledJobs']>
-  ): Promise<number> {
+  ): ReturnType<MemoryAdapter['recoverStalledJobs']> {
     return this.stalledChecks.run(() => super.recoverStalledJobs(...args))
   }
 

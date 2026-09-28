@@ -29,6 +29,21 @@ export interface AcquiredJob extends JobData {
 }
 
 /**
+ * Result of a stalled job recovery pass.
+ */
+export interface StalledJobsRecovery {
+  /** Number of stalled jobs moved back to pending */
+  recovered: number
+
+  /**
+   * Stalled jobs that exceeded `maxStalledCount`. They stay active, reacquired
+   * by the calling worker (the one set via setWorkerId), which fails them
+   * through the regular failure path.
+   */
+  exceeded: AcquiredJob[]
+}
+
+/**
  * Adapter interface for queue storage backends.
  *
  * Implementations handle job persistence, atomic operations, and
@@ -77,18 +92,24 @@ export interface Adapter {
    * A stalled job is one where the worker stopped responding (e.g., crash).
    *
    * Jobs within maxStalledCount are moved back to pending.
-   * Jobs exceeding maxStalledCount are failed permanently.
+   * Jobs exceeding maxStalledCount are not removed: up to `maxExceeded` of
+   * them are reacquired atomically by the calling worker (acquiredAt set to
+   * now) and returned so the worker can fail them. The others are left
+   * untouched, still stalled, for a later recovery. If the worker crashes
+   * before failing a returned job, it stalls again and comes back later.
    *
    * @param queue - The queue to check for stalled jobs
    * @param stalledThreshold - Duration in ms after which a job is considered stalled
    * @param maxStalledCount - Maximum times a job can be recovered before failing
-   * @returns Number of jobs that were recovered (not including permanently failed ones)
+   * @param maxExceeded - Maximum number of exceeded jobs to reacquire in this pass
+   * @returns The number of recovered jobs and the reacquired exceeded jobs
    */
   recoverStalledJobs(
     queue: string,
     stalledThreshold: number,
-    maxStalledCount: number
-  ): Promise<number>
+    maxStalledCount: number,
+    maxExceeded: number
+  ): Promise<StalledJobsRecovery>
 
   /**
    * Renew the acquired timestamp of in-flight jobs (heartbeat).

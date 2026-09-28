@@ -737,6 +737,11 @@ const config = {
 }
 ```
 
+A job is stalled when its worker stops renewing it for longer than `stalledThreshold`, usually
+because the process crashed. A stalled job goes back to the queue up to `maxStalledCount` times.
+After that, the worker that detects it fails it like any other permanent failure: `failed()`
+receives `E_JOB_STALLED`, and `removeOnFail` decides whether the job is kept in history.
+
 ## Logging
 
 ```typescript

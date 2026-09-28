@@ -4,18 +4,20 @@ import { fake } from '../src/drivers/fake_adapter.js'
 import { JobPool } from '../src/job_pool.js'
 import {
   WorkerSession,
+  type JobExecutor,
   type WorkerSessionOptions,
   type WorkerSessionSettings,
 } from '../src/worker_session.js'
 import { ControllableAdapter } from './_mocks/controllable_adapter.js'
 import { trackPromise } from './_utils/track_promise.js'
 
-type SessionOverrides = Partial<Omit<WorkerSessionOptions, 'settings'>> & {
+type SessionOverrides = Partial<Omit<WorkerSessionOptions, 'settings' | 'jobExecutionRuntime'>> & {
+  jobExecutionRuntime?: Partial<JobExecutor>
   settings?: Partial<WorkerSessionSettings>
 }
 
 function createSession(overrides: SessionOverrides = {}): WorkerSession {
-  const { settings, ...options } = overrides
+  const { settings, jobExecutionRuntime, ...options } = overrides
 
   return new WorkerSession({
     workerId: 'test-worker',
@@ -23,6 +25,12 @@ function createSession(overrides: SessionOverrides = {}): WorkerSession {
     adapter: fake()(),
     jobExecutionRuntime: {
       execute: async () => ({ type: 'completed' as const }),
+      failStalled: async () => ({
+        type: 'failed' as const,
+        reason: 'stalled' as const,
+        error: new Error('stalled'),
+      }),
+      ...jobExecutionRuntime,
     },
     scheduleDispatcher: {
       dispatch: async () => ({ jobId: 'scheduled-job' }),
@@ -514,6 +522,106 @@ test.group('WorkerSession', () => {
 
     assert.isNull(await cycle)
     await stop
+  })
+
+  test('waits for stalled jobs recovered while stopping to be failed', async ({
+    assert,
+    cleanup,
+  }) => {
+    const adapter = new ControllableAdapter()
+    const hookStarted = Promise.withResolvers<void>()
+    const hookGate = Promise.withResolvers<void>()
+
+    adapter.setWorkerId('crashed-worker')
+    await adapter.pushOn('default', {
+      id: 'stalled-job',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      stalledCount: 1,
+    })
+    await adapter.popFrom('default')
+    await setTimeout(20)
+
+    adapter.stalledChecks.block(1)
+    const session = createSession({
+      adapter,
+      jobExecutionRuntime: {
+        async failStalled() {
+          hookStarted.resolve()
+          await hookGate.promise
+          return { type: 'failed', reason: 'stalled', error: new Error('stalled') }
+        },
+      },
+      settings: { stalledThreshold: 10 },
+    })
+    cleanup(async () => {
+      hookGate.resolve()
+      adapter.releaseAll()
+      await session.stop()
+    })
+
+    const cycle = session.processCycle()
+    await adapter.stalledChecks.waitForStarted()
+    const stop = trackPromise(session.stop())
+    adapter.stalledChecks.release(1)
+
+    await hookStarted.promise
+    await setTimeout(20)
+    assert.isFalse(stop.settled)
+
+    hookGate.resolve()
+    await stop.promise
+    assert.isNull(await cycle)
+    assert.isNull(await adapter.getJob('stalled-job', 'default'))
+  })
+
+  test('fails at most as many stalled jobs as there are free slots', async ({
+    assert,
+    cleanup,
+  }) => {
+    const adapter = new ControllableAdapter()
+    const hookGate = Promise.withResolvers<void>()
+    const firstHookStarted = Promise.withResolvers<void>()
+    const failed: string[] = []
+
+    adapter.setWorkerId('crashed-worker')
+    for (const id of ['stalled-1', 'stalled-2']) {
+      await adapter.pushOn('default', {
+        id,
+        name: 'TestJob',
+        payload: {},
+        attempts: 0,
+        stalledCount: 1,
+      })
+      await adapter.popFrom('default')
+    }
+    await setTimeout(20)
+
+    const session = createSession({
+      adapter,
+      jobExecutionRuntime: {
+        async failStalled(job) {
+          failed.push(job.id)
+          firstHookStarted.resolve()
+          await hookGate.promise
+          return { type: 'failed', reason: 'stalled', error: new Error('stalled') }
+        },
+      },
+      settings: { concurrency: 1, stalledThreshold: 10 },
+    })
+    cleanup(async () => {
+      hookGate.resolve()
+      await session.stop()
+    })
+
+    void session.processCycle()
+    await firstHookStarted.promise
+    await setTimeout(20)
+
+    assert.lengthOf(failed, 1)
+    const [other] = ['stalled-1', 'stalled-2'].filter((id) => id !== failed[0])
+    assert.equal((await adapter.getJob(other, 'default'))!.status, 'active')
   })
 
   test('suppresses a stalled-check error after stopping', async ({ assert, cleanup }) => {

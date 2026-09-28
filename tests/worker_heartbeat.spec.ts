@@ -125,8 +125,9 @@ test.group('WorkerHeartbeat', () => {
     await adapter.renewals.waitForStarted()
     await setTimeout(60)
 
-    const recovered = await adapter.recoverStalledJobs('default', 40, 1)
+    const { recovered, exceeded } = await adapter.recoverStalledJobs('default', 40, 1, 100)
     assert.equal(recovered, 0)
+    assert.deepEqual(exceeded, [])
   })
 
   test('stops renewing after stop resolves', async ({ assert, cleanup }) => {

@@ -343,9 +343,11 @@ test.group('Adapter | Redis', (group) => {
       assert.equal(second && typeof second === 'object' && second.outcome, 'added')
       assert.equal(await inspectorConnection.get(dedupKey), 'raw-stall-dedup-uuid-2')
 
-      // First job still active + stalled. With maxStalledCount=0 it fails permanently.
-      const recovered = await adapter.recoverStalledJobs(queue, 10, 0)
+      // First job still active + stalled. With maxStalledCount=0 it is handed back to be failed.
+      const { recovered, exceeded } = await adapter.recoverStalledJobs(queue, 10, 0, 100)
       assert.equal(recovered, 0)
+      assert.lengthOf(exceeded, 1)
+      await adapter.failJob(exceeded[0].id, queue, new Error('stalled'))
 
       assert.equal(await inspectorConnection.get(dedupKey), 'raw-stall-dedup-uuid-2')
 
@@ -403,7 +405,8 @@ test.group('Adapter | Redis', (group) => {
     await push('prefix-stalled', 'stalled-job')
     await adapter.popFrom('prefix-stalled')
     await new Promise((resolve) => setTimeout(resolve, 5))
-    await adapter.recoverStalledJobs('prefix-stalled', 0, 0)
+    await adapter.recoverStalledJobs('prefix-stalled', 0, 0, 100)
+    await adapter.failJob('stalled-job', 'prefix-stalled', new Error('stalled'))
     assert.equal(await dedupExists('prefix-stalled', 'stalled-job'), 0)
   })
 
@@ -666,9 +669,7 @@ test.group('Adapter | Redis', (group) => {
     assert.exists(await connection.hget(metadataKey, 'metadata-prune-uuid-3'))
   })
 
-  test('Redis metadata is removed when stalled recovery drops a permanently stalled job', async ({
-    assert,
-  }) => {
+  test('Redis metadata is removed when a permanently stalled job is failed', async ({ assert }) => {
     const adapter = new RedisAdapter(connection)
     adapter.setWorkerId('worker-1')
     const queue = 'metadata-stalled-clean-queue'
@@ -695,9 +696,12 @@ test.group('Adapter | Redis', (group) => {
     await adapter.popFrom(queue)
     await new Promise((resolve) => setTimeout(resolve, 20))
 
-    const recovered = await adapter.recoverStalledJobs(queue, 10, 0)
-
+    const { recovered, exceeded } = await adapter.recoverStalledJobs(queue, 10, 0, 100)
     assert.equal(recovered, 0)
+    assert.lengthOf(exceeded, 1)
+
+    await adapter.failJob(exceeded[0].id, queue, new Error('stalled'))
+
     assert.isNull(await connection.hget(metadataKey, 'metadata-stalled-uuid-1'))
     assert.isNull(await adapter.getJob('metadata-stalled-uuid-1', queue))
   })
@@ -2038,7 +2042,7 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
 
     assert.equal(second && typeof second === 'object' && second.outcome, 'added')
 
-    const recovered = await knexAdapter.recoverStalledJobs(queue, 1, 1)
+    const { recovered } = await knexAdapter.recoverStalledJobs(queue, 1, 1, 100)
     assert.equal(recovered, 1)
 
     const availableJobs = [await knexAdapter.popFrom(queue), await knexAdapter.popFrom(queue)]

@@ -20,7 +20,7 @@ interface PoolFillResult {
 }
 
 export type InternalOperationWrapper = HeartbeatOperationWrapper
-export type JobExecutor = Pick<JobExecutionRuntime, 'execute'>
+export type JobExecutor = Pick<JobExecutionRuntime, 'execute' | 'failStalled'>
 export interface ScheduleDispatcher {
   dispatch(request: SingleJobDispatchRequest): Promise<unknown>
 }
@@ -71,6 +71,7 @@ export class WorkerSession {
   #stopOperation?: Promise<void>
   #pool = new JobPool()
   #fillOperation?: Promise<PoolFillResult>
+  #stalledCheckOperation?: Promise<void>
   #completionOperation?: Promise<PoolEntry>
   #completedEntry?: PoolEntry
   #completionDelayController?: AbortController
@@ -197,6 +198,12 @@ export class WorkerSession {
     if (this.#fillOperation) {
       debug('worker %s: waiting for in-flight job acquisitions to complete', this.#workerId)
       await this.#fillOperation.catch(() => {})
+    }
+
+    // A recovery in flight can still add reacquired stalled jobs to the pool.
+    if (this.#stalledCheckOperation) {
+      debug('worker %s: waiting for the in-flight stalled job check to complete', this.#workerId)
+      await this.#stalledCheckOperation.catch(() => {})
     }
 
     if (!this.#pool.isEmpty()) {
@@ -517,12 +524,31 @@ export class WorkerSession {
 
     this.#lastStalledCheck = now
 
+    const stalledCheckOperation = this.#recoverStalledJobs()
+    this.#stalledCheckOperation = stalledCheckOperation
+
+    try {
+      await stalledCheckOperation
+    } finally {
+      if (this.#stalledCheckOperation === stalledCheckOperation) {
+        this.#stalledCheckOperation = undefined
+      }
+    }
+  }
+
+  async #recoverStalledJobs(): Promise<void> {
     for (const queue of this.#queues) {
-      const recovered = await this.#wrapInternal(() =>
+      if (!this.#running) return
+
+      // Only reacquire as many exceeded jobs as there are free slots. The
+      // others stay stalled and are picked up by a later recovery.
+      const freeSlots = Math.max(this.#settings.concurrency - this.#pool.size, 0)
+      const { recovered, exceeded } = await this.#wrapInternal(() =>
         this.#adapter.recoverStalledJobs(
           queue,
           this.#settings.stalledThreshold,
-          this.#settings.maxStalledCount
+          this.#settings.maxStalledCount,
+          freeSlots
         )
       )
 
@@ -534,7 +560,25 @@ export class WorkerSession {
           queue
         )
       }
+
+      // The adapter reacquired these jobs for this worker. Failing them runs
+      // through the pool like an execution, so the heartbeat keeps their lease
+      // while failed() runs and stop() waits for them. A job left active by an
+      // error stalls again and comes back on a later recovery.
+      for (const job of exceeded) {
+        debug('worker %s: failing job %s after it stalled too many times', this.#workerId, job.id)
+        this.#pool.add(job, queue, this.#failStalled(job, queue))
+      }
     }
+  }
+
+  async #failStalled(job: AcquiredJob, queue: string): Promise<void> {
+    const outcome = await this.#jobExecutionRuntime.failStalled(
+      job,
+      queue,
+      this.#settings.maxStalledCount
+    )
+    await this.#finalizeExecution(job, queue, outcome)
   }
 
   async #dispatchDueSchedules(): Promise<void> {

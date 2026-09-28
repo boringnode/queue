@@ -1,6 +1,6 @@
 import { setTimeout as sleep } from 'node:timers/promises'
 import { QueueManager } from '../queue_manager.js'
-import type { Adapter, AcquiredJob } from '../contracts/adapter.js'
+import type { Adapter, AcquiredJob, StalledJobsRecovery } from '../contracts/adapter.js'
 import type {
   JobData,
   JobRetention,
@@ -98,10 +98,11 @@ export class SyncAdapter implements Adapter {
   recoverStalledJobs(
     _queue: string,
     _stalledThreshold: number,
-    _maxStalledCount: number
-  ): Promise<number> {
+    _maxStalledCount: number,
+    _maxExceeded: number
+  ): Promise<StalledJobsRecovery> {
     // SyncAdapter has no stalled jobs - jobs are executed immediately
-    return Promise.resolve(0)
+    return Promise.resolve({ recovered: 0, exceeded: [] })
   }
 
   renewJobs(_queue: string, _jobIds: string[]): Promise<number> {
