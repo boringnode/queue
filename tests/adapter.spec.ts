@@ -1333,6 +1333,64 @@ test.group('Adapter | Redis', (group) => {
     )
   })
 
+  test('cron finalization does not undo a cleared next run', async ({ assert, cleanup }) => {
+    const secondConnection = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+      keyPrefix: KEY_PREFIX,
+      db: 15,
+    })
+    cleanup(async () => {
+      await secondConnection.quit()
+    })
+
+    const adapter = new RedisAdapter(connection)
+    const secondAdapter = new RedisAdapter(secondConnection)
+    const id = 'cron-finalize-cleared-next-run'
+
+    await adapter.upsertSchedule({
+      id,
+      name: 'CronClearedJob',
+      payload: {},
+      cronExpression: '* * * * *',
+      timezone: 'UTC',
+    })
+    await adapter.updateSchedule(id, { nextRunAt: new Date(Date.now() - 1_000) })
+
+    const originalEval = connection.eval.bind(connection)
+    let releaseClaim!: () => void
+    let claimReturned!: () => void
+    const claimReleased = new Promise<void>((resolve) => {
+      releaseClaim = resolve
+    })
+    const claimHasReturned = new Promise<void>((resolve) => {
+      claimReturned = resolve
+    })
+    let gateNextEval = true
+
+    connection.eval = (async (...args: Parameters<typeof connection.eval>) => {
+      const result = await originalEval(...args)
+      if (gateNextEval) {
+        gateNextEval = false
+        claimReturned()
+        await claimReleased
+      }
+      return result
+    }) as typeof connection.eval
+
+    const claim = adapter.claimDueSchedule()
+    await claimHasReturned
+    await secondAdapter.updateSchedule(id, { nextRunAt: null })
+
+    releaseClaim()
+    await claim
+    connection.eval = originalEval
+
+    const schedule = await adapter.getSchedule(id)
+    assert.isNull(schedule!.nextRunAt)
+    assert.isNull(await connection.zscore('schedules::due', id))
+  })
+
   test('stale cron finalization cannot modify a recreated schedule claim', async ({
     assert,
     cleanup,

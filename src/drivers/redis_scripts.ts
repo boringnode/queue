@@ -575,6 +575,12 @@ ${SCHEDULE_DUE_INDEX_LUA}
     redis.call('HSET', schedule_key, field, value)
   end
 
+  -- An explicit next run supersedes an in-flight cron claim, so the claim's
+  -- finalization must not overwrite it.
+  if updates.next_run_at ~= nil then
+    redis.call('HDEL', schedule_key, 'claim_token')
+  end
+
   sync_schedule_due_index(schedule_key, due_key, id)
 
   return 1

@@ -11,10 +11,10 @@ claiming schedules maintain the derived index, while claiming repairs stale entr
 and index disagree.
 
 Schedule hash and index writes are atomic, and index consistency is preserved across concurrent
-lifecycle changes. Cron finalization now rejects stale calculations when a schedule is deleted or
-reconfigured while its next run is being calculated. Paused schedules retain their next run but stay
-out of the due index until resumed. Claiming also discards malformed due scores instead of allowing
-one corrupt entry to block later schedules.
+lifecycle changes. Cron finalization now rejects stale calculations when a schedule is deleted,
+reconfigured, or has its next run cleared during the calculation. Paused schedules retain their
+next run but stay out of the due index until resumed. Claiming also discards malformed due scores
+instead of allowing one corrupt entry to block later schedules.
 
 ## Bug Fix
 
