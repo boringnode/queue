@@ -25,7 +25,7 @@
     "format": "oxfmt --check .",
     "format:fix": "oxfmt --write .",
     "prepublishOnly": "yarn build",
-    "release": "yarn dlx release-it",
+    "release": "release-it",
     "test": "node --import=@poppinss/ts-exec --enable-source-maps bin/test.ts --reporters=dot",
     "test:coverage": "c8 yarn test",
     "typecheck": "tsc --noEmit"
@@ -47,6 +47,7 @@
     "@opentelemetry/instrumentation": "^0.219.0",
     "@opentelemetry/sdk-trace-base": "^2.8.0",
     "@poppinss/ts-exec": "^1.4.4",
+    "@release-it/conventional-changelog": "^12.0.2",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.9.4",
     "@types/pg": "^8.20.0",
@@ -118,6 +119,14 @@
     "provenance": true
   },
   "release-it": {
+    "plugins": {
+      "@release-it/conventional-changelog": {
+        "preset": {
+          "name": "conventionalcommits",
+          "preMajor": true
+        }
+      }
+    },
     "git": {
       "commitMessage": "chore(release): ${version}",
       "tagAnnotation": "v${version}",

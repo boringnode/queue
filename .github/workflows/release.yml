@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g. patch, minor, major, or explicit like 1.0.0). Leave empty for conventional-commits auto-detect.'
+        description: 'Version to release (e.g. patch, minor, major, or explicit like 1.0.0). Leave empty to compute it from conventional commits: while the package is 0.x, a breaking change gives a minor and anything else a patch.'
         required: false
 
 permissions:
