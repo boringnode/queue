@@ -2788,17 +2788,17 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { version: 1 },
       attempts: 0,
-      dedup: { id: 'TestJob::debounce-1', ttl: 200, extend: true, replace: true },
+      dedup: { id: 'TestJob::debounce-1', ttl: 400, extend: true, replace: true },
     })
 
-    await new Promise((r) => setTimeout(r, 120))
+    await new Promise((r) => setTimeout(r, 250))
 
     const second = await adapter.pushOn('debounce-queue', {
       id: 'debounce-uuid-2',
       name: 'TestJob',
       payload: { version: 2 },
       attempts: 0,
-      dedup: { id: 'TestJob::debounce-1', ttl: 200, extend: true, replace: true },
+      dedup: { id: 'TestJob::debounce-1', ttl: 400, extend: true, replace: true },
     })
     assert.equal(second && typeof second === 'object' && second.outcome, 'replaced')
     assert.equal(second && typeof second === 'object' && second.jobId, 'debounce-uuid-1')
@@ -2806,16 +2806,16 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const midRecord = await adapter.getJob('debounce-uuid-1', 'debounce-queue')
     assert.deepEqual(midRecord!.data.payload, { version: 2 })
 
-    // 240ms total elapsed > original 200ms TTL, but the second dispatch reset
-    // the window at T=120. Only 120ms into the new window → still alive.
-    await new Promise((r) => setTimeout(r, 120))
+    // 500ms total elapsed > original 400ms TTL, but the second dispatch reset
+    // the window at T=250. Only 250ms into the new window → still alive.
+    await new Promise((r) => setTimeout(r, 250))
 
     const third = await adapter.pushOn('debounce-queue', {
       id: 'debounce-uuid-3',
       name: 'TestJob',
       payload: { version: 3 },
       attempts: 0,
-      dedup: { id: 'TestJob::debounce-1', ttl: 200, extend: true, replace: true },
+      dedup: { id: 'TestJob::debounce-1', ttl: 400, extend: true, replace: true },
     })
     assert.equal(third && typeof third === 'object' && third.outcome, 'replaced')
     assert.equal(third && typeof third === 'object' && third.jobId, 'debounce-uuid-1')
