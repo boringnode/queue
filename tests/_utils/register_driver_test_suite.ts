@@ -2506,29 +2506,30 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { n: 1 },
       attempts: 0,
-      dedup: { id: 'TestJob::ext-1', ttl: 100, extend: true },
+      dedup: { id: 'TestJob::ext-1', ttl: 400, extend: true },
     })
 
-    await new Promise((r) => setTimeout(r, 60))
+    await new Promise((r) => setTimeout(r, 250))
 
     const second = await adapter.pushOn('ext-queue', {
       id: 'ext-uuid-2',
       name: 'TestJob',
       payload: { n: 2 },
       attempts: 0,
-      dedup: { id: 'TestJob::ext-1', ttl: 100, extend: true },
+      dedup: { id: 'TestJob::ext-1', ttl: 400, extend: true },
     })
     assert.equal(second && typeof second === 'object' && second.outcome, 'extended')
 
-    await new Promise((r) => setTimeout(r, 60))
+    await new Promise((r) => setTimeout(r, 250))
 
-    // Without extend, 50ms elapsed > 40ms TTL would've expired.
+    // Without the extend at T=250, the window would have expired at T=400. With it,
+    // only 250ms of the new 400ms window have passed.
     const third = await adapter.pushOn('ext-queue', {
       id: 'ext-uuid-3',
       name: 'TestJob',
       payload: { n: 3 },
       attempts: 0,
-      dedup: { id: 'TestJob::ext-1', ttl: 100, extend: true },
+      dedup: { id: 'TestJob::ext-1', ttl: 400, extend: true },
     })
     assert.equal(third && typeof third === 'object' && third.outcome, 'extended')
   })
@@ -2867,11 +2868,11 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { n: 1 },
       attempts: 0,
-      dedup: { id: 'TestJob::active-ext-1', ttl: 200, extend: true },
+      dedup: { id: 'TestJob::active-ext-1', ttl: 400, extend: true },
     })
 
     // Move to active mid-window.
-    await new Promise((r) => setTimeout(r, 80))
+    await new Promise((r) => setTimeout(r, 250))
     const popped = await adapter.popFrom('active-ext-queue')
     assert.equal(popped!.id, 'active-ext-uuid-1')
 
@@ -2882,22 +2883,22 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { n: 2 },
       attempts: 0,
-      dedup: { id: 'TestJob::active-ext-1', ttl: 200, extend: true },
+      dedup: { id: 'TestJob::active-ext-1', ttl: 400, extend: true },
     })
     assert.equal(second && typeof second === 'object' && second.outcome, 'extended')
     assert.equal(second && typeof second === 'object' && second.jobId, 'active-ext-uuid-1')
 
-    // Without the extend, the slot would have expired by now (80 + 150 > 200).
-    // With the extend at T=80, the window restarted; at T=230 only 150ms into
+    // Without the extend, the slot would have expired by now (250 + 250 > 400).
+    // With the extend at T=250, the window restarted; at T=500 only 250ms into
     // new window → still blocking.
-    await new Promise((r) => setTimeout(r, 150))
+    await new Promise((r) => setTimeout(r, 250))
 
     const third = await adapter.pushOn('active-ext-queue', {
       id: 'active-ext-uuid-3',
       name: 'TestJob',
       payload: { n: 3 },
       attempts: 0,
-      dedup: { id: 'TestJob::active-ext-1', ttl: 200, extend: true },
+      dedup: { id: 'TestJob::active-ext-1', ttl: 400, extend: true },
     })
     assert.equal(third && typeof third === 'object' && third.outcome, 'extended')
     assert.equal(third && typeof third === 'object' && third.jobId, 'active-ext-uuid-1')
