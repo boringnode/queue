@@ -34,6 +34,14 @@ export function resolveSchedulePayload(payload: unknown): unknown {
   return payload === undefined ? {} : payload
 }
 
+/**
+ * Convert an epoch millisecond value read from a database into a Date.
+ * SQL drivers can return `bigint` columns as strings.
+ */
+export function epochToDate(value: number | string | bigint | null | undefined): Date | null {
+  return value === null || value === undefined ? null : new Date(Number(value))
+}
+
 export function parse(duration: Duration): number {
   if (typeof duration === 'number') {
     return duration

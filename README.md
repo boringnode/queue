@@ -470,6 +470,39 @@ await schema.dropJobsTable()
 
 </details>
 
+#### Migrating SQL schedules after an upgrade
+
+The schedules table stores its dates as epoch milliseconds (`bigint`), so they do not depend on the
+time zone of the database connection or of the process. Tables created before 0.8 used SQL date
+columns. Stop every process running the previous version, convert the table once with the schema
+service, then start the new version:
+
+```typescript
+// Knex
+await new KnexQueueSchemaService(connection).migrateScheduleDates('queue_schedules', {
+  timezone: 'Europe/Paris',
+})
+
+// Kysely
+await new KyselyQueueSchemaService(db, { dialect: 'postgres' }).migrateScheduleDates(
+  'queue_schedules',
+  { timezone: 'Europe/Paris' }
+)
+```
+
+`timezone` is the time zone the database driver wrote dates in with the previous version, used for
+the dates stored without a time zone (Kysely on PostgreSQL and MySQL, Knex on MySQL). It is the time
+zone of the process, unless the driver was configured otherwise: with the mysql2 `timezone: 'Z'`
+option, pass `'UTC'`. It defaults to the time zone of the process running the migration.
+
+On MySQL, dates are also converted through the session time zone of the connection. If the
+previous version used a session time zone other than the one of the migration connection (for
+example by setting `time_zone`), pass it as `databaseTimeZone`, such as `'+02:00'`.
+
+The migration is idempotent and keeps custom columns. MySQL cannot change a schema inside a
+transaction: if a run fails there, fix the cause and run it again, it resumes where it stopped.
+Until the table is migrated, `adapter.migrate()` throws an error that points to this method.
+
 ### Fake (testing + assertions)
 
 ```typescript

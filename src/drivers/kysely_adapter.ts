@@ -11,15 +11,18 @@ import type {
   ScheduleListOptions,
 } from '../types/main.js'
 import { DEFAULT_PRIORITY } from '../constants.js'
-import { calculateScore, resolveRetention, resolveSchedulePayload } from '../utils.js'
+import { calculateScore, epochToDate, resolveRetention, resolveSchedulePayload } from '../utils.js'
 import type { KyselyDialect } from '../services/kysely_queue_schema.js'
+
+import { KyselyQueueSchemaService } from '../services/kysely_queue_schema.js'
+import { scheduleDatesMigrationRequiredMessage } from '../services/schedule_dates.js'
 
 export { KyselyQueueSchemaService } from '../services/kysely_queue_schema.js'
 export type { KyselyDialect, KyselyQueueSchemaOptions } from '../services/kysely_queue_schema.js'
+export type { ScheduleDatesMigrationOptions } from '../services/schedule_dates.js'
 
 type OptionalColumn<T> = ColumnType<T, T | undefined, T | undefined>
 type NumericValue = number | string | bigint
-type DateValue = Date | string | number
 
 /** Queue job table columns applications may merge into their Kysely database interface. */
 export interface QueueJobTable {
@@ -47,13 +50,13 @@ export interface QueueScheduleTable {
   cron_expression: OptionalColumn<string | null>
   every_ms: OptionalColumn<NumericValue | null>
   timezone: OptionalColumn<string>
-  from_date: OptionalColumn<DateValue | null>
-  to_date: OptionalColumn<DateValue | null>
+  from_date: OptionalColumn<NumericValue | null>
+  to_date: OptionalColumn<NumericValue | null>
   run_limit: OptionalColumn<NumericValue | null>
   run_count: OptionalColumn<NumericValue>
-  next_run_at: OptionalColumn<DateValue | null>
-  last_run_at: OptionalColumn<DateValue | null>
-  created_at: OptionalColumn<DateValue>
+  next_run_at: OptionalColumn<NumericValue | null>
+  last_run_at: OptionalColumn<NumericValue | null>
+  created_at: OptionalColumn<NumericValue>
 }
 
 /** Default queue tables for inclusion in an application's Kysely database interface. */
@@ -122,7 +125,20 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     // The Kysely instance is always owned by the application.
   }
 
-  async migrate(): Promise<void> {}
+  /**
+   * Schema changes of SQL tables belong to the application's migrations, run
+   * through KyselyQueueSchemaService. This only fails fast when the schedules
+   * table still needs one.
+   */
+  async migrate(): Promise<void> {
+    const schema = new KyselyQueueSchemaService(this.#connection, { dialect: this.#dialect })
+
+    if (await schema.needsScheduleDatesMigration(this.#schedulesTable)) {
+      throw new Error(
+        scheduleDatesMigrationRequiredMessage(this.#schedulesTable, 'KyselyQueueSchemaService')
+      )
+    }
+  }
 
   async pop(): Promise<AcquiredJob | null> {
     return this.popFrom('default')
@@ -677,15 +693,15 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
       cron_expression: config.cronExpression ?? null,
       every_ms: config.everyMs ?? null,
       timezone: config.timezone,
-      from_date: this.#dateValue(config.from ?? null),
-      to_date: this.#dateValue(config.to ?? null),
+      from_date: config.from?.getTime() ?? null,
+      to_date: config.to?.getTime() ?? null,
       run_limit: config.limit ?? null,
       status: 'active' as const,
     }
 
     const insert = this.#schedules(this.#connection)
       .insertInto(this.#schedulesTable)
-      .values({ ...data, run_count: 0, created_at: this.#dateValue(new Date()) })
+      .values({ ...data, run_count: 0, created_at: Date.now() })
     const updates = {
       name: data.name,
       payload: data.payload,
@@ -738,8 +754,8 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   ): Promise<void> {
     const data: Updateable<QueueScheduleTable> = {}
     if (updates.status !== undefined) data.status = updates.status
-    if (updates.nextRunAt !== undefined) data.next_run_at = this.#dateValue(updates.nextRunAt)
-    if (updates.lastRunAt !== undefined) data.last_run_at = this.#dateValue(updates.lastRunAt)
+    if (updates.nextRunAt !== undefined) data.next_run_at = updates.nextRunAt?.getTime() ?? null
+    if (updates.lastRunAt !== undefined) data.last_run_at = updates.lastRunAt?.getTime() ?? null
     if (updates.runCount !== undefined) data.run_count = updates.runCount
     if (Object.keys(data).length === 0) return
 
@@ -758,8 +774,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   }
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
-    const now = new Date()
-    const nowValue = this.#dateValue(now)
+    const now = Date.now()
 
     return this.#withTransaction(this.#connection, async (trx) => {
       let query = this.#schedules(trx)
@@ -767,7 +782,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
         .selectAll()
         .where('status', '=', 'active')
         .where('next_run_at', 'is not', null)
-        .where('next_run_at', '<=', nowValue)
+        .where('next_run_at', '<=', now)
         .where((expression) =>
           expression.or([
             expression('run_limit', 'is', null),
@@ -775,7 +790,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
           ])
         )
         .where((expression) =>
-          expression.or([expression('to_date', 'is', null), expression('to_date', '>=', nowValue)])
+          expression.or([expression('to_date', 'is', null), expression('to_date', '>=', now)])
         )
         .orderBy('next_run_at', 'asc')
         .limit(1)
@@ -786,28 +801,28 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
       if (!row) return null
 
       const newRunCount = Number(row.run_count ?? 0) + 1
-      let nextRunAt: Date | null = null
+      let nextRunAt: number | null = null
 
       if (row.every_ms) {
-        nextRunAt = new Date(now.getTime() + Number(row.every_ms))
+        nextRunAt = now + Number(row.every_ms)
       } else if (row.cron_expression) {
         const { CronExpressionParser } = await import('cron-parser')
         nextRunAt = CronExpressionParser.parse(row.cron_expression, {
-          currentDate: now,
+          currentDate: new Date(now),
           tz: row.timezone || 'UTC',
         })
           .next()
-          .toDate()
+          .getTime()
       }
 
       if (row.run_limit !== null && newRunCount >= Number(row.run_limit)) nextRunAt = null
-      if (nextRunAt && row.to_date && nextRunAt > new Date(row.to_date)) nextRunAt = null
+      if (nextRunAt && row.to_date && nextRunAt > Number(row.to_date)) nextRunAt = null
 
       await this.#schedules(trx)
         .updateTable(this.#schedulesTable)
         .set({
-          next_run_at: this.#dateValue(nextRunAt),
-          last_run_at: nowValue,
+          next_run_at: nextRunAt,
+          last_run_at: now,
           run_count: newRunCount,
         })
         .where('id', '=', row.id)
@@ -836,14 +851,6 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     return this.#dialect === 'postgres' || this.#dialect === 'mysql'
   }
 
-  #dateValue(value: Date): Date | string
-  #dateValue(value: null): null
-  #dateValue(value: Date | null): Date | string | null
-  #dateValue(value: Date | null): Date | string | null {
-    if (!value || this.#dialect !== 'sqlite') return value
-    return value.toISOString()
-  }
-
   #rowToScheduleData(row: ScheduleRow): ScheduleData {
     return {
       id: row.id,
@@ -852,14 +859,14 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
       cronExpression: row.cron_expression ?? null,
       everyMs: row.every_ms ? Number(row.every_ms) : null,
       timezone: row.timezone ?? 'UTC',
-      from: row.from_date ? new Date(row.from_date) : null,
-      to: row.to_date ? new Date(row.to_date) : null,
+      from: epochToDate(row.from_date),
+      to: epochToDate(row.to_date),
       limit: row.run_limit ? Number(row.run_limit) : null,
       runCount: Number(row.run_count ?? 0),
-      nextRunAt: row.next_run_at ? new Date(row.next_run_at) : null,
-      lastRunAt: row.last_run_at ? new Date(row.last_run_at) : null,
+      nextRunAt: epochToDate(row.next_run_at),
+      lastRunAt: epochToDate(row.last_run_at),
       status: row.status === 'active' ? 'active' : 'paused',
-      createdAt: row.created_at ? new Date(row.created_at) : new Date(),
+      createdAt: epochToDate(row.created_at) ?? new Date(),
     }
   }
 

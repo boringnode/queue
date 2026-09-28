@@ -13,9 +13,13 @@ import type {
   ScheduleListOptions,
 } from '../types/main.js'
 import { DEFAULT_PRIORITY } from '../constants.js'
-import { calculateScore, resolveRetention, resolveSchedulePayload } from '../utils.js'
+import { calculateScore, epochToDate, resolveRetention, resolveSchedulePayload } from '../utils.js'
+
+import { KnexQueueSchemaService } from '../services/knex_queue_schema.js'
+import { scheduleDatesMigrationRequiredMessage } from '../services/schedule_dates.js'
 
 export { KnexQueueSchemaService } from '../services/knex_queue_schema.js'
+export type { ScheduleDatesMigrationOptions } from '../services/schedule_dates.js'
 
 export interface KnexAdapterOptions {
   connection: Knex
@@ -34,14 +38,14 @@ interface ScheduleRow extends DbRow {
   cron_expression: string | null
   every_ms: number | string | null
   timezone: string | null
-  from_date: Date | string | number | null
-  to_date: Date | string | number | null
+  from_date: number | string | null
+  to_date: number | string | null
   run_limit: number | string | null
   run_count: number | string | null
-  next_run_at: Date | string | number | null
-  last_run_at: Date | string | number | null
+  next_run_at: number | string | null
+  last_run_at: number | string | null
   status: string
-  created_at: Date | string | number | null
+  created_at: number | string | null
 }
 
 /**
@@ -90,7 +94,20 @@ export class KnexAdapter implements Adapter {
     }
   }
 
-  async migrate(): Promise<void> {}
+  /**
+   * Schema changes of SQL tables belong to the application's migrations, run
+   * through KnexQueueSchemaService. This only fails fast when the schedules
+   * table still needs one.
+   */
+  async migrate(): Promise<void> {
+    const schema = new KnexQueueSchemaService(this.#connection)
+
+    if (await schema.needsScheduleDatesMigration(this.#schedulesTable)) {
+      throw new Error(
+        scheduleDatesMigrationRequiredMessage(this.#schedulesTable, 'KnexQueueSchemaService')
+      )
+    }
+  }
 
   async pop(): Promise<AcquiredJob | null> {
     return this.popFrom('default')
@@ -696,8 +713,8 @@ export class KnexAdapter implements Adapter {
       cron_expression: config.cronExpression ?? null,
       every_ms: config.everyMs ?? null,
       timezone: config.timezone,
-      from_date: config.from ?? null,
-      to_date: config.to ?? null,
+      from_date: config.from?.getTime() ?? null,
+      to_date: config.to?.getTime() ?? null,
       run_limit: config.limit ?? null,
       status: 'active',
     }
@@ -707,7 +724,7 @@ export class KnexAdapter implements Adapter {
       .insert({
         ...data,
         run_count: 0,
-        created_at: this.#connection.fn.now(),
+        created_at: Date.now(),
       })
       .onConflict('id')
       .merge({
@@ -759,8 +776,8 @@ export class KnexAdapter implements Adapter {
     const data: Record<string, unknown> = {}
 
     if (updates.status !== undefined) data.status = updates.status
-    if (updates.nextRunAt !== undefined) data.next_run_at = updates.nextRunAt
-    if (updates.lastRunAt !== undefined) data.last_run_at = updates.lastRunAt
+    if (updates.nextRunAt !== undefined) data.next_run_at = updates.nextRunAt?.getTime() ?? null
+    if (updates.lastRunAt !== undefined) data.last_run_at = updates.lastRunAt?.getTime() ?? null
     if (updates.runCount !== undefined) data.run_count = updates.runCount
 
     if (Object.keys(data).length > 0) {
@@ -773,7 +790,7 @@ export class KnexAdapter implements Adapter {
   }
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
-    const now = new Date()
+    const now = Date.now()
 
     return this.#connection.transaction(async (trx) => {
       // Find one due schedule with row locking
@@ -798,19 +815,19 @@ export class KnexAdapter implements Adapter {
       if (!row) return null
 
       // Calculate next run time
-      let nextRunAt: Date | null = null
+      let nextRunAt: number | null = null
       const newRunCount = Number(row.run_count ?? 0) + 1
 
       if (row.every_ms) {
-        nextRunAt = new Date(now.getTime() + Number(row.every_ms))
+        nextRunAt = now + Number(row.every_ms)
       } else if (row.cron_expression) {
         // Import cron-parser dynamically to calculate next run
         const { CronExpressionParser } = await import('cron-parser')
         const cron = CronExpressionParser.parse(row.cron_expression, {
-          currentDate: now,
+          currentDate: new Date(now),
           tz: row.timezone || 'UTC',
         })
-        nextRunAt = cron.next().toDate()
+        nextRunAt = cron.next().getTime()
       }
 
       // Check if limit will be reached
@@ -819,7 +836,7 @@ export class KnexAdapter implements Adapter {
       }
 
       // Check if past end date
-      if (nextRunAt && row.to_date && nextRunAt > new Date(row.to_date)) {
+      if (nextRunAt && row.to_date && nextRunAt > Number(row.to_date)) {
         nextRunAt = null
       }
 
@@ -843,14 +860,14 @@ export class KnexAdapter implements Adapter {
       cronExpression: row.cron_expression ?? null,
       everyMs: row.every_ms ? Number(row.every_ms) : null,
       timezone: row.timezone ?? 'UTC',
-      from: row.from_date ? new Date(row.from_date) : null,
-      to: row.to_date ? new Date(row.to_date) : null,
+      from: epochToDate(row.from_date),
+      to: epochToDate(row.to_date),
       limit: row.run_limit ? Number(row.run_limit) : null,
       runCount: Number(row.run_count ?? 0),
-      nextRunAt: row.next_run_at ? new Date(row.next_run_at) : null,
-      lastRunAt: row.last_run_at ? new Date(row.last_run_at) : null,
+      nextRunAt: epochToDate(row.next_run_at),
+      lastRunAt: epochToDate(row.last_run_at),
       status: row.status === 'paused' || row.status === 'cancelled' ? 'paused' : 'active',
-      createdAt: row.created_at ? new Date(row.created_at) : new Date(),
+      createdAt: epochToDate(row.created_at) ?? new Date(),
     }
   }
 }
