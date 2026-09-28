@@ -682,18 +682,19 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     }
 
     await new Promise((resolve) => setTimeout(resolve, 50))
+    adapter.setWorkerId('recovering-worker')
 
     // No free slot: exceeded jobs are left stalled
     const none = await adapter.recoverStalledJobs('test-queue', 10, 1, 0)
     assert.deepEqual(none.exceeded, [])
 
-    const first = await adapter.recoverStalledJobs('test-queue', 10, 1, 1)
-    assert.lengthOf(first.exceeded, 1)
+    const { exceeded } = await adapter.recoverStalledJobs('test-queue', 10, 1, 1)
+    assert.lengthOf(exceeded, 1)
 
-    // The other job is still stalled and comes back on the next pass
-    const second = await adapter.recoverStalledJobs('test-queue', 10, 1, 1)
-    assert.lengthOf(second.exceeded, 1)
-    assert.notEqual(second.exceeded[0].id, first.exceeded[0].id)
+    // Only the returned job was reacquired; the other one is left untouched
+    const other = exceeded[0].id === 'job-1' ? 'job-2' : 'job-1'
+    assert.equal(await adapter.renewJobs('test-queue', [exceeded[0].id]), 1)
+    assert.equal(await adapter.renewJobs('test-queue', [other]), 0)
   })
 
   test('failJob should finalize a job handed back by recoverStalledJobs', async ({ assert }) => {
