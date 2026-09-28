@@ -8,7 +8,7 @@ import type {
   ScheduleData,
   ScheduleListOptions,
 } from '../../src/types/main.js'
-import { parse } from '../../src/utils.js'
+import { parse, resolveSchedulePayload } from '../../src/utils.js'
 
 interface ActiveJob {
   job: JobData
@@ -324,7 +324,7 @@ export class MemoryAdapter implements Adapter {
     const schedule: ScheduleData = {
       id,
       name: config.name,
-      payload: config.payload,
+      payload: resolveSchedulePayload(config.payload),
       cronExpression: config.cronExpression ?? null,
       everyMs: config.everyMs ?? null,
       timezone: config.timezone,

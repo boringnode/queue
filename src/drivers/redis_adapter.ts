@@ -12,7 +12,7 @@ import type {
   ScheduleData,
   ScheduleListOptions,
 } from '../types/main.js'
-import { resolveRetention } from '../utils.js'
+import { resolveRetention, resolveSchedulePayload } from '../utils.js'
 import { encodeRedisJobPayloadOverlay, hydrateRedisJob } from './redis_job_storage.js'
 import {
   ACQUIRE_JOB_SCRIPT,
@@ -443,7 +443,7 @@ export class RedisAdapter implements Adapter {
     const scheduleData: Record<string, string> = {
       id,
       name: config.name,
-      payload: JSON.stringify(config.payload),
+      payload: JSON.stringify(resolveSchedulePayload(config.payload)),
       timezone: config.timezone,
       status: 'active',
     }

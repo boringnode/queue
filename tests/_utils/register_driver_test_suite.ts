@@ -1421,6 +1421,57 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.isNull(schedule!.limit)
   })
 
+  test('upsertSchedule stores an undefined payload as an empty object', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+
+    await adapter.upsertSchedule({
+      id: 'schedule-undefined-payload',
+      name: 'TestJob',
+      payload: undefined,
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+
+    const schedule = await adapter.getSchedule('schedule-undefined-payload')
+    assert.deepEqual(schedule!.payload, {})
+  })
+
+  test('upsertSchedule without a payload replaces the previous payload', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    const config = {
+      id: 'schedule-cleared-payload',
+      name: 'TestJob',
+      everyMs: 60_000,
+      timezone: 'UTC',
+    }
+
+    await adapter.upsertSchedule({ ...config, payload: { version: 1 } })
+    await adapter.upsertSchedule({ ...config, payload: undefined })
+
+    const schedule = await adapter.getSchedule('schedule-cleared-payload')
+    assert.deepEqual(schedule!.payload, {})
+  })
+
+  test('schedule payloads keep empty arrays through claims', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    const payload = { items: [], nested: { tags: [] } }
+
+    await adapter.upsertSchedule({
+      id: 'schedule-empty-arrays',
+      name: 'TestJob',
+      payload,
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+    await adapter.updateSchedule('schedule-empty-arrays', {
+      nextRunAt: new Date(Date.now() - 1_000),
+    })
+
+    const claimed = await adapter.claimDueSchedule()
+    assert.deepEqual(claimed!.payload, payload)
+    assert.deepEqual((await adapter.getSchedule('schedule-empty-arrays'))!.payload, payload)
+  })
+
   test('upsertSchedule should preserve runtime runCount when id exists', async ({ assert }) => {
     const adapter = await options.createAdapter()
 

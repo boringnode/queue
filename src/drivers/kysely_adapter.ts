@@ -11,7 +11,7 @@ import type {
   ScheduleListOptions,
 } from '../types/main.js'
 import { DEFAULT_PRIORITY } from '../constants.js'
-import { calculateScore, resolveRetention } from '../utils.js'
+import { calculateScore, resolveRetention, resolveSchedulePayload } from '../utils.js'
 import type { KyselyDialect } from '../services/kysely_queue_schema.js'
 
 export { KyselyQueueSchemaService } from '../services/kysely_queue_schema.js'
@@ -665,7 +665,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     const data = {
       id,
       name: config.name,
-      payload: JSON.stringify(config.payload),
+      payload: JSON.stringify(resolveSchedulePayload(config.payload)),
       cron_expression: config.cronExpression ?? null,
       every_ms: config.everyMs ?? null,
       timezone: config.timezone,

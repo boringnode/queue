@@ -25,6 +25,15 @@ export function resolveRetention(retention?: JobRetention): ResolvedRetention {
   }
 }
 
+/**
+ * Resolve the payload stored for a schedule. Schedules persist their payload
+ * as JSON, which cannot represent `undefined`, so every adapter stores a
+ * missing payload as an empty object.
+ */
+export function resolveSchedulePayload(payload: unknown): unknown {
+  return payload === undefined ? {} : payload
+}
+
 export function parse(duration: Duration): number {
   if (typeof duration === 'number') {
     return duration

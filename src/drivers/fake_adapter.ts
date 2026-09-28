@@ -13,7 +13,7 @@ import type {
   ScheduleListOptions,
 } from '../types/main.js'
 import { DEFAULT_PRIORITY } from '../constants.js'
-import { parse } from '../utils.js'
+import { parse, resolveSchedulePayload } from '../utils.js'
 import { Job } from '../job.js'
 
 interface DedupEntry {
@@ -416,7 +416,7 @@ export class FakeAdapter implements Adapter {
     const schedule: ScheduleData = {
       id,
       name: config.name,
-      payload: config.payload,
+      payload: resolveSchedulePayload(config.payload),
       cronExpression: config.cronExpression ?? null,
       everyMs: config.everyMs ?? null,
       timezone: config.timezone,

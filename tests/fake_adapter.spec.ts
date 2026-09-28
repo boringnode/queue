@@ -186,4 +186,18 @@ test.group('FakeAdapter', () => {
 
     await adapter.destroy()
   })
+
+  test('should store an undefined schedule payload as an empty object', async ({ assert }) => {
+    const adapter = fake()()
+    const config = { id: 'fake-schedule', name: 'TestJob', everyMs: 60_000, timezone: 'UTC' }
+
+    await adapter.upsertSchedule({ ...config, payload: undefined })
+    assert.deepEqual((await adapter.getSchedule('fake-schedule'))!.payload, {})
+
+    await adapter.upsertSchedule({ ...config, payload: { version: 1 } })
+    await adapter.upsertSchedule({ ...config, payload: undefined })
+    assert.deepEqual((await adapter.getSchedule('fake-schedule'))!.payload, {})
+
+    await adapter.destroy()
+  })
 })
