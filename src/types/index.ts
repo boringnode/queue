@@ -3,6 +3,7 @@ export type {
   AdapterSelector,
   BackoffConfig,
   BackoffStrategy,
+  DedupOutcome,
   DispatchManyResult,
   DispatchResult,
   Duration,
@@ -28,6 +29,12 @@ export type {
   Logger,
 } from './main.js'
 
-export type { Adapter, AcquiredJob, JobLease, StalledJobsRecovery } from '../contracts/adapter.js'
+export type {
+  Adapter,
+  AcquiredJob,
+  JobLease,
+  PushResult,
+  StalledJobsRecovery,
+} from '../contracts/adapter.js'
 
 export type { JobDispatchMessage, JobExecuteMessage } from './tracing_channels.js'

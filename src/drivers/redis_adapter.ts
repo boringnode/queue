@@ -44,7 +44,11 @@ const schedulesDueKey = 'schedules::due'
 // Schedule hashes live one level below the index keys so no schedule id can collide with them.
 const scheduleDataPrefix = 'schedules::data::'
 const legacyScheduleDataPrefix = 'schedules::'
-type RedisConfig = Redis | RedisOptions
+
+/**
+ * An ioredis connection, or the options to create one.
+ */
+export type RedisConfig = Redis | RedisOptions
 
 function isRedisConnection(config?: RedisConfig): config is Redis {
   return !!config && 'defineCommand' in config && typeof config.defineCommand === 'function'

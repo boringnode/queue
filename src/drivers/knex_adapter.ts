@@ -41,7 +41,11 @@ export interface KnexAdapterOptions {
   ownsConnection?: boolean
 }
 
-type KnexConfig = Knex | Knex.Config
+/**
+ * A Knex instance, or the config to create one.
+ */
+export type KnexConfig = Knex | Knex.Config
+
 type DbRow = Record<string, unknown>
 
 interface ScheduleRow extends DbRow {
