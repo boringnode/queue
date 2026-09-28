@@ -1,4 +1,4 @@
-import { sql, type Kysely, type Transaction } from 'kysely'
+import { sql, type AlterTableColumnAlteringBuilder, type Kysely, type Transaction } from 'kysely'
 import {
   assertTimeZone,
   epochColumn,
@@ -8,11 +8,19 @@ import {
   type ScheduleDateColumn,
   type ScheduleDatesMigrationOptions,
 } from './schedule_dates.js'
+import { QUEUE_TEXT_COLUMNS, type TextColumnsMigrationOptions } from './text_columns.js'
 
 export type KyselyDialect = 'postgres' | 'mysql' | 'sqlite'
 
 export interface KyselyQueueSchemaOptions {
   dialect: KyselyDialect
+}
+
+interface MysqlTextColumn {
+  name: string
+  nullable: string
+  collation: string | null
+  comment: string
 }
 
 /**
@@ -35,13 +43,13 @@ export class KyselyQueueSchemaService<DB> {
       .addColumn('id', 'varchar(255)', (column) => column.notNull())
       .addColumn('queue', 'varchar(255)', (column) => column.notNull())
       .addColumn('status', 'varchar(20)', (column) => column.notNull())
-      .addColumn('data', 'text', (column) => column.notNull())
+      .addColumn('data', this.#textType(), (column) => column.notNull())
       .addColumn('score', 'bigint')
       .addColumn('worker_id', 'varchar(255)')
       .addColumn('acquired_at', 'bigint')
       .addColumn('execute_at', 'bigint')
       .addColumn('finished_at', 'bigint')
-      .addColumn('error', 'text')
+      .addColumn('error', this.#textType())
       .addColumn('dedup_id', 'varchar(510)')
       .addColumn('dedup_at', 'bigint')
       .addColumn('dedup_ttl', 'bigint')
@@ -99,7 +107,7 @@ export class KyselyQueueSchemaService<DB> {
       .addColumn('id', 'varchar(255)', (column) => column.primaryKey())
       .addColumn('status', 'varchar(50)', (column) => column.notNull().defaultTo('active'))
       .addColumn('name', 'varchar(255)', (column) => column.notNull())
-      .addColumn('payload', 'text', (column) => column.notNull())
+      .addColumn('payload', this.#textType(), (column) => column.notNull())
       .addColumn('cron_expression', 'varchar(255)')
       .addColumn('every_ms', 'bigint')
       .addColumn('timezone', 'varchar(100)', (column) => column.notNull().defaultTo('UTC'))
@@ -118,6 +126,57 @@ export class KyselyQueueSchemaService<DB> {
       .on(tableName)
       .columns(['status', 'next_run_at'])
       .execute()
+  }
+
+  /**
+   * Migration for MySQL tables created before 0.8, whose TEXT columns stop at
+   * 64 KB: a larger payload or error message failed to insert, or was cut in
+   * non-strict mode. Converts `data`, `error` and `payload` to LONGTEXT and
+   * keeps their nullability. Does nothing on other databases, on columns
+   * already converted, or on a missing table.
+   */
+  async migrateTextColumns(options: TextColumnsMigrationOptions = {}): Promise<void> {
+    if (this.#dialect !== 'mysql') return
+
+    const tables = [
+      [options.jobsTable ?? 'queue_jobs', QUEUE_TEXT_COLUMNS.jobs],
+      [options.schedulesTable ?? 'queue_schedules', QUEUE_TEXT_COLUMNS.schedules],
+    ] as const
+
+    for (const [tableName, columns] of tables) {
+      const [schema, name] = this.#mysqlTable(tableName)
+      const { rows } = await sql<MysqlTextColumn>`
+        select column_name as ${sql.ref('name')}, is_nullable as ${sql.ref('nullable')},
+          collation_name as ${sql.ref('collation')}, column_comment as ${sql.ref('comment')}
+        from information_schema.columns
+        where table_schema = coalesce(${schema}, database()) and table_name = ${name}
+          and column_name in (${sql.join([...columns])})
+          and data_type <> 'longtext'
+      `.execute(this.#connection)
+
+      if (rows.length === 0) continue
+
+      // One ALTER: MySQL rebuilds the table for this change. MODIFY replaces the
+      // whole column definition, so carry over what it would reset.
+      let alter = this.#connection.schema.alterTable(
+        tableName
+      ) as unknown as AlterTableColumnAlteringBuilder
+      for (const row of rows) {
+        alter = alter.modifyColumn(row.name, sql`longtext`, (column) => {
+          const definition = row.nullable === 'YES' ? column : column.notNull()
+          return definition.modifyEnd(
+            sql.join(
+              [
+                ...(row.comment ? [sql`comment ${sql.lit(row.comment)}`] : []),
+                ...(row.collation ? [sql`collate ${sql.lit(row.collation)}`] : []),
+              ],
+              sql` `
+            )
+          )
+        })
+      }
+      await alter.execute()
+    }
   }
 
   /**
@@ -426,6 +485,11 @@ export class KyselyQueueSchemaService<DB> {
       .columns(['queue', 'dedup_id'])
       .where(sql<boolean>`dedup_id is not null and status in ('pending', 'delayed')`)
       .execute()
+  }
+
+  /** LONGTEXT on MySQL, whose TEXT stops at 64 KB; TEXT elsewhere. */
+  #textType() {
+    return this.#dialect === 'mysql' ? sql`longtext` : sql`text`
   }
 
   #isDuplicateIndexError(error: unknown): boolean {

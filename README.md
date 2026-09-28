@@ -503,6 +503,21 @@ The migration is idempotent and keeps custom columns. MySQL cannot change a sche
 transaction: if a run fails there, fix the cause and run it again, it resumes where it stopped.
 Until the table is migrated, `adapter.migrate()` throws an error that points to this method.
 
+On MySQL, tables created before 0.8 also used `TEXT` columns for job payloads, error messages, and
+schedule payloads, which stop at 64 KB: a larger payload failed to insert, or was cut in non-strict
+mode. New tables use `LONGTEXT`. Convert existing ones once:
+
+```typescript
+await schemaService.migrateTextColumns({
+  jobsTable: 'queue_jobs',
+  schedulesTable: 'queue_schedules',
+})
+```
+
+It keeps the nullability, collation, and comment of each column, does nothing on PostgreSQL, SQLite,
+or columns already converted, and skips a missing table. MySQL rebuilds each table for this change
+and blocks writes to it while the copy runs: plan it like any other schema change on a large table.
+
 ### Fake (testing + assertions)
 
 ```typescript

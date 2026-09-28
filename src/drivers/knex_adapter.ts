@@ -20,6 +20,7 @@ import { scheduleDatesMigrationRequiredMessage } from '../services/schedule_date
 
 export { KnexQueueSchemaService } from '../services/knex_queue_schema.js'
 export type { ScheduleDatesMigrationOptions } from '../services/schedule_dates.js'
+export type { TextColumnsMigrationOptions } from '../services/text_columns.js'
 
 export interface KnexAdapterOptions {
   connection: Knex

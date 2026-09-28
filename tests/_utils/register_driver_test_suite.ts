@@ -1571,6 +1571,56 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.deepEqual((await adapter.getSchedule('schedule-empty-arrays'))!.payload, payload)
   })
 
+  test('pushOn should store a payload larger than 64 KB', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+    const blob = 'x'.repeat(70_000)
+
+    await adapter.pushOn('test-queue', {
+      id: 'big',
+      name: 'TestJob',
+      payload: { blob },
+      attempts: 0,
+    })
+
+    const job = await adapter.popFrom('test-queue')
+    assert.equal((job!.payload as { blob: string }).blob.length, blob.length)
+  })
+
+  test('failJob should store an error message larger than 64 KB', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+    const message = 'e'.repeat(70_000)
+
+    await adapter.pushOn('test-queue', {
+      id: 'big-error',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+    })
+    await adapter.popFrom('test-queue')
+    await adapter.failJob('big-error', 'test-queue', new Error(message), false)
+
+    const record = await adapter.getJob('big-error', 'test-queue')
+    assert.equal(record!.error!.length, message.length)
+  })
+
+  test('upsertSchedule should store a payload larger than 64 KB', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    const blob = 'x'.repeat(70_000)
+
+    await adapter.upsertSchedule({
+      id: 'big-schedule',
+      name: 'TestJob',
+      payload: { blob },
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+
+    const schedule = await adapter.getSchedule('big-schedule')
+    assert.equal((schedule!.payload as { blob: string }).blob.length, blob.length)
+  })
+
   test('upsertSchedule should preserve runtime runCount when id exists', async ({ assert }) => {
     const adapter = await options.createAdapter()
 

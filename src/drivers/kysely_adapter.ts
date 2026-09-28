@@ -20,6 +20,7 @@ import { scheduleDatesMigrationRequiredMessage } from '../services/schedule_date
 export { KyselyQueueSchemaService } from '../services/kysely_queue_schema.js'
 export type { KyselyDialect, KyselyQueueSchemaOptions } from '../services/kysely_queue_schema.js'
 export type { ScheduleDatesMigrationOptions } from '../services/schedule_dates.js'
+export type { TextColumnsMigrationOptions } from '../services/text_columns.js'
 
 type OptionalColumn<T> = ColumnType<T, T | undefined, T | undefined>
 type NumericValue = number | string | bigint

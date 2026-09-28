@@ -8,6 +8,14 @@ import {
   type ScheduleDateColumn,
   type ScheduleDatesMigrationOptions,
 } from './schedule_dates.js'
+import { QUEUE_TEXT_COLUMNS, type TextColumnsMigrationOptions } from './text_columns.js'
+
+interface MysqlTextColumn {
+  name: string
+  nullable: string
+  collation: string | null
+  comment: string
+}
 
 export class KnexQueueSchemaService {
   #connection: Knex
@@ -28,13 +36,14 @@ export class KnexQueueSchemaService {
       table.string('id', 255).notNullable()
       table.string('queue', 255).notNullable()
       table.enu('status', ['pending', 'active', 'delayed', 'completed', 'failed']).notNullable()
-      table.text('data').notNullable()
+      // LONGTEXT on MySQL, whose TEXT stops at 64 KB; TEXT elsewhere.
+      table.text('data', 'longtext').notNullable()
       table.bigint('score').unsigned().nullable()
       table.string('worker_id', 255).nullable()
       table.bigint('acquired_at').unsigned().nullable()
       table.bigint('execute_at').unsigned().nullable()
       table.bigint('finished_at').unsigned().nullable()
-      table.text('error').nullable()
+      table.text('error', 'longtext').nullable()
       table.string('dedup_id', 510).nullable()
       table.bigint('dedup_at').unsigned().nullable()
       table.bigint('dedup_ttl').unsigned().nullable()
@@ -108,7 +117,7 @@ export class KnexQueueSchemaService {
       table.string('id', 255).primary()
       table.string('status', 50).notNullable().defaultTo('active')
       table.string('name', 255).notNullable()
-      table.text('payload').notNullable()
+      table.text('payload', 'longtext').notNullable()
       table.string('cron_expression', 255).nullable()
       table.bigint('every_ms').unsigned().nullable()
       table.string('timezone', 100).notNullable().defaultTo('UTC')
@@ -124,6 +133,56 @@ export class KnexQueueSchemaService {
 
       extend?.(table)
     })
+  }
+
+  /**
+   * Migration for MySQL tables created before 0.8, whose TEXT columns stop at
+   * 64 KB: a larger payload or error message failed to insert, or was cut in
+   * non-strict mode. Converts `data`, `error` and `payload` to LONGTEXT and
+   * keeps their nullability. Does nothing on other databases, on columns
+   * already converted, or on a missing table.
+   */
+  async migrateTextColumns(options: TextColumnsMigrationOptions = {}): Promise<void> {
+    if (this.#dialect() !== 'mysql') return
+
+    const tables = [
+      [options.jobsTable ?? 'queue_jobs', QUEUE_TEXT_COLUMNS.jobs],
+      [options.schedulesTable ?? 'queue_schedules', QUEUE_TEXT_COLUMNS.schedules],
+    ] as const
+
+    for (const [tableName, columns] of tables) {
+      const [schema, name] = tableName.includes('.') ? tableName.split('.', 2) : [null, tableName]
+      const [rows] = await this.#connection.raw(
+        `select column_name as name, is_nullable as nullable,
+           collation_name as collation, column_comment as comment
+         from information_schema.columns
+         where table_schema = coalesce(?, database()) and table_name = ?
+           and column_name in (${columns.map(() => '?').join(', ')})
+           and data_type <> 'longtext'`,
+        [schema, name, ...columns]
+      )
+      if (rows.length === 0) continue
+
+      // MODIFY replaces the whole column definition: carry over what it would reset.
+      // The collation and comment are bound: Knex does not escape backslashes in comments.
+      const clauses: string[] = []
+      const bindings: string[] = [tableName]
+      for (const row of rows as MysqlTextColumn[]) {
+        let clause = `modify ?? longtext ${row.nullable === 'YES' ? 'null' : 'not null'}`
+        bindings.push(row.name)
+        if (row.collation) {
+          clause += ' collate ?'
+          bindings.push(row.collation)
+        }
+        if (row.comment) {
+          clause += ' comment ?'
+          bindings.push(row.comment)
+        }
+        clauses.push(clause)
+      }
+
+      await this.#connection.raw(`alter table ?? ${clauses.join(', ')}`, bindings)
+    }
   }
 
   /**
