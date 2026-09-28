@@ -659,6 +659,12 @@ export default class LongRunningJob extends Job<Payload> {
 }
 ```
 
+Cancellation is cooperative: when the timeout fires, the job fails or is retried right away, but
+the handler keeps running until it returns. It keeps its worker slot until then, so `concurrency`
+and `worker.stop()` account for it. A handler that ignores `this.signal` and never returns holds its
+slot forever and blocks `worker.stop()`: stop long operations when the signal aborts, or pass it to
+the APIs that accept one, such as `fetch()`.
+
 `timeout` and `failOnTimeout` can also be set for every job in `defaultJobOptions`, globally or per
 queue:
 

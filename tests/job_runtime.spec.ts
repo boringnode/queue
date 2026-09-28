@@ -314,6 +314,41 @@ test.group('JobExecutionRuntime', () => {
     })
   })
 
+  test('handles a synchronous throw from a Job with a timeout', async ({ assert, cleanup }) => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    cleanup(() => {
+      process.off('unhandledRejection', onUnhandled)
+    })
+
+    const error = new Error('invalid payload')
+
+    class SyncThrowingJob extends Job {
+      static options = { timeout: 20 }
+
+      // A non-async implementation can throw before returning a promise.
+      execute(): Promise<void> {
+        throw error
+      }
+    }
+
+    const runtime = new JobExecutionRuntime({
+      resolveJob: async () => SyncThrowingJob,
+      configResolver: new QueueConfigResolver({}),
+    })
+    const outcome = await runtime.execute(acquiredJob(), 'default')
+
+    assert.equal(outcome.type, 'failed')
+    if (outcome.type !== 'failed') return
+    assert.strictEqual(outcome.error, error)
+    assert.notProperty(outcome, 'timedOutExecution')
+
+    // Wait past the timeout: its listener must be gone.
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    assert.deepEqual(unhandled, [])
+  })
+
   test('aborts timed out Jobs and removes the abort listener', async ({ assert, cleanup }) => {
     const controller = new AbortController()
     const originalTimeout = AbortSignal.timeout

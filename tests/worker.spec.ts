@@ -489,6 +489,8 @@ test.group('Worker', () => {
   test('should timeout job that exceeds timeout duration', async ({ assert, cleanup }) => {
     assert.plan(2)
 
+    let failedAt = 0
+
     class SlowJob extends Job {
       static options = { timeout: 50 }
 
@@ -497,6 +499,7 @@ test.group('Worker', () => {
       }
 
       async failed(error: Error) {
+        failedAt = Date.now()
         assert.instanceOf(error, errors.E_JOB_TIMEOUT)
       }
     }
@@ -530,13 +533,14 @@ test.group('Worker', () => {
     await worker.processCycle(['default']) // started
     await worker.processCycle(['default']) // completed (timeout)
 
-    const elapsed = Date.now() - startTime
-
-    assert.isBelow(elapsed, 150, 'Job should be killed before completing')
+    // The timeout fires before the handler returns; the cycle ends once it has returned.
+    assert.isBelow(failedAt - startTime, 150)
   })
 
   test('should apply timeout when timeout is set to 0', async ({ assert, cleanup }) => {
     assert.plan(2)
+
+    let failedAt = 0
 
     class ZeroTimeoutJob extends Job {
       static options = { timeout: 0 }
@@ -546,6 +550,7 @@ test.group('Worker', () => {
       }
 
       async failed(error: Error) {
+        failedAt = Date.now()
         assert.instanceOf(error, errors.E_JOB_TIMEOUT)
       }
     }
@@ -579,9 +584,8 @@ test.group('Worker', () => {
     await worker.processCycle(['default']) // started
     await worker.processCycle(['default']) // completed (timeout)
 
-    const elapsed = Date.now() - startTime
-
-    assert.isBelow(elapsed, 150, 'Job should be killed before completing')
+    // The timeout fires before the handler returns; the cycle ends once it has returned.
+    assert.isBelow(failedAt - startTime, 150)
   })
 
   test('should remove timeout abort listener when job completes before timeout', async ({
@@ -759,12 +763,15 @@ test.group('Worker', () => {
   }) => {
     assert.plan(2)
 
+    let failedAt = 0
+
     class SlowJob extends Job {
       async execute() {
         await setTimeout(200)
       }
 
       async failed(error: Error) {
+        failedAt = Date.now()
         assert.instanceOf(error, errors.E_JOB_TIMEOUT)
       }
     }
@@ -801,9 +808,8 @@ test.group('Worker', () => {
     await worker.processCycle(['default']) // started
     await worker.processCycle(['default']) // completed (timeout)
 
-    const elapsed = Date.now() - startTime
-
-    assert.isBelow(elapsed, 150)
+    // The timeout fires before the handler returns; the cycle ends once it has returned.
+    assert.isBelow(failedAt - startTime, 150)
   })
 
   test('should apply the timeout and failOnTimeout of the global defaultJobOptions', async ({
@@ -861,12 +867,15 @@ test.group('Worker', () => {
   test('should apply the timeout of the queue defaultJobOptions', async ({ assert, cleanup }) => {
     assert.plan(2)
 
+    let failedAt = 0
+
     class SlowJob extends Job {
       async execute() {
         await setTimeout(200)
       }
 
       async failed(error: Error) {
+        failedAt = Date.now()
         assert.instanceOf(error, errors.E_JOB_TIMEOUT)
       }
     }
@@ -902,7 +911,146 @@ test.group('Worker', () => {
     await worker.processCycle(['default']) // started
     await worker.processCycle(['default']) // completed (timeout)
 
-    assert.isBelow(Date.now() - startTime, 150)
+    // The timeout fires before the handler returns; the cycle ends once it has returned.
+    assert.isBelow(failedAt - startTime, 150)
+  })
+
+  test('should keep the slot of a timed out job until its handler returns', async ({
+    assert,
+    cleanup,
+  }) => {
+    let handlerReturned = false
+    let statusWhenHandlerReturned: string | undefined
+    const sharedAdapter = memory()()
+
+    class StubbornJob extends Job {
+      static options = { timeout: 50, retry: { maxRetries: 1 } }
+
+      async execute() {
+        // Ignores this.signal and keeps running after the timeout.
+        await setTimeout(200)
+        statusWhenHandlerReturned = (await sharedAdapter.getJob('stubborn-job', 'default'))?.status
+        handlerReturned = true
+      }
+    }
+
+    Locator.register('StubbornJob', StubbornJob)
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      worker: { concurrency: 1 },
+    })
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await sharedAdapter.push({
+      id: 'stubborn-job',
+      name: 'StubbornJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    await worker.processCycle(['default']) // started
+    await worker.processCycle(['default']) // completed (timeout), once the handler returned
+
+    // The retry was scheduled at the timeout, while the handler still ran...
+    assert.equal(statusWhenHandlerReturned, 'pending')
+    // ...but the slot stayed taken until the handler returned.
+    assert.isTrue(handlerReturned)
+  })
+
+  test('should wait for a timed out handler before stopping', async ({ assert, cleanup }) => {
+    let timedOut = false
+    let handlerReturned = false
+
+    class StubbornJob extends Job {
+      static options = { timeout: 20 }
+
+      async execute() {
+        await setTimeout(150)
+        handlerReturned = true
+      }
+
+      async failed() {
+        timedOut = true
+      }
+    }
+
+    const sharedAdapter = memory()()
+
+    Locator.register('StubbornJob', StubbornJob)
+
+    const worker = new Worker({ default: 'memory', adapters: { memory: () => sharedAdapter } })
+
+    cleanup(async () => {
+      Locator.clear()
+    })
+
+    await sharedAdapter.push({
+      id: 'stubborn-stop-job',
+      name: 'StubbornJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    await worker.processCycle(['default']) // started
+    await setTimeout(60)
+    assert.isTrue(timedOut)
+    assert.isFalse(handlerReturned)
+
+    await worker.stop()
+
+    assert.isTrue(handlerReturned, 'stop() should wait for the timed out handler')
+  })
+
+  test('should keep the slot of a timed out job when its failed() hook throws', async ({
+    assert,
+    cleanup,
+  }) => {
+    let handlerReturned = false
+
+    class StubbornJob extends Job {
+      static options = { timeout: 20 }
+
+      async execute() {
+        await setTimeout(150)
+        handlerReturned = true
+      }
+
+      async failed() {
+        throw new Error('failed() hook error')
+      }
+    }
+
+    const sharedAdapter = memory()()
+
+    Locator.register('StubbornJob', StubbornJob)
+
+    const worker = new Worker({ default: 'memory', adapters: { memory: () => sharedAdapter } })
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await sharedAdapter.push({
+      id: 'stubborn-hook-job',
+      name: 'StubbornJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    await worker.processCycle(['default']) // started
+    await worker.processCycle(['default']) // settles once the handler returned
+
+    assert.isTrue(handlerReturned)
   })
 
   test('should wait for running jobs to complete before stopping', async ({ assert, cleanup }) => {

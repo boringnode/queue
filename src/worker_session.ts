@@ -445,7 +445,17 @@ export class WorkerSession {
     debug('worker %s: executing job %s (%s)', this.#workerId, job.id, job.name)
 
     const outcome = await this.#jobExecutionRuntime.execute(job, queue)
-    await this.#finalizeExecution(job, queue, outcome)
+
+    try {
+      await this.#finalizeExecution(job, queue, outcome)
+    } finally {
+      // The job is finalized, but its timed out handler still runs: it keeps
+      // its slot, so concurrency and stop() account for it until it returns.
+      if ('timedOutExecution' in outcome && outcome.timedOutExecution) {
+        debug('worker %s: waiting for timed out job %s to return', this.#workerId, job.id)
+        await outcome.timedOutExecution
+      }
+    }
 
     if (outcome.type === 'completed') {
       debug(

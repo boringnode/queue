@@ -174,6 +174,12 @@ export class SyncAdapter implements Adapter {
       }
       const outcome = await runtime.execute(acquiredJob, queue)
 
+      // A timed out handler keeps running until it returns: wait for it, so
+      // the caller never sees two attempts running at once.
+      if ('timedOutExecution' in outcome) {
+        await outcome.timedOutExecution
+      }
+
       if (outcome.type === 'initialization-failed') {
         throw outcome.error
       }

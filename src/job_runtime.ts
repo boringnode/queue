@@ -18,16 +18,23 @@ import { parse } from './utils.js'
 
 type PermanentFailureReason = 'timeout' | 'no-retries' | 'max-attempts' | 'stalled'
 
+/**
+ * A timed out handler that had not settled when the timeout fired. The
+ * attempt is over, but the handler keeps running until it returns: callers
+ * wait for this promise before they run anything in its place.
+ */
+type TimedOutExecution = { timedOutExecution?: Promise<void> }
+
 export type JobExecutionOutcome =
   | { type: 'completed'; removeOnComplete?: JobRetention }
-  | { type: 'retry'; retryAt?: Date }
-  | {
+  | ({ type: 'retry'; retryAt?: Date } & TimedOutExecution)
+  | ({
       type: 'failed'
       reason: PermanentFailureReason
       error: Error
       removeOnFail?: JobRetention
       failedHookError?: Error
-    }
+    } & TimedOutExecution)
   | { type: 'initialization-failed'; error: Error; removeOnFail?: JobRetention }
 
 type JobExecutionRuntimeDependencies = {
@@ -171,9 +178,10 @@ export class JobExecutionRuntime {
     const context = this.#createContext(job, queue)
     const resolvedOptions = this.#configResolver.resolveJobOptions(queue, options)
     const retryConfig = this.#configResolver.resolveRetryConfig(queue, options)
+    const timedOut: TimedOutExecution = {}
 
     try {
-      await this.#executeJob(instance, job.payload, context, resolvedOptions)
+      await this.#executeJob(instance, job.payload, context, resolvedOptions, timedOut)
       executeMessage.status = 'completed'
 
       return { type: 'completed', removeOnComplete: resolvedOptions.removeOnComplete }
@@ -192,7 +200,7 @@ export class JobExecutionRuntime {
       if (decision.type === 'retry') {
         executeMessage.status = 'retrying'
         executeMessage.nextRetryAt = decision.retryAt
-        return decision
+        return { ...decision, ...timedOut }
       }
 
       executeMessage.status = 'failed'
@@ -210,6 +218,7 @@ export class JobExecutionRuntime {
         error: executionError,
         removeOnFail: resolvedOptions.removeOnFail,
         failedHookError,
+        ...timedOut,
       }
     }
   }
@@ -231,7 +240,8 @@ export class JobExecutionRuntime {
     instance: Job,
     payload: unknown,
     context: JobContext,
-    options: ResolvedJobOptions
+    options: ResolvedJobOptions,
+    timedOut: TimedOutExecution
   ): Promise<void> {
     const configuredTimeout = options.timeout
 
@@ -250,8 +260,22 @@ export class JobExecutionRuntime {
       timeout
     )
 
+    // Unset when execute() throws synchronously: nothing keeps running then.
+    let execution: Promise<void> | undefined
+
     try {
-      await Promise.race([instance.execute(), abortPromise])
+      execution = instance.execute()
+      await Promise.race([execution, abortPromise])
+    } catch (error) {
+      // Cancellation is cooperative: a handler that has not settled yet keeps
+      // running, so the caller must keep its slot until it returns.
+      if (execution && error instanceof errors.E_JOB_TIMEOUT) {
+        timedOut.timedOutExecution = Promise.resolve(execution).then(
+          () => {},
+          () => {}
+        )
+      }
+      throw error
     } finally {
       cleanupAbortListener()
     }

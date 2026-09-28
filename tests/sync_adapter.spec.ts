@@ -58,6 +58,34 @@ test.group('SyncAdapter', (group) => {
     assert.deepEqual(contextJobIds, Array(contextJobIds.length).fill(jobId))
   })
 
+  test('should not start a retry while a timed out attempt still runs', async ({ assert }) => {
+    let running = 0
+    let maxRunning = 0
+    let attempts = 0
+
+    class StubbornSyncJob extends Job<Record<string, never>> {
+      static options = { timeout: 20, maxRetries: 1 }
+
+      async execute() {
+        attempts++
+        running++
+        maxRunning = Math.max(maxRunning, running)
+        // Ignores this.signal and keeps running after the timeout.
+        await sleep(80)
+        running--
+      }
+    }
+
+    await QueueManager.init({ default: 'sync', adapters: { sync: sync() } })
+    Locator.register('StubbornSyncJob', StubbornSyncJob)
+
+    await StubbornSyncJob.dispatch({}).run()
+
+    assert.equal(attempts, 2)
+    assert.equal(maxRunning, 1)
+    assert.equal(running, 0)
+  })
+
   test('should log delayed sync job failures without unhandled rejections', async ({ assert }) => {
     const logger = new MemoryLogger()
     let unhandledError: unknown
