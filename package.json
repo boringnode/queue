@@ -10,8 +10,12 @@
   "exports": {
     ".": "./build/index.js",
     "./otel": "./build/src/otel.js",
-    "./drivers/*": "./build/src/drivers/*.js",
-    "./contracts/*": "./build/src/contracts/*.js",
+    "./drivers/fake_adapter": "./build/src/drivers/fake_adapter.js",
+    "./drivers/knex_adapter": "./build/src/drivers/knex_adapter.js",
+    "./drivers/kysely_adapter": "./build/src/drivers/kysely_adapter.js",
+    "./drivers/redis_adapter": "./build/src/drivers/redis_adapter.js",
+    "./drivers/sync_adapter": "./build/src/drivers/sync_adapter.js",
+    "./contracts/adapter": "./build/src/contracts/adapter.js",
     "./types": "./build/src/types/index.js"
   },
   "scripts": {

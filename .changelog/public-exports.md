@@ -8,3 +8,21 @@
   `PushResult` for `push()` and `pushOn()`.
 - `RedisConfig` and `KnexConfig`, the config types `redis()` and `knex()` accept, are exported from
   their drivers.
+
+## Breaking Changes
+
+### Only adapters are exported under `./drivers`
+
+The `./drivers/*` and `./contracts/*` wildcards also exposed internal modules, such as
+`@boringnode/queue/drivers/redis_scripts` and `@boringnode/queue/drivers/redis_job_storage`. The
+package now exports these paths only:
+
+- `@boringnode/queue/drivers/fake_adapter`
+- `@boringnode/queue/drivers/knex_adapter`
+- `@boringnode/queue/drivers/kysely_adapter`
+- `@boringnode/queue/drivers/redis_adapter`
+- `@boringnode/queue/drivers/sync_adapter`
+- `@boringnode/queue/contracts/adapter`
+
+Importing any other path under `./drivers` or `./contracts` now fails with
+`ERR_PACKAGE_PATH_NOT_EXPORTED`.

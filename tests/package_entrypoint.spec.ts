@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { readdir, readFile } from 'node:fs/promises'
 import { test } from '@japa/runner'
 import type { DedupOutcome, PushResult } from '../src/types/index.js'
 import type { redis, RedisConfig } from '../src/drivers/redis_adapter.js'
@@ -46,4 +47,26 @@ test('public types cover adapter results and adapter configs', ({ expectTypeOf }
   expectTypeOf<PushResult['outcome']>().toEqualTypeOf<DedupOutcome>()
   expectTypeOf<Parameters<typeof redis>[0]>().toEqualTypeOf<RedisConfig | undefined>()
   expectTypeOf<Parameters<typeof knex>[0]>().toEqualTypeOf<KnexConfig>()
+})
+
+test('package exports every adapter and no internal driver module', async ({ assert }) => {
+  const packageJson = JSON.parse(
+    await readFile(new URL('../package.json', import.meta.url), 'utf8')
+  )
+  const adapters = (await readdir(new URL('../src/drivers/', import.meta.url)))
+    .filter((file) => file.endsWith('.ts'))
+    .map((file) => file.replace(/\.ts$/, ''))
+    .filter((module) => module.endsWith('_adapter'))
+
+  const exportedDrivers = Object.keys(packageJson.exports).filter((path) =>
+    path.startsWith('./drivers/')
+  )
+
+  assert.sameMembers(
+    exportedDrivers,
+    adapters.map((adapter) => `./drivers/${adapter}`)
+  )
+  for (const adapter of adapters) {
+    assert.equal(packageJson.exports[`./drivers/${adapter}`], `./build/src/drivers/${adapter}.js`)
+  }
 })
