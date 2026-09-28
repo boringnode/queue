@@ -77,7 +77,7 @@ __metadata:
   peerDependencies:
     "@opentelemetry/api": ^1.9.0
     "@opentelemetry/core": ^1.30.0 || ^2.0.0
-    "@opentelemetry/instrumentation": ^0.200.0
+    "@opentelemetry/instrumentation": ">=0.200.0 <0.300.0"
     ioredis: ^5.0.0
     knex: ^3.0.0
     kysely: ^0.29.0
