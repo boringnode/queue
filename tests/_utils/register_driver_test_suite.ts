@@ -835,31 +835,36 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')
 
-    await adapter.pushOn('test-queue', {
-      id: 'long-running',
-      name: 'TestJob',
-      payload: {},
-      attempts: 0,
-    })
-
-    const job = await adapter.popFrom('test-queue')
-    assert.isNotNull(job)
-
-    // Keep renewing the job while it "runs" longer than the stalled threshold.
-    for (let i = 0; i < 5; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 20))
-      const renewed = await adapter.renewJobs('test-queue', [job!])
-      assert.equal(renewed, 1)
-
-      // Even though more than 30ms has elapsed in total, the job is never
-      // stalled because each renewal refreshes its acquired timestamp.
-      const { recovered } = await adapter.recoverStalledJobs('test-queue', 30, 1, 100)
-      assert.equal(recovered, 0)
+    for (const id of ['long-running', 'not-renewed']) {
+      await adapter.pushOn('test-queue', { id, name: 'TestJob', payload: {}, attempts: 0 })
     }
 
-    // Still active, not back in pending.
-    const pending = await adapter.popFrom('test-queue')
-    assert.isNull(pending)
+    // Jobs pushed in the same millisecond can be acquired in either order.
+    const acquired = [await adapter.popFrom('test-queue'), await adapter.popFrom('test-queue')]
+    const job = acquired.find((candidate) => candidate?.id === 'long-running')
+    assert.isDefined(job)
+
+    // Both jobs run longer than the 200ms stalled threshold; only one is renewed.
+    // A slow run only makes the control job more stalled, and the renewed job
+    // has a 200ms margin between each renewal and the next recovery.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(await adapter.renewJobs('test-queue', [job!]), 1)
+
+    const first = await adapter.recoverStalledJobs('test-queue', 200, 1, 100)
+
+    // The control job proves the threshold had passed; the renewed job stays active.
+    assert.equal(first.recovered, 1)
+    assert.equal((await adapter.getJob('long-running', 'test-queue'))!.status, 'active')
+    assert.equal((await adapter.getJob('not-renewed', 'test-queue'))!.status, 'pending')
+
+    // 300ms after the first renewal, the job would be stalled again: only the
+    // second renewal, with the same lease, keeps it active.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(await adapter.renewJobs('test-queue', [job!]), 1)
+
+    const second = await adapter.recoverStalledJobs('test-queue', 200, 1, 100)
+    assert.equal(second.recovered, 0)
+    assert.equal((await adapter.getJob('long-running', 'test-queue'))!.status, 'active')
   })
 
   test('renewJobs should only renew jobs that are still active', async ({ assert }) => {
