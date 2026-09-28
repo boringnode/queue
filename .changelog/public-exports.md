@@ -26,3 +26,8 @@ package now exports these paths only:
 
 Importing any other path under `./drivers` or `./contracts` now fails with
 `ERR_PACKAGE_PATH_NOT_EXPORTED`.
+
+### `errors.E_NO_JOBS_FOUND` is removed
+
+It was never thrown: when job discovery finds no files, `QueueManager` logs a warning instead. Code
+that referenced `errors.E_NO_JOBS_FOUND` must drop the reference.

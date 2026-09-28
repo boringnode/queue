@@ -68,12 +68,6 @@ export const E_ADAPTER_INIT_ERROR = createError<[adapterName: string, originalMe
   500
 )
 
-export const E_NO_JOBS_FOUND = createError<[patterns: string]>(
-  'No jobs found for the specified locations: %s. Verify your glob patterns match your job files.',
-  'E_NO_JOBS_FOUND',
-  500
-)
-
 export const E_INVALID_CRON_EXPRESSION = createError<[expression: string, reason: string]>(
   'Invalid cron expression "%s": %s',
   'E_INVALID_CRON_EXPRESSION',
