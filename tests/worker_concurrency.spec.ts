@@ -3,7 +3,7 @@ import { test } from '@japa/runner'
 import { Redis } from 'ioredis'
 import { RedisAdapter } from '../src/drivers/redis_adapter.js'
 import { KnexAdapter } from '../src/drivers/knex_adapter.js'
-import { QueueSchemaService } from '../src/services/queue_schema.js'
+import { KnexQueueSchemaService } from '../src/services/knex_queue_schema.js'
 import { registerWorkerConcurrencyTestSuite } from './_utils/register_worker_concurrency_suite.js'
 
 const KEY_PREFIX = 'boringnode::queue::concurrency-test::'
@@ -38,7 +38,7 @@ test.group('Worker Concurrency | Redis', (group) => {
 test.group('Worker Concurrency | Knex (PostgreSQL)', (group) => {
   let connection: ReturnType<typeof Knex>
   let adapter: KnexAdapter
-  let schemaService: QueueSchemaService
+  let schemaService: KnexQueueSchemaService
   const tableName = 'queue_jobs_concurrency_test'
   const schedulesTableName = 'queue_schedules_concurrency_test'
 
@@ -54,7 +54,7 @@ test.group('Worker Concurrency | Knex (PostgreSQL)', (group) => {
       },
     })
 
-    schemaService = new QueueSchemaService(connection)
+    schemaService = new KnexQueueSchemaService(connection)
 
     // Drop both tables to ensure clean state
     await schemaService.dropJobsTable(tableName)

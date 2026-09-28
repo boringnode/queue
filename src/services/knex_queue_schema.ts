@@ -1,6 +1,6 @@
 import type { Knex } from 'knex'
 
-export class QueueSchemaService {
+export class KnexQueueSchemaService {
   #connection: Knex
 
   constructor(connection: Knex) {
