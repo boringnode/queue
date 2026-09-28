@@ -7,6 +7,15 @@ import type {
 } from './types/main.js'
 
 /**
+ * Job options applied when a job runs, after merging the job, queue, global,
+ * and worker settings.
+ */
+export type ResolvedJobOptions = Pick<
+  JobOptions,
+  'removeOnComplete' | 'removeOnFail' | 'timeout'
+> & { failOnTimeout: boolean }
+
+/**
  * Resolve effective queue/job runtime configuration from the initialized
  * queue config.
  *
@@ -72,29 +81,33 @@ export class QueueConfigResolver {
   }
 
   /**
-   * Resolve effective retention options using priority: job > queue > global.
+   * Resolve the options applied when a job runs, using priority:
+   * job > queue `defaultJobOptions` > global `defaultJobOptions`.
+   * The timeout falls back to `worker.timeout` last.
    */
-  resolveJobOptions(queue: string, jobOptions?: JobOptions): JobOptions {
-    const queueConfig = this.#queueConfigs.get(queue)
-    const queueJobOptions = queueConfig?.defaultJobOptions
+  resolveJobOptions(queue: string, jobOptions?: JobOptions): ResolvedJobOptions {
+    const layers = [
+      jobOptions,
+      this.#queueConfigs.get(queue)?.defaultJobOptions,
+      this.#globalJobOptions,
+    ]
 
     return {
-      removeOnComplete:
-        jobOptions?.removeOnComplete ??
-        queueJobOptions?.removeOnComplete ??
-        this.#globalJobOptions?.removeOnComplete,
-      removeOnFail:
-        jobOptions?.removeOnFail ??
-        queueJobOptions?.removeOnFail ??
-        this.#globalJobOptions?.removeOnFail,
+      removeOnComplete: this.#firstDefined(layers, 'removeOnComplete'),
+      removeOnFail: this.#firstDefined(layers, 'removeOnFail'),
+      timeout: this.#firstDefined(layers, 'timeout') ?? this.#workerTimeout,
+      failOnTimeout: this.#firstDefined(layers, 'failOnTimeout') ?? false,
     }
   }
 
   /**
-   * Return the configured default worker timeout.
+   * The value of `key` in the first options that define it.
    */
-  getWorkerTimeout(): Duration | undefined {
-    return this.#workerTimeout
+  #firstDefined<K extends keyof JobOptions>(
+    layers: Array<JobOptions | undefined>,
+    key: K
+  ): JobOptions[K] {
+    return layers.find((options) => options?.[key] !== undefined)?.[key]
   }
 
   /**

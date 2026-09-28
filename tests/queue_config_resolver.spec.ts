@@ -78,16 +78,43 @@ test.group('QueueConfigResolver', () => {
     assert.deepEqual(resolved, {
       removeOnComplete: false,
       removeOnFail: { age: '3d' },
+      timeout: undefined,
+      failOnTimeout: false,
     })
   })
 
-  test('should expose configured worker timeout', ({ assert }) => {
+  test('should resolve the timeout with correct precedence', ({ assert }) => {
+    const resolver = QueueConfigResolver.from({
+      default: 'sync',
+      adapters: { sync: () => ({}) as any },
+      worker: { timeout: '1m' },
+      defaultJobOptions: { timeout: '30s', failOnTimeout: true },
+      queues: {
+        email: { defaultJobOptions: { timeout: '10s', failOnTimeout: false } },
+      },
+    })
+
+    const job = resolver.resolveJobOptions('email', { timeout: '5s', failOnTimeout: true })
+    assert.equal(job.timeout, '5s')
+    assert.isTrue(job.failOnTimeout)
+
+    const queue = resolver.resolveJobOptions('email', {})
+    assert.equal(queue.timeout, '10s')
+    assert.isFalse(queue.failOnTimeout)
+
+    const global = resolver.resolveJobOptions('reports', {})
+    assert.equal(global.timeout, '30s')
+    assert.isTrue(global.failOnTimeout)
+  })
+
+  test('should fall back to the worker timeout', ({ assert }) => {
     const resolver = QueueConfigResolver.from({
       default: 'sync',
       adapters: { sync: () => ({}) as any },
       worker: { timeout: '30s' },
     })
 
-    assert.equal(resolver.getWorkerTimeout(), '30s')
+    assert.equal(resolver.resolveJobOptions('default').timeout, '30s')
+    assert.isFalse(resolver.resolveJobOptions('default').failOnTimeout)
   })
 })

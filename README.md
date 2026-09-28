@@ -659,6 +659,21 @@ export default class LongRunningJob extends Job<Payload> {
 }
 ```
 
+`timeout` and `failOnTimeout` can also be set for every job in `defaultJobOptions`, globally or per
+queue:
+
+```typescript
+const config = {
+  defaultJobOptions: { timeout: '5m' },
+  queues: {
+    reports: { defaultJobOptions: { timeout: '30m', failOnTimeout: true } },
+  },
+}
+```
+
+The job's own options win, then the queue's `defaultJobOptions`, then the global ones, then
+`worker.timeout`.
+
 ## Job Context
 
 Access execution metadata via `this.context`:

@@ -806,6 +806,105 @@ test.group('Worker', () => {
     assert.isBelow(elapsed, 150)
   })
 
+  test('should apply the timeout and failOnTimeout of the global defaultJobOptions', async ({
+    assert,
+    cleanup,
+  }) => {
+    assert.plan(2)
+
+    let attempts = 0
+
+    class SlowJob extends Job {
+      async execute() {
+        attempts++
+        await setTimeout(200)
+      }
+
+      async failed(error: Error) {
+        assert.instanceOf(error, errors.E_JOB_TIMEOUT)
+      }
+    }
+
+    const sharedAdapter = memory()()
+
+    const localConfig = {
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      retry: { maxRetries: 3 },
+      defaultJobOptions: { timeout: 50, failOnTimeout: true },
+    }
+
+    Locator.register('SlowJob', SlowJob)
+
+    const worker = new Worker(localConfig)
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await sharedAdapter.push({
+      id: 'default-options-timeout-job',
+      name: 'SlowJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    await worker.processCycle(['default']) // started
+    await worker.processCycle(['default']) // completed (timeout, failed)
+    await worker.processCycle(['default']) // idle: failOnTimeout skips the retries
+
+    assert.equal(attempts, 1)
+  })
+
+  test('should apply the timeout of the queue defaultJobOptions', async ({ assert, cleanup }) => {
+    assert.plan(2)
+
+    class SlowJob extends Job {
+      async execute() {
+        await setTimeout(200)
+      }
+
+      async failed(error: Error) {
+        assert.instanceOf(error, errors.E_JOB_TIMEOUT)
+      }
+    }
+
+    const sharedAdapter = memory()()
+
+    const localConfig = {
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      defaultJobOptions: { timeout: 5_000 },
+      queues: { default: { defaultJobOptions: { timeout: 50 } } },
+    }
+
+    Locator.register('SlowJob', SlowJob)
+
+    const worker = new Worker(localConfig)
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await sharedAdapter.push({
+      id: 'queue-options-timeout-job',
+      name: 'SlowJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    const startTime = Date.now()
+
+    await worker.processCycle(['default']) // started
+    await worker.processCycle(['default']) // completed (timeout)
+
+    assert.isBelow(Date.now() - startTime, 150)
+  })
+
   test('should wait for running jobs to complete before stopping', async ({ assert, cleanup }) => {
     let jobCompleted = false
 

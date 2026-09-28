@@ -3,7 +3,7 @@ import { DEFAULT_PRIORITY } from './constants.js'
 import { executeChannel } from './tracing_channels.js'
 import type { Job } from './job.js'
 import type { AcquiredJob } from './contracts/adapter.js'
-import type { QueueConfigResolver } from './queue_config_resolver.js'
+import type { QueueConfigResolver, ResolvedJobOptions } from './queue_config_resolver.js'
 import type {
   JobClass,
   JobContext,
@@ -169,19 +169,19 @@ export class JobExecutionRuntime {
     }
 
     const context = this.#createContext(job, queue)
-    const retention = this.#configResolver.resolveJobOptions(queue, options)
+    const resolvedOptions = this.#configResolver.resolveJobOptions(queue, options)
     const retryConfig = this.#configResolver.resolveRetryConfig(queue, options)
 
     try {
-      await this.#executeJob(instance, job.payload, context, options)
+      await this.#executeJob(instance, job.payload, context, resolvedOptions)
       executeMessage.status = 'completed'
 
-      return { type: 'completed', removeOnComplete: retention.removeOnComplete }
+      return { type: 'completed', removeOnComplete: resolvedOptions.removeOnComplete }
     } catch (error) {
       const executionError = error as Error
       const decision = this.#resolveFailure(
         job.name,
-        options,
+        resolvedOptions,
         retryConfig,
         executionError,
         job.attempts
@@ -208,7 +208,7 @@ export class JobExecutionRuntime {
         type: 'failed',
         reason: decision.reason,
         error: executionError,
-        removeOnFail: retention.removeOnFail,
+        removeOnFail: resolvedOptions.removeOnFail,
         failedHookError,
       }
     }
@@ -231,9 +231,9 @@ export class JobExecutionRuntime {
     instance: Job,
     payload: unknown,
     context: JobContext,
-    options: JobOptions
+    options: ResolvedJobOptions
   ): Promise<void> {
-    const configuredTimeout = options.timeout ?? this.#configResolver.getWorkerTimeout()
+    const configuredTimeout = options.timeout
 
     if (configuredTimeout === undefined) {
       instance.$hydrate(payload, context)
@@ -259,7 +259,7 @@ export class JobExecutionRuntime {
 
   #resolveFailure(
     jobName: string,
-    options: JobOptions,
+    options: ResolvedJobOptions,
     retryConfig: RetryConfig,
     error: Error,
     attempts: number
