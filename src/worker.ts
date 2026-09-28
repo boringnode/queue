@@ -30,7 +30,8 @@ import {
  *
  * @example
  * ```typescript
- * import { Worker, redis } from '@boringnode/queue'
+ * import { Worker } from '@boringnode/queue'
+ * import { redis } from '@boringnode/queue/drivers/redis_adapter'
  *
  * const worker = new Worker({
  *   default: 'redis',

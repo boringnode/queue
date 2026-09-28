@@ -37,7 +37,8 @@ type QueueManagerFakeState = {
  *
  * @example
  * ```typescript
- * import { QueueManager, redis } from '@boringnode/queue'
+ * import { QueueManager, exponentialBackoff } from '@boringnode/queue'
+ * import { redis } from '@boringnode/queue/drivers/redis_adapter'
  *
  * await QueueManager.init({
  *   default: 'redis',

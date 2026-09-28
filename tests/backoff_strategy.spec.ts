@@ -7,6 +7,7 @@ import {
   linearBackoff,
 } from '../src/strategies/backoff_strategy.js'
 import * as errors from '../src/exceptions.js'
+import type { JobOptions } from '../src/types/main.js'
 
 test.group('BackoffStrategy', () => {
   test('should validate negative baseDelay', ({ assert }) => {
@@ -238,5 +239,23 @@ test.group('BackoffStrategy | Fixed', () => {
 
     assert.isTrue(nextRetry.getTime() >= now + 1000)
     assert.isTrue(nextRetry.getTime() <= after + 1000)
+  })
+
+  test('README retry examples compile and produce retry dates', ({ assert }) => {
+    // Mirrors the "Retry & Backoff" section of the README.
+    const options: JobOptions = {
+      maxRetries: 5,
+      retry: {
+        backoff: exponentialBackoff({
+          baseDelay: '1s',
+          maxDelay: '1m',
+          multiplier: 2,
+          jitter: true,
+        }),
+      },
+    }
+
+    assert.instanceOf(options.retry!.backoff!().getNextRetryAt(1), Date)
+    assert.equal(fixedBackoff('5s')().calculateDelay(3), 5000)
   })
 })

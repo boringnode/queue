@@ -257,7 +257,7 @@ const { jobId, deduped } = await SaveDraftJob.dispatch({ content: '...' })
 
 - The dedup ID is automatically prefixed with the job name (`SendInvoiceJob::order-123`), so different job types can reuse the same key.
 - The user-supplied `id` must be ≤ 400 characters, and the combined `<jobName>::<id>` key must be ≤ 510 characters (constrained by the Knex storage column). Both limits are validated at `.dedup()` time.
-- `ttl` accepts a Duration (`'5s'`, `'1m'`) or milliseconds, and must be **positive** when provided. Use `0` or omit `ttl` if you want no expiry — `ttl: 0` is rejected to avoid an ambiguous "expired immediately vs no-expiry" interpretation across engines.
+- `ttl` accepts a Duration (`'5s'`, `'1m'`) or milliseconds, and must be **positive** when provided. Omit `ttl` if you want no expiry. `ttl: 0` is rejected to avoid an ambiguous "expired immediately vs no-expiry" interpretation across engines.
 - `extend` and `replace` **require** `ttl` — calling them without `ttl` throws.
 - `replace` only applies to jobs in `pending` or `delayed` state. Jobs that are active (executing) or retained in history (`completed`/`failed` with retention) are left alone; the dispatch returns `{ deduped: 'skipped' }`.
 - `replace` swaps the **payload only** — priority, queue, delay, groupId, and stored dedup options of the existing job are retained. To change those, use a different dedup id or wait for the TTL to expire.
@@ -265,9 +265,9 @@ const { jobId, deduped } = await SaveDraftJob.dispatch({ content: '...' })
 - `extend` works in **all states** — even when the existing job is `active` (executing) or retained in history. Unlike `replace` (which is no-op on non-replaceable states), `extend` always refreshes the dedup TTL window. Use this when you want the dedup slot to keep blocking new dispatches for the lifetime of a long-running job.
 - `extend` requires the **first** dispatch to have set a `ttl`. If the slot was created without a `ttl`, later `extend` dispatches have no window to refresh and return `{ deduped: 'skipped' }` instead of `'extended'`.
 - `retryJob` does not touch the dedup entry — a retried job continues to occupy the dedup slot. TTL runs on wall-clock time, so long-running retries may outlive the TTL window. Use a generous TTL or no TTL if retries must stay deduped.
-- Atomic and race-free:
+- Atomicity:
   - **Redis**: a single Lua script per dispatch performs the dedup-key lookup, state check (pending/delayed ZSCORE), payload swap, and TTL refresh atomically.
-  - **Knex/Kysely**: transactional `SELECT ... FOR UPDATE` + insert/update inside a transaction. A savepoint catches unique-constraint violations under concurrent inserts and returns `{ deduped: 'skipped' }` pointing at the winner.
+  - **Knex/Kysely**: transactional `SELECT ... FOR UPDATE` + insert/update inside a transaction. On PostgreSQL and SQLite, a partial unique index makes concurrent first dispatches race-free: a savepoint catches the unique-constraint violation and returns `{ deduped: 'skipped' }` pointing at the winner. MySQL has no partial unique index, see the caveat below.
   - **SyncAdapter**: executes inline, no dedup support.
 
 ### Caveats
@@ -553,13 +553,12 @@ export default class ReliableJob extends Job<Payload> {
   static options: JobOptions = {
     maxRetries: 5,
     retry: {
-      backoff: () =>
-        exponentialBackoff({
-          baseDelay: '1s',
-          maxDelay: '1m',
-          multiplier: 2,
-          jitter: true,
-        }),
+      backoff: exponentialBackoff({
+        baseDelay: '1s',
+        maxDelay: '1m',
+        multiplier: 2,
+        jitter: true,
+      }),
     },
   }
 }
@@ -586,7 +585,7 @@ exponentialBackoff({ baseDelay: '1s', maxDelay: '1m', multiplier: 2 })
 linearBackoff({ baseDelay: '1s', maxDelay: '30s', multiplier: 1 })
 
 // Fixed: 5s, 5s, 5s...
-fixedBackoff({ baseDelay: '5s', jitter: true })
+fixedBackoff('5s')
 ```
 
 </details>
@@ -668,16 +667,19 @@ const redisSchedules = await Schedule.list({}, { adapter: 'redis' })
 
 **Schedule options:**
 
-| Method              | Description                       |
-| ------------------- | --------------------------------- |
-| `.id(string)`       | Unique identifier                 |
-| `.every(duration)`  | Fixed interval ('5s', '1m', '1h') |
-| `.cron(expression)` | Cron schedule                     |
-| `.timezone(tz)`     | Timezone (default: 'UTC')         |
-| `.from(date)`       | Start boundary                    |
-| `.to(date)`         | End boundary                      |
-| `.limit(n)`         | Maximum runs                      |
-| `.with(adapter)`    | Adapter that owns the Schedule    |
+| Method              | Description                                  |
+| ------------------- | -------------------------------------------- |
+| `.id(string)`       | Unique identifier (defaults to the job name) |
+| `.every(duration)`  | Fixed interval ('5s', '1m', '1h')            |
+| `.cron(expression)` | Cron schedule                                |
+| `.timezone(tz)`     | Timezone (default: 'UTC')                    |
+| `.from(date)`       | Start boundary                               |
+| `.to(date)`         | End boundary                                 |
+| `.limit(n)`         | Maximum runs                                 |
+| `.with(adapter)`    | Adapter that owns the Schedule               |
+
+Scheduling the same Job twice without `.id()` replaces the first Schedule, since both use the job
+name as their id.
 
 A Schedule and every Job it dispatches stay on the same Adapter. Start a Worker for each Adapter
 that owns Schedules.

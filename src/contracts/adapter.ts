@@ -36,7 +36,7 @@ export interface AcquiredJob extends JobData {
  *
  * @example
  * ```typescript
- * import { redis } from '@boringnode/queue'
+ * import { redis } from '@boringnode/queue/drivers/redis_adapter'
  *
  * const config = {
  *   default: 'redis',
