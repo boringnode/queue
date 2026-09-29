@@ -29,6 +29,7 @@ import {
 
 import { KnexQueueSchemaService } from '../services/knex_queue_schema.js'
 import { scheduleDatesMigrationRequiredMessage } from '../services/schedule_dates.js'
+import { SCHEDULE_TIMING_COLUMNS } from '../services/schedule_timing.js'
 
 export { KnexQueueSchemaService } from '../services/knex_queue_schema.js'
 export type { ScheduleDatesMigrationOptions } from '../services/schedule_dates.js'
@@ -193,6 +194,16 @@ export class KnexAdapter implements Adapter {
   #supportsSkipLocked(): boolean {
     const client = this.#connection.client.config.client
     return client === 'pg' || client === 'mysql' || client === 'mysql2' || client === 'mariadb'
+  }
+
+  #isMysql(): boolean {
+    const client = this.#connection.client.config.client
+    return client === 'mysql' || client === 'mysql2' || client === 'mariadb'
+  }
+
+  #isSqlite(): boolean {
+    const client = String(this.#connection.client.config.client)
+    return client.includes('sqlite')
   }
 
   async #processDelayedJobs(queue: string, now: number): Promise<void> {
@@ -732,9 +743,9 @@ export class KnexAdapter implements Adapter {
 
   async upsertSchedule(config: ScheduleConfig): Promise<string> {
     const id = config.id ?? randomUUID()
+    const nextRunAt = config.nextRunAt?.getTime() ?? null
 
-    const data = {
-      id,
+    const definition = {
       name: config.name,
       payload: JSON.stringify(resolveSchedulePayload(config.payload)),
       cron_expression: config.cronExpression ?? null,
@@ -743,27 +754,40 @@ export class KnexAdapter implements Adapter {
       from_date: config.from?.getTime() ?? null,
       to_date: config.to?.getTime() ?? null,
       run_limit: config.limit ?? null,
-      status: 'active',
     }
 
-    // Atomic upsert
+    // One statement creates or updates the row. It takes the row lock (the
+    // write lock on SQLite) itself, so concurrent upserts and claims apply one
+    // after the other: a transaction reading the row first can deadlock on
+    // MySQL, and fail with SQLITE_BUSY on SQLite.
+    const column = (name: string) => `${this.#schedulesTable}.${name}`
+    const nullSafeEquals = this.#isMysql()
+      ? '<=>'
+      : this.#isSqlite()
+        ? 'is'
+        : 'is not distinct from'
+    const sameTiming = SCHEDULE_TIMING_COLUMNS.map(() => `?? ${nullSafeEquals} ?`).join(' and ')
+
     await this.#connection(this.#schedulesTable)
       .insert({
-        ...data,
+        ...definition,
+        id,
+        status: 'active',
+        next_run_at: nextRunAt,
         run_count: 0,
         created_at: Date.now(),
       })
       .onConflict('id')
       .merge({
-        name: data.name,
-        payload: data.payload,
-        cron_expression: data.cron_expression,
-        every_ms: data.every_ms,
-        timezone: data.timezone,
-        from_date: data.from_date,
-        to_date: data.to_date,
-        run_limit: data.run_limit,
-        status: 'active',
+        // The status, run metadata, and next run belong to the running
+        // schedule; a new timing takes this next run. First, since MySQL
+        // assigns in order and the timing columns must hold stored values.
+        next_run_at: this.#connection.raw(`case when ${sameTiming} then ?? else ? end`, [
+          ...SCHEDULE_TIMING_COLUMNS.flatMap((name) => [column(name), definition[name]]),
+          column('next_run_at'),
+          nextRunAt,
+        ]),
+        ...definition,
       })
 
     return id

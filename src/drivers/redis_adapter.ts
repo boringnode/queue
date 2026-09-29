@@ -489,7 +489,6 @@ export class RedisAdapter implements Adapter {
       name: config.name,
       payload: JSON.stringify(resolveSchedulePayload(config.payload)),
       timezone: config.timezone,
-      status: 'active',
     }
 
     if (config.cronExpression !== undefined) scheduleData.cron_expression = config.cronExpression
@@ -506,7 +505,8 @@ export class RedisAdapter implements Adapter {
       schedulesDueKey,
       id,
       now.toString(),
-      JSON.stringify(scheduleData)
+      JSON.stringify(scheduleData),
+      config.nextRunAt?.getTime().toString() ?? ''
     )
 
     return id

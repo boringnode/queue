@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import Knex from 'knex'
 import { test } from '@japa/runner'
 import { Redis } from 'ioredis'
@@ -1123,8 +1126,10 @@ test.group('Adapter | Redis', (group) => {
       const nextRunAt = Date.now() + 60_000 + i
       await adapter.updateSchedule(id, { status: 'paused' })
 
+      // The upsert keeps the status and next run the concurrent update sets,
+      // in either order, since the timing does not change.
       await Promise.all([
-        adapter.updateSchedule(id, { nextRunAt: new Date(nextRunAt) }),
+        adapter.updateSchedule(id, { status: 'active', nextRunAt: new Date(nextRunAt) }),
         secondAdapter.upsertSchedule({
           id,
           name: 'ConcurrentJob',
@@ -1340,6 +1345,81 @@ test.group('Adapter | Redis', (group) => {
     assert.equal(schedule!.timezone, 'America/New_York')
     assert.isNull(schedule!.nextRunAt)
     assert.isNull(await connection.zscore('schedules::due', id))
+  })
+
+  test('cron finalization survives a concurrent upsert with the same timing', async ({
+    assert,
+    cleanup,
+  }) => {
+    const secondConnection = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+      keyPrefix: KEY_PREFIX,
+      db: 15,
+    })
+    cleanup(async () => {
+      await secondConnection.quit()
+    })
+
+    const adapter = new RedisAdapter(connection)
+    const secondAdapter = new RedisAdapter(secondConnection)
+    const id = 'cron-finalize-same-timing-upsert'
+    const config = {
+      id,
+      name: 'CronJob',
+      cronExpression: '0 9 * * *',
+      timezone: 'UTC',
+    }
+
+    await adapter.upsertSchedule({
+      ...config,
+      payload: { version: 1 },
+      nextRunAt: new Date(Date.now() - 1_000),
+    })
+
+    const originalEval = connection.eval.bind(connection)
+    let releaseClaim!: () => void
+    let claimReturned!: () => void
+    const claimReleased = new Promise<void>((resolve) => {
+      releaseClaim = resolve
+    })
+    const claimHasReturned = new Promise<void>((resolve) => {
+      claimReturned = resolve
+    })
+    let gateNextEval = true
+
+    connection.eval = (async (...args: Parameters<typeof connection.eval>) => {
+      const result = await originalEval(...args)
+      if (gateNextEval) {
+        gateNextEval = false
+        claimReturned()
+        await claimReleased
+      }
+      return result
+    }) as typeof connection.eval
+
+    // A redeploy runs the same schedule definition while the claim is in flight.
+    const claim = adapter.claimDueSchedule()
+    await claimHasReturned
+    await secondAdapter.upsertSchedule({
+      ...config,
+      payload: { version: 2 },
+      nextRunAt: new Date(Date.now() + 3_600_000),
+    })
+
+    releaseClaim()
+    await claim
+    connection.eval = originalEval
+
+    // The claim computed the next 9:00 run, which the same timing keeps valid.
+    const schedule = await adapter.getSchedule(id)
+    assert.deepEqual(schedule!.payload, { version: 2 })
+    assert.equal(schedule!.nextRunAt!.getUTCHours(), 9)
+    assert.isAbove(schedule!.nextRunAt!.getTime(), Date.now())
+    assert.equal(
+      Number(await connection.zscore('schedules::due', id)),
+      schedule!.nextRunAt!.getTime()
+    )
   })
 
   test('cron finalization survives a concurrent runtime metadata update', async ({
@@ -2052,5 +2132,67 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       'pg-expired-active-stalled-uuid-1',
       'pg-expired-active-stalled-uuid-2',
     ])
+  })
+})
+
+test.group('Adapter | Knex (SQLite file, two connections)', () => {
+  test('concurrent upserts from two connections all succeed', async ({ assert, cleanup }) => {
+    const directory = await mkdtemp(join(tmpdir(), 'queue-sqlite-'))
+    const connect = () =>
+      Knex({
+        client: 'better-sqlite3',
+        connection: { filename: join(directory, 'queue.sqlite') },
+        useNullAsDefault: true,
+        pool: { afterCreate: (db: any, done: any) => done(null, db.pragma('journal_mode = WAL')) },
+      })
+    const first = connect()
+    const second = connect()
+    cleanup(async () => {
+      await first.destroy()
+      await second.destroy()
+      await rm(directory, { recursive: true, force: true })
+    })
+
+    const schedulesTableName = 'queue_schedules'
+    await new KnexQueueSchemaService(first).createSchedulesTable(schedulesTableName)
+    const adapters = [first, second].map(
+      (connection) => new KnexAdapter({ connection, schedulesTableName })
+    )
+
+    for (let round = 0; round < 5; round++) {
+      const id = `two-connections-${round}`
+      const base = Date.now() + 60_000
+
+      // Workers on two connections define the same schedule, then two timings.
+      const results = await Promise.allSettled([
+        ...adapters.map((adapter) =>
+          adapter.upsertSchedule({
+            id,
+            name: 'TestJob',
+            payload: {},
+            everyMs: 60_000,
+            timezone: 'UTC',
+            nextRunAt: new Date(base + 60_000),
+          })
+        ),
+        ...adapters.map((adapter, index) =>
+          adapter.upsertSchedule({
+            id,
+            name: 'TestJob',
+            payload: {},
+            everyMs: (index + 2) * 60_000,
+            timezone: 'UTC',
+            nextRunAt: new Date(base + (index + 2) * 60_000),
+          })
+        ),
+      ])
+
+      assert.deepEqual(
+        results.filter((result) => result.status === 'rejected'),
+        []
+      )
+      const schedule = await adapters[0].getSchedule(id)
+      assert.equal(schedule!.nextRunAt!.getTime() - base, schedule!.everyMs)
+    }
   })
 })

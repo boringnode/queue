@@ -1747,6 +1747,128 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.equal(schedule!.runCount, 3)
   })
 
+  test('upsertSchedule should create a new schedule active with its next run', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    const nextRunAt = new Date(Date.now() + 60_000)
+
+    await adapter.upsertSchedule({
+      id: 'upsert-new-next-run',
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+      nextRunAt,
+    })
+
+    const schedule = await adapter.getSchedule('upsert-new-next-run')
+    assert.equal(schedule!.status, 'active')
+    assert.equal(schedule!.nextRunAt!.getTime(), nextRunAt.getTime())
+  })
+
+  test('upsertSchedule should keep the status of an existing schedule', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    const config = {
+      id: 'upsert-keep-paused',
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+    }
+
+    await adapter.upsertSchedule(config)
+    await adapter.updateSchedule(config.id, { status: 'paused' })
+
+    // Even a new definition does not resume a paused schedule.
+    await adapter.upsertSchedule(config)
+    await adapter.upsertSchedule({ ...config, everyMs: 30_000 })
+
+    assert.equal((await adapter.getSchedule(config.id))!.status, 'paused')
+  })
+
+  test('upsertSchedule should keep the next run when the timing is unchanged', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    const config = {
+      id: 'upsert-keep-next-run',
+      name: 'TestJob',
+      cronExpression: '0 9 * * *',
+      timezone: 'Europe/Paris',
+      from: new Date('2026-01-01T00:00:00.000Z'),
+      to: new Date('2099-01-01T00:00:00.000Z'),
+      limit: 10,
+    }
+    const nextRunAt = new Date(Date.now() + 60_000)
+
+    await adapter.upsertSchedule({ ...config, payload: { version: 1 }, nextRunAt })
+
+    // A payload change is not a timing change.
+    await adapter.upsertSchedule({
+      ...config,
+      payload: { version: 2 },
+      nextRunAt: new Date(Date.now() + 3_600_000),
+    })
+
+    const schedule = await adapter.getSchedule(config.id)
+    assert.deepEqual(schedule!.payload, { version: 2 })
+    assert.equal(schedule!.nextRunAt!.getTime(), nextRunAt.getTime())
+  })
+
+  test('upsertSchedule should take the new next run when the timing changes', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    const base = {
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+      from: new Date('2026-01-01T00:00:00.000Z'),
+      to: new Date('2099-01-01T00:00:00.000Z'),
+      limit: 10,
+    }
+    const changes = {
+      cron: { everyMs: undefined, cronExpression: '0 9 * * *' },
+      every: { everyMs: 30_000 },
+      timezone: { timezone: 'Europe/Paris' },
+      from: { from: new Date('2026-02-01T00:00:00.000Z') },
+      to: { to: new Date('2098-01-01T00:00:00.000Z') },
+      limit: { limit: 20 },
+    }
+
+    for (const [field, change] of Object.entries(changes)) {
+      const id = `upsert-timing-${field}`
+      const nextRunAt = new Date(Date.now() + 3_600_000)
+
+      await adapter.upsertSchedule({ ...base, id, nextRunAt: new Date(Date.now() + 60_000) })
+      await adapter.upsertSchedule({ ...base, ...change, id, nextRunAt })
+
+      const schedule = await adapter.getSchedule(id)
+      assert.equal(schedule!.nextRunAt!.getTime(), nextRunAt.getTime(), field)
+    }
+  })
+
+  test('upsertSchedule should keep a finished schedule finished', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    const config = {
+      id: 'upsert-keep-finished',
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+      limit: 1,
+    }
+
+    await adapter.upsertSchedule({ ...config, nextRunAt: new Date(Date.now() + 60_000) })
+    await adapter.updateSchedule(config.id, { runCount: 1, nextRunAt: null })
+
+    await adapter.upsertSchedule({ ...config, nextRunAt: new Date(Date.now() + 60_000) })
+
+    assert.isNull((await adapter.getSchedule(config.id))!.nextRunAt)
+  })
+
   test('getSchedule should return null for non-existent schedule', async ({ assert }) => {
     const adapter = await options.createAdapter()
 
@@ -2026,6 +2148,63 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       // Only one should succeed
       const claimedSchedules = [claimed1, claimed2].filter((s) => s !== null)
       assert.equal(claimedSchedules.length, 1, 'Only one adapter should claim the schedule')
+    })
+
+    test('concurrent upserts of a new schedule all succeed', async ({ assert }) => {
+      const adapters = await Promise.all(Array.from({ length: 10 }, () => options.createAdapter()))
+      const config = {
+        id: 'concurrent-new-identical',
+        name: 'TestJob',
+        payload: {},
+        everyMs: 60_000,
+        timezone: 'UTC',
+      }
+      const nextRunAt = new Date(Date.now() + 60_000)
+
+      // Workers booting together define the same schedule.
+      const results = await Promise.allSettled(
+        adapters.map((adapter) => adapter.upsertSchedule({ ...config, nextRunAt }))
+      )
+
+      assert.deepEqual(
+        results.filter((result) => result.status === 'rejected'),
+        []
+      )
+      const schedule = await adapters[0].getSchedule(config.id)
+      assert.equal(schedule!.status, 'active')
+      assert.equal(schedule!.nextRunAt!.getTime(), nextRunAt.getTime())
+    })
+
+    test('concurrent upserts keep the next run of the definition that wins', async ({ assert }) => {
+      const adapters = await Promise.all(Array.from({ length: 10 }, () => options.createAdapter()))
+      const base = Date.now() + 60_000
+
+      for (let round = 0; round < 3; round++) {
+        const id = `concurrent-new-timing-${round}`
+
+        // Each definition has its own interval and the next run that matches it.
+        const results = await Promise.allSettled(
+          adapters.map((adapter, index) => {
+            const everyMs = (index + 1) * 60_000
+            return adapter.upsertSchedule({
+              id,
+              name: 'TestJob',
+              payload: { index },
+              everyMs,
+              timezone: 'UTC',
+              nextRunAt: new Date(base + everyMs),
+            })
+          })
+        )
+
+        assert.deepEqual(
+          results.filter((result) => result.status === 'rejected'),
+          []
+        )
+        const schedule = await adapters[0].getSchedule(id)
+        assert.equal(schedule!.nextRunAt!.getTime() - base, schedule!.everyMs)
+        assert.deepEqual(schedule!.payload, { index: schedule!.everyMs! / 60_000 - 1 })
+      }
     })
 
     test('high-concurrency claimDueSchedule stress test', async ({ assert }) => {

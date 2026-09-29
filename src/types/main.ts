@@ -603,6 +603,14 @@ export interface ScheduleConfig {
 
   /** Maximum number of runs (null = unlimited) */
   limit?: number
+
+  /**
+   * Next run of a new schedule, or of an existing one whose timing (cron,
+   * interval, timezone, boundaries, or limit) changes. An existing schedule
+   * with the same timing keeps its next run. Without it, such a schedule has
+   * no next run until `updateSchedule()` sets one.
+   */
+  nextRunAt?: Date
 }
 
 /**

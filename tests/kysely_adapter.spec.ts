@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import Database from 'better-sqlite3'
 import { Kysely, MysqlDialect, PostgresDialect, SqliteDialect } from 'kysely'
 import { createPool } from 'mysql2'
@@ -186,5 +189,67 @@ test.group('Adapter | Kysely (MySQL)', (group) => {
   test('addDedupColumns should be idempotent', async () => {
     await schema.addDedupColumns(tableName)
     await schema.addDedupColumns(tableName)
+  })
+})
+
+test.group('KyselyAdapter | SQLite file, two connections', () => {
+  test('concurrent upserts from two connections all succeed', async ({ assert, cleanup }) => {
+    const directory = await mkdtemp(join(tmpdir(), 'queue-sqlite-'))
+    const connect = () => {
+      const database = new Database(join(directory, 'queue.sqlite'))
+      database.pragma('journal_mode = WAL')
+      return new Kysely<QueueDatabase>({ dialect: new SqliteDialect({ database }) })
+    }
+    const first = connect()
+    const second = connect()
+    cleanup(async () => {
+      await first.destroy()
+      await second.destroy()
+      await rm(directory, { recursive: true, force: true })
+    })
+
+    const schedulesTableName = 'queue_schedules'
+    await new KyselyQueueSchemaService(first, { dialect: 'sqlite' }).createSchedulesTable(
+      schedulesTableName
+    )
+    const adapters = [first, second].map(
+      (connection) => new KyselyAdapter({ connection, dialect: 'sqlite', schedulesTableName })
+    )
+
+    for (let round = 0; round < 5; round++) {
+      const id = `two-connections-${round}`
+      const base = Date.now() + 60_000
+
+      // Workers on two connections define the same schedule, then two timings.
+      const results = await Promise.allSettled([
+        ...adapters.map((adapter) =>
+          adapter.upsertSchedule({
+            id,
+            name: 'TestJob',
+            payload: {},
+            everyMs: 60_000,
+            timezone: 'UTC',
+            nextRunAt: new Date(base + 60_000),
+          })
+        ),
+        ...adapters.map((adapter, index) =>
+          adapter.upsertSchedule({
+            id,
+            name: 'TestJob',
+            payload: {},
+            everyMs: (index + 2) * 60_000,
+            timezone: 'UTC',
+            nextRunAt: new Date(base + (index + 2) * 60_000),
+          })
+        ),
+      ])
+
+      assert.deepEqual(
+        results.filter((result) => result.status === 'rejected'),
+        []
+      )
+      const schedule = await adapters[0].getSchedule(id)
+      assert.equal(schedule!.nextRunAt!.getTime() - base, schedule!.everyMs)
+    }
   })
 })

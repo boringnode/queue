@@ -542,6 +542,12 @@ const SCHEDULE_DUE_INDEX_LUA = `
 /**
  * Atomically upserts schedule configuration while preserving runtime fields
  * and synchronizing the derived due index from the resulting hash.
+ *
+ * A new schedule is created active with the given next run. An existing one
+ * keeps its status, run metadata, and next run, unless its timing changes:
+ * then it takes the given next run, and a cron claim in flight is
+ * invalidated so its finalization cannot overwrite it. With the same timing,
+ * the claim stays valid, since the next run it computes is still right.
  */
 export const UPSERT_SCHEDULE_SCRIPT = `
   local schedule_key = KEYS[1]
@@ -550,26 +556,37 @@ export const UPSERT_SCHEDULE_SCRIPT = `
   local id = ARGV[1]
   local now = ARGV[2]
   local schedule = cjson.decode(ARGV[3])
+  local next_run_at = ARGV[4]
 
 ${SCHEDULE_DUE_INDEX_LUA}
 
+  local exists = redis.call('EXISTS', schedule_key) == 1
+  local timing_changed = not exists
+  local timing_fields = { 'cron_expression', 'every_ms', 'timezone', 'from_date', 'to_date', 'run_limit' }
+  for _, field in ipairs(timing_fields) do
+    if (redis.call('HGET', schedule_key, field) or '') ~= (schedule[field] or '') then
+      timing_changed = true
+    end
+  end
+
   local run_count = redis.call('HGET', schedule_key, 'run_count') or '0'
   local created_at = redis.call('HGET', schedule_key, 'created_at') or now
-  local config_revision = tonumber(redis.call('HGET', schedule_key, 'config_revision') or '0') + 1
+  local config_revision = tonumber(redis.call('HGET', schedule_key, 'config_revision') or '0')
 
-  redis.call(
-    'HDEL',
-    schedule_key,
-    'cron_expression',
-    'every_ms',
-    'from_date',
-    'to_date',
-    'run_limit',
-    'claim_token'
-  )
+  redis.call('HDEL', schedule_key, 'cron_expression', 'every_ms', 'from_date', 'to_date', 'run_limit')
 
   for field, value in pairs(schedule) do
     redis.call('HSET', schedule_key, field, value)
+  end
+
+  if not exists then
+    redis.call('HSET', schedule_key, 'status', 'active')
+  end
+
+  if timing_changed then
+    config_revision = config_revision + 1
+    redis.call('HDEL', schedule_key, 'claim_token')
+    redis.call('HSET', schedule_key, 'next_run_at', next_run_at)
   end
 
   redis.call(

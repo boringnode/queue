@@ -21,6 +21,7 @@ import type {
 import { DEFAULT_PRIORITY } from '../constants.js'
 import { createLeaseToken, parse, resolveSchedulePayload } from '../utils.js'
 import { Job } from '../job.js'
+import { sameScheduleTiming } from '../services/schedule_timing.js'
 
 interface DedupEntry {
   jobId: string
@@ -454,9 +455,12 @@ export class FakeAdapter implements Adapter {
       to: config.to ?? null,
       limit: config.limit ?? null,
       runCount: existing?.runCount ?? 0,
-      nextRunAt: existing?.nextRunAt ?? null, // Will be (re)calculated by the caller
+      nextRunAt:
+        existing && sameScheduleTiming(scheduleTiming(existing), scheduleTiming(config))
+          ? existing.nextRunAt
+          : (config.nextRunAt ?? null),
       lastRunAt: existing?.lastRunAt ?? null,
-      status: 'active',
+      status: existing?.status ?? 'active',
       createdAt: existing?.createdAt ?? now,
     }
 
@@ -831,5 +835,17 @@ export class FakeAdapter implements Adapter {
 
   #getJobClassName(JobClass: JobClass): string {
     return JobClass.options?.name || JobClass.name
+  }
+}
+
+/** Timing of a schedule, in the column names `sameScheduleTiming()` compares. */
+function scheduleTiming(schedule: ScheduleConfig | ScheduleData) {
+  return {
+    cron_expression: schedule.cronExpression,
+    every_ms: schedule.everyMs,
+    timezone: schedule.timezone,
+    from_date: schedule.from?.getTime(),
+    to_date: schedule.to?.getTime(),
+    run_limit: schedule.limit,
   }
 }

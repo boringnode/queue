@@ -282,10 +282,14 @@ export interface Adapter {
   migrate(): Promise<void>
 
   /**
-   * Create or update a schedule.
+   * Create or update a schedule. Concurrent calls, and claims, must leave a
+   * definition with the next run that goes with it.
    *
-   * If a schedule with the given id exists, it will be updated (upsert).
-   * Otherwise, a new schedule is created.
+   * A new schedule is created active, with `config.nextRunAt` as its next
+   * run. An existing schedule gets the new definition but keeps its status
+   * (a paused schedule stays paused), run count, last run, and creation date.
+   * It also keeps its next run, unless its timing (cron, interval, timezone,
+   * boundaries, or limit) changes: then it takes `config.nextRunAt`.
    *
    * @param config - The schedule configuration
    * @returns The schedule ID

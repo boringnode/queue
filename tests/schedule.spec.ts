@@ -164,6 +164,36 @@ test.group('ScheduleBuilder', (group) => {
     assert.isTrue(schedule!.nextRunAt!.getTime() > Date.now())
   })
 
+  test('should keep the status and next run when the same schedule runs again', async ({
+    assert,
+  }) => {
+    const define = () => new ScheduleBuilder('HourlyJob', { version: 1 }).every('1h').run()
+
+    await define()
+    const first = await Schedule.find('HourlyJob')
+    await first!.pause()
+
+    // A redeploy defines the same schedule again, later.
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await define()
+
+    const schedule = await Schedule.find('HourlyJob')
+    assert.equal(schedule!.status, 'paused')
+    assert.equal(schedule!.nextRunAt!.getTime(), first!.nextRunAt!.getTime())
+  })
+
+  test('should recalculate the next run when the timing changes', async ({ assert }) => {
+    await new ScheduleBuilder('RetimedJob', {}).every('1h').run()
+    const before = await Schedule.find('RetimedJob')
+
+    const start = Date.now()
+    await new ScheduleBuilder('RetimedJob', {}).every('5m').run()
+
+    const schedule = await Schedule.find('RetimedJob')
+    assert.isBelow(schedule!.nextRunAt!.getTime(), before!.nextRunAt!.getTime())
+    assert.approximately(schedule!.nextRunAt!.getTime(), start + 5 * 60 * 1000, 1000)
+  })
+
   test('should throw when neither cron nor every is set', async ({ assert }) => {
     assert.plan(1)
     const builder = new ScheduleBuilder('InvalidJob', {})

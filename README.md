@@ -754,6 +754,13 @@ const redisSchedules = await Schedule.list({}, { adapter: 'redis' })
 Scheduling the same Job twice without `.id()` replaces the first Schedule, since both use the job
 name as their id.
 
+Defining a Schedule that already exists updates it without resetting it, so you can define your
+Schedules at every boot:
+
+- it keeps its status: a paused Schedule stays paused until `schedule.resume()`;
+- it keeps its next run, unless its timing changes (cron expression, interval, timezone, `from`,
+  `to`, or `limit`). A payload change alone does not move the next run.
+
 A Schedule and every Job it dispatches stay on the same Adapter. Start a Worker for each Adapter
 that owns Schedules.
 

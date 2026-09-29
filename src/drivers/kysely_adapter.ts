@@ -28,6 +28,7 @@ import type { KyselyDialect } from '../services/kysely_queue_schema.js'
 
 import { KyselyQueueSchemaService } from '../services/kysely_queue_schema.js'
 import { scheduleDatesMigrationRequiredMessage } from '../services/schedule_dates.js'
+import { SCHEDULE_TIMING_COLUMNS } from '../services/schedule_timing.js'
 
 export { KyselyQueueSchemaService } from '../services/kysely_queue_schema.js'
 export type { KyselyDialect, KyselyQueueSchemaOptions } from '../services/kysely_queue_schema.js'
@@ -720,8 +721,8 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
 
   async upsertSchedule(config: ScheduleConfig): Promise<string> {
     const id = config.id ?? randomUUID()
-    const data = {
-      id,
+    const nextRunAt = config.nextRunAt?.getTime() ?? null
+    const definition = {
       name: config.name,
       payload: JSON.stringify(resolveSchedulePayload(config.payload)),
       cron_expression: config.cronExpression ?? null,
@@ -730,23 +731,42 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
       from_date: config.from?.getTime() ?? null,
       to_date: config.to?.getTime() ?? null,
       run_limit: config.limit ?? null,
-      status: 'active' as const,
+    }
+
+    // One statement creates or updates the row. It takes the row lock (the
+    // write lock on SQLite) itself, so concurrent upserts and claims apply one
+    // after the other: a transaction reading the row first can deadlock on
+    // MySQL, and fail with SQLITE_BUSY on SQLite.
+    const column = (name: string) => sql.ref(`${this.#schedulesTable}.${name}`)
+    const nullSafeEquals = sql.raw(
+      { postgres: 'is not distinct from', mysql: '<=>', sqlite: 'is' }[this.#dialect]
+    )
+    const sameTiming = sql.join(
+      SCHEDULE_TIMING_COLUMNS.map(
+        (name) => sql`${column(name)} ${nullSafeEquals} ${definition[name]}`
+      ),
+      sql` and `
+    )
+    const updates = {
+      // The status, run metadata, and next run belong to the running
+      // schedule; a new timing takes this next run. First, since MySQL
+      // assigns in order and the timing columns must hold stored values.
+      next_run_at: sql<
+        number | null
+      >`case when ${sameTiming} then ${column('next_run_at')} else ${nextRunAt} end`,
+      ...definition,
     }
 
     const insert = this.#schedules(this.#connection)
       .insertInto(this.#schedulesTable)
-      .values({ ...data, run_count: 0, created_at: Date.now() })
-    const updates = {
-      name: data.name,
-      payload: data.payload,
-      cron_expression: data.cron_expression,
-      every_ms: data.every_ms,
-      timezone: data.timezone,
-      from_date: data.from_date,
-      to_date: data.to_date,
-      run_limit: data.run_limit,
-      status: 'active' as const,
-    }
+      .values({
+        ...definition,
+        id,
+        status: 'active',
+        next_run_at: nextRunAt,
+        run_count: 0,
+        created_at: Date.now(),
+      })
 
     if (this.#dialect === 'mysql') {
       await insert.onDuplicateKeyUpdate(updates).execute()

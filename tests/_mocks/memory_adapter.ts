@@ -15,6 +15,7 @@ import type {
   ScheduleListOptions,
 } from '../../src/types/main.js'
 import { createLeaseToken, parse, resolveSchedulePayload } from '../../src/utils.js'
+import { sameScheduleTiming } from '../../src/services/schedule_timing.js'
 
 interface ActiveJob {
   job: JobData
@@ -359,9 +360,12 @@ export class MemoryAdapter implements Adapter {
       to: config.to ?? null,
       limit: config.limit ?? null,
       runCount: existing?.runCount ?? 0,
-      nextRunAt: existing?.nextRunAt ?? null, // Will be (re)calculated by the caller
+      nextRunAt:
+        existing && sameScheduleTiming(scheduleTiming(existing), scheduleTiming(config))
+          ? existing.nextRunAt
+          : (config.nextRunAt ?? null),
       lastRunAt: existing?.lastRunAt ?? null,
-      status: 'active',
+      status: existing?.status ?? 'active',
       createdAt: existing?.createdAt ?? now,
     }
 
@@ -601,5 +605,17 @@ export class MemoryAdapter implements Adapter {
     if (entry && entry.jobId === job.id) {
       this.#dedupIndex.get(queue)?.delete(job.dedup.id)
     }
+  }
+}
+
+/** Timing of a schedule, in the column names `sameScheduleTiming()` compares. */
+function scheduleTiming(schedule: ScheduleConfig | ScheduleData) {
+  return {
+    cron_expression: schedule.cronExpression,
+    every_ms: schedule.everyMs,
+    timezone: schedule.timezone,
+    from_date: schedule.from?.getTime(),
+    to_date: schedule.to?.getTime(),
+    run_limit: schedule.limit,
   }
 }
