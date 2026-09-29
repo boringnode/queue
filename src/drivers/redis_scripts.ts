@@ -548,6 +548,10 @@ const SCHEDULE_DUE_INDEX_LUA = `
  * then it takes the given next run, and a cron claim in flight is
  * invalidated so its finalization cannot overwrite it. With the same timing,
  * the claim stays valid, since the next run it computes is still right.
+ *
+ * Returns the claim token, config revision, and claim time of a cron claim
+ * not finalized yet, so the caller can finalize it in case the process that
+ * claimed it died. Returns nil otherwise.
  */
 export const UPSERT_SCHEDULE_SCRIPT = `
   local schedule_key = KEYS[1]
@@ -585,7 +589,7 @@ ${SCHEDULE_DUE_INDEX_LUA}
 
   if timing_changed then
     config_revision = config_revision + 1
-    redis.call('HDEL', schedule_key, 'claim_token')
+    redis.call('HDEL', schedule_key, 'claim_token', 'claimed_at')
     redis.call('HSET', schedule_key, 'next_run_at', next_run_at)
   end
 
@@ -602,7 +606,18 @@ ${SCHEDULE_DUE_INDEX_LUA}
   redis.call('SADD', schedules_index_key, id)
   sync_schedule_due_index(schedule_key, due_key, id)
 
-  return id
+  -- A finished schedule never keeps a claim token, so an empty next run with
+  -- one is a cron claim not finalized yet.
+  local claim_token = redis.call('HGET', schedule_key, 'claim_token') or ''
+  if claim_token ~= '' and redis.call('HGET', schedule_key, 'next_run_at') == '' then
+    return {
+      claim_token,
+      tostring(config_revision),
+      redis.call('HGET', schedule_key, 'claimed_at') or ''
+    }
+  end
+
+  return false
 `
 
 /**
@@ -629,7 +644,7 @@ ${SCHEDULE_DUE_INDEX_LUA}
   -- An explicit next run supersedes an in-flight cron claim, so the claim's
   -- finalization must not overwrite it.
   if updates.next_run_at ~= nil then
-    redis.call('HDEL', schedule_key, 'claim_token')
+    redis.call('HDEL', schedule_key, 'claim_token', 'claimed_at')
   end
 
   sync_schedule_due_index(schedule_key, due_key, id)
@@ -668,7 +683,7 @@ ${SCHEDULE_DUE_INDEX_LUA}
     or config_revision ~= expected_config_revision
     or claim_token ~= expected_claim_token then
     if claim_token == expected_claim_token then
-      redis.call('HDEL', schedule_key, 'claim_token')
+      redis.call('HDEL', schedule_key, 'claim_token', 'claimed_at')
     end
     sync_schedule_due_index(schedule_key, due_key, id)
     return 0
@@ -685,7 +700,7 @@ ${SCHEDULE_DUE_INDEX_LUA}
   end
 
   redis.call('HSET', schedule_key, 'next_run_at', next_run_at)
-  redis.call('HDEL', schedule_key, 'claim_token')
+  redis.call('HDEL', schedule_key, 'claim_token', 'claimed_at')
   sync_schedule_due_index(schedule_key, due_key, id)
 
   return 1
@@ -852,6 +867,7 @@ export const CLAIM_SCHEDULE_SCRIPT = `
             -- This schedule is claimable - atomically update it
             local new_run_count = run_count + 1
             local new_claim_token = ''
+            local new_claimed_at = ''
 
             -- Calculate new next_run_at (simple interval-based for now)
             -- Complex cron calculation happens in the caller
@@ -861,6 +877,7 @@ export const CLAIM_SCHEDULE_SCRIPT = `
               new_next_run_at = tostring(now + every_ms)
             elseif schedule.cron_expression then
               new_claim_token = claim_token
+              new_claimed_at = tostring(now)
             end
 
             -- Check if we've hit the limit after this run
@@ -878,7 +895,8 @@ export const CLAIM_SCHEDULE_SCRIPT = `
               'next_run_at', new_next_run_at,
               'last_run_at', tostring(now),
               'run_count', tostring(new_run_count),
-              'claim_token', new_claim_token)
+              'claim_token', new_claim_token,
+              'claimed_at', new_claimed_at)
 
             -- Update or remove from ZSET
             if new_next_run_at ~= '' then

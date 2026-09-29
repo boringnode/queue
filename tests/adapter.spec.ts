@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import Knex from 'knex'
 import { test } from '@japa/runner'
 import { Redis } from 'ioredis'
+import { CronExpressionParser } from 'cron-parser'
 import { MemoryAdapter } from './_mocks/memory_adapter.js'
 import { redis, RedisAdapter } from '../src/drivers/redis_adapter.js'
 import { KnexAdapter } from '../src/drivers/knex_adapter.js'
@@ -1371,10 +1372,11 @@ test.group('Adapter | Redis', (group) => {
       timezone: 'UTC',
     }
 
+    const claimedOccurrence = new Date(Date.now() - 1_000)
     await adapter.upsertSchedule({
       ...config,
       payload: { version: 1 },
-      nextRunAt: new Date(Date.now() - 1_000),
+      nextRunAt: claimedOccurrence,
     })
 
     const originalEval = connection.eval.bind(connection)
@@ -1398,13 +1400,14 @@ test.group('Adapter | Redis', (group) => {
       return result
     }) as typeof connection.eval
 
-    // A redeploy runs the same schedule definition while the claim is in flight.
+    // A redeploy runs the same schedule definition while the claim is in flight. Its next run
+    // was computed before the claim: the claimed occurrence.
     const claim = adapter.claimDueSchedule()
     await claimHasReturned
     await secondAdapter.upsertSchedule({
       ...config,
       payload: { version: 2 },
-      nextRunAt: new Date(Date.now() + 3_600_000),
+      nextRunAt: claimedOccurrence,
     })
 
     releaseClaim()
@@ -1420,6 +1423,151 @@ test.group('Adapter | Redis', (group) => {
       Number(await connection.zscore('schedules::due', id)),
       schedule!.nextRunAt!.getTime()
     )
+    assert.isNull(await adapter.claimDueSchedule())
+    assert.equal((await adapter.getSchedule(id))!.runCount, 1)
+  })
+
+  /**
+   * Claims a due cron schedule and fails its finalization, as when the
+   * process dies between the two scripts.
+   */
+  async function claimWithoutFinalization(adapter: RedisAdapter) {
+    const originalEval = connection.eval.bind(connection)
+    let evalCount = 0
+    connection.eval = (async (...args: Parameters<typeof connection.eval>) => {
+      if (++evalCount === 2) throw new Error('connection lost')
+      return originalEval(...args)
+    }) as typeof connection.eval
+
+    const error = await adapter.claimDueSchedule().then(
+      () => null,
+      (claimError: Error) => claimError
+    )
+    connection.eval = originalEval
+
+    if (error?.message !== 'connection lost') {
+      throw new Error('The claim was expected to fail its finalization')
+    }
+  }
+
+  test('defining a schedule again finalizes a cron claim never finalized', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+    const id = 'cron-claim-never-finalized'
+    const config = {
+      id,
+      name: 'CronJob',
+      payload: {},
+      cronExpression: '0 9 * * *',
+      timezone: 'UTC',
+    }
+    const claimedOccurrence = new Date(Date.now() - 1_000)
+
+    await adapter.upsertSchedule({ ...config, nextRunAt: claimedOccurrence })
+    await claimWithoutFinalization(adapter)
+    const { lastRunAt } = (await adapter.getSchedule(id))!
+
+    // The next deploy computed its next run before the claim: the claimed occurrence.
+    await adapter.upsertSchedule({ ...config, nextRunAt: claimedOccurrence })
+
+    const expectedNextRunAt = CronExpressionParser.parse('0 9 * * *', {
+      currentDate: lastRunAt!,
+      tz: 'UTC',
+    })
+      .next()
+      .toDate()
+    const schedule = await adapter.getSchedule(id)
+    assert.equal(schedule!.nextRunAt!.getTime(), expectedNextRunAt.getTime())
+    assert.equal(Number(await connection.zscore('schedules::due', id)), expectedNextRunAt.getTime())
+    assert.isNull(await connection.hget(`schedules::data::${id}`, 'claim_token'))
+
+    // The claimed occurrence does not run again.
+    assert.isNull(await adapter.claimDueSchedule())
+    assert.equal((await adapter.getSchedule(id))!.runCount, 1)
+  })
+
+  test('a manual trigger does not move the time a cron claim is finalized from', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+    const id = 'cron-claim-never-finalized-then-triggered'
+    const config = {
+      id,
+      name: 'CronJob',
+      payload: {},
+      cronExpression: '0 9 * * *',
+      timezone: 'UTC',
+    }
+
+    await adapter.upsertSchedule({ ...config, nextRunAt: new Date(Date.now() - 1_000) })
+    await claimWithoutFinalization(adapter)
+    const { lastRunAt: claimedAt } = (await adapter.getSchedule(id))!
+
+    // Schedule.trigger() records its run, here past the next 9:00.
+    await adapter.updateSchedule(id, {
+      runCount: 2,
+      lastRunAt: new Date(claimedAt!.getTime() + 2 * 86_400_000),
+    })
+    await adapter.upsertSchedule({ ...config, nextRunAt: new Date(Date.now() + 3_600_000) })
+
+    const expectedNextRunAt = CronExpressionParser.parse('0 9 * * *', {
+      currentDate: claimedAt!,
+      tz: 'UTC',
+    })
+      .next()
+      .toDate()
+    const schedule = await adapter.getSchedule(id)
+    assert.equal(schedule!.nextRunAt!.getTime(), expectedNextRunAt.getTime())
+    assert.isNull(await connection.hget(`schedules::data::${id}`, 'claimed_at'))
+  })
+
+  test('defining a schedule again keeps a cron claim at its run limit finished', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+    const id = 'cron-claim-never-finalized-at-limit'
+    const config = {
+      id,
+      name: 'CronJob',
+      payload: {},
+      cronExpression: '0 9 * * *',
+      timezone: 'UTC',
+      limit: 1,
+    }
+
+    await adapter.upsertSchedule({ ...config, nextRunAt: new Date(Date.now() - 1_000) })
+    await claimWithoutFinalization(adapter)
+    await adapter.upsertSchedule({ ...config, nextRunAt: new Date(Date.now() + 3_600_000) })
+
+    const schedule = await adapter.getSchedule(id)
+    assert.isNull(schedule!.nextRunAt)
+    assert.equal(schedule!.runCount, 1)
+    assert.isNull(await connection.zscore('schedules::due', id))
+    assert.isNull(await connection.hget(`schedules::data::${id}`, 'claim_token'))
+  })
+
+  test('defining a schedule again keeps a cron claim past its end date finished', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+    const id = 'cron-claim-never-finalized-past-end'
+    // Yearly, so the next occurrence falls after the end date.
+    const config = {
+      id,
+      name: 'CronJob',
+      payload: {},
+      cronExpression: '0 0 1 1 *',
+      timezone: 'UTC',
+      to: new Date(Date.now() + 60_000),
+    }
+
+    await adapter.upsertSchedule({ ...config, nextRunAt: new Date(Date.now() - 1_000) })
+    await claimWithoutFinalization(adapter)
+    await adapter.upsertSchedule({ ...config, nextRunAt: new Date(Date.now() + 30_000) })
+
+    const schedule = await adapter.getSchedule(id)
+    assert.isNull(schedule!.nextRunAt)
+    assert.isNull(await connection.zscore('schedules::due', id))
+    assert.isNull(await connection.hget(`schedules::data::${id}`, 'claim_token'))
   })
 
   test('cron finalization survives a concurrent runtime metadata update', async ({

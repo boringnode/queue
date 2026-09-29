@@ -497,7 +497,7 @@ export class RedisAdapter implements Adapter {
     if (config.to !== undefined) scheduleData.to_date = config.to.getTime().toString()
     if (config.limit !== undefined) scheduleData.run_limit = config.limit.toString()
 
-    await this.#connection.eval(
+    const unfinalizedClaim = (await this.#connection.eval(
       UPSERT_SCHEDULE_SCRIPT,
       3,
       scheduleKey,
@@ -507,7 +507,23 @@ export class RedisAdapter implements Adapter {
       now.toString(),
       JSON.stringify(scheduleData),
       config.nextRunAt?.getTime().toString() ?? ''
-    )
+    )) as [string, string, string] | null
+
+    // Finalize it as its worker would have, from the time of the claim. The
+    // given next run was computed before, so it may be the claimed occurrence.
+    if (unfinalizedClaim && config.cronExpression !== undefined) {
+      const [claimToken, configRevision, claimedAt] = unfinalizedClaim
+      if (claimedAt !== '') {
+        await this.#finalizeCronClaim({
+          id,
+          cronExpression: config.cronExpression,
+          timezone: config.timezone,
+          configRevision,
+          claimToken,
+          claimedAt: Number(claimedAt),
+        })
+      }
+    }
 
     return id
   }
@@ -638,39 +654,52 @@ export class RedisAdapter implements Adapter {
     // The Lua script only handles simple interval; cron needs JS cron-parser.
     // This is safe because the schedule is already claimed (run_count incremented).
     if (data.cron_expression) {
-      const { CronExpressionParser } = await import('cron-parser')
-      const cron = CronExpressionParser.parse(data.cron_expression, {
-        currentDate: new Date(now),
-        tz: data.timezone || 'UTC',
-      })
-      const nextRun = cron.next().toDate().getTime()
-
-      const runCount = Number.parseInt(data.run_count || '0', 10) + 1
-      const runLimit = data.run_limit ? Number.parseInt(data.run_limit, 10) : null
-      const toDate = data.to_date ? Number.parseInt(data.to_date, 10) : null
-
-      let newNextRunAt: number | string = nextRun
-
-      if (runLimit !== null && runCount >= runLimit) {
-        newNextRunAt = ''
-      } else if (toDate && nextRun > toDate) {
-        newNextRunAt = ''
-      }
-
-      await this.#connection.eval(
-        FINALIZE_CRON_SCHEDULE_SCRIPT,
-        2,
-        `${scheduleDataPrefix}${data.id}`,
-        schedulesDueKey,
-        data.id,
-        data.cron_expression,
-        data.config_revision || '',
+      await this.#finalizeCronClaim({
+        id: data.id,
+        cronExpression: data.cron_expression,
+        timezone: data.timezone,
+        configRevision: data.config_revision || '',
         claimToken,
-        newNextRunAt.toString()
-      )
+        claimedAt: now,
+      })
     }
 
     return this.#hashToScheduleData(data)
+  }
+
+  /**
+   * Writes the next run of a cron claim, the first occurrence after the
+   * claim. The script applies it only while the same claim still owns the
+   * schedule, and clears it when the run limit or end date is reached.
+   */
+  async #finalizeCronClaim(claim: {
+    id: string
+    cronExpression: string
+    timezone: string
+    configRevision: string
+    claimToken: string
+    claimedAt: number
+  }): Promise<void> {
+    const { CronExpressionParser } = await import('cron-parser')
+    const nextRunAt = CronExpressionParser.parse(claim.cronExpression, {
+      currentDate: new Date(claim.claimedAt),
+      tz: claim.timezone || 'UTC',
+    })
+      .next()
+      .toDate()
+      .getTime()
+
+    await this.#connection.eval(
+      FINALIZE_CRON_SCHEDULE_SCRIPT,
+      2,
+      `${scheduleDataPrefix}${claim.id}`,
+      schedulesDueKey,
+      claim.id,
+      claim.cronExpression,
+      claim.configRevision,
+      claim.claimToken,
+      nextRunAt.toString()
+    )
   }
 
   #hashToScheduleData(data: Record<string, string>): ScheduleData {

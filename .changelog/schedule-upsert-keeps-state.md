@@ -17,8 +17,9 @@ timezone, `from`, `to`, or `limit`. A payload change alone does not move the nex
 schedule is created active, as before. Workers that boot together and define the same schedule
 end with one definition and the next run that goes with it.
 
-On Redis, an upsert that keeps the timing no longer invalidates a cron claim in flight, since the
-next run it computes is still right.
+On Redis, a cron claim writes its next run in a second step. If the process dies between the two,
+the schedule is left without a next run. Defining it again repairs it, as in 0.7: it writes the
+first occurrence after the claim, or none when the run limit or end date is reached.
 
 ## Breaking Changes
 
