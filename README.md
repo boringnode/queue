@@ -761,8 +761,8 @@ Schedules at every boot:
 - it keeps its next run, unless its timing changes (cron expression, interval, timezone, `from`,
   `to`, or `limit`). A payload change alone does not move the next run.
 
-A Schedule and every Job it dispatches stay on the same Adapter. Start a Worker for each Adapter
-that owns Schedules.
+A Schedule and every Job it dispatches stay on the same Adapter. Start a Worker, in its own
+process, for each Adapter that owns Schedules.
 
 </details>
 
@@ -817,6 +817,11 @@ const config = {
   },
 }
 ```
+
+Run one Worker per process. A Worker listens on one Adapter, so to process the queues of several
+Adapters, start one process per Adapter. Starting a second Worker while another one runs in the
+same process throws `E_WORKER_ALREADY_RUNNING`: initializing it would destroy the Adapters of the
+first one. A Worker holds the process until its `stop()` completes.
 
 A job is stalled when its worker stops renewing it for longer than `stalledThreshold`, usually
 because the process crashed. A stalled job goes back to the queue up to `maxStalledCount` times.

@@ -56,6 +56,12 @@ export const E_INVALID_TIMEOUT = createError<[timeout: string]>(
   500
 )
 
+export const E_WORKER_ALREADY_RUNNING = createError(
+  'Another Worker is already running in this process. Run one Worker per process.',
+  'E_WORKER_ALREADY_RUNNING',
+  500
+)
+
 export const E_QUEUE_NOT_INITIALIZED = createError(
   'QueueManager is not initialized. Call QueueManager.init() before using it.',
   'E_QUEUE_NOT_INITIALIZED',

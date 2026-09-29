@@ -2850,3 +2850,172 @@ test.group('Worker | Scheduler Integration', () => {
     assert.includeMembers(executedJobs, ['scheduled', 'regular'])
   })
 })
+
+test.group('Worker | one per process', (group) => {
+  group.each.teardown(() => Locator.clear())
+
+  const config = (adapter: MemoryAdapter) => ({
+    default: 'memory',
+    adapters: { memory: () => adapter },
+    logger: new MemoryLogger(),
+    worker: { idleDelay: 5, gracefulShutdown: false },
+  })
+
+  async function waitFor(condition: () => boolean) {
+    for (let i = 0; i < 200 && !condition(); i++) {
+      await setTimeout(5)
+    }
+  }
+
+  test('start() rejects a second Worker and keeps the first one working', async ({
+    assert,
+    cleanup,
+  }) => {
+    let executed = 0
+
+    class CountedJob extends Job {
+      async execute() {
+        executed++
+      }
+    }
+
+    Locator.register('CountedJob', CountedJob)
+    const adapter = new MemoryAdapter()
+    const first = new Worker(config(adapter))
+    const second = new Worker(config(adapter))
+    cleanup(() => first.stop())
+
+    const running = first.start(['default'])
+    await setTimeout(20)
+
+    await assert.rejects(() => second.start(['default']), errors.E_WORKER_ALREADY_RUNNING)
+
+    // Starting the second Worker did not re-initialize the QueueManager and
+    // destroy the Adapter of the first one.
+    await adapter.push({ id: 'after-second', name: 'CountedJob', payload: {}, attempts: 0 })
+    await waitFor(() => executed === 1)
+    assert.equal(executed, 1)
+
+    await first.stop()
+    await running
+  })
+
+  test('start() accepts another Worker once the first one stopped', async ({ cleanup }) => {
+    const adapter = new MemoryAdapter()
+    const first = new Worker(config(adapter))
+    const second = new Worker(config(adapter))
+    cleanup(async () => {
+      await first.stop()
+      await second.stop()
+    })
+
+    const firstRun = first.start(['default'])
+    await setTimeout(20)
+    await first.stop()
+    await firstRun
+
+    const secondRun = second.start(['default'])
+    await setTimeout(20)
+    await second.stop()
+    await secondRun
+  })
+
+  test('a second start() of the same Worker keeps the process reserved', async ({
+    assert,
+    cleanup,
+  }) => {
+    const first = new Worker(config(new MemoryAdapter()))
+    const other = new Worker(config(new MemoryAdapter()))
+    cleanup(() => first.stop())
+
+    const running = first.start(['default'])
+    await setTimeout(20)
+
+    // The loop already runs: this call returns at once and must not release the process.
+    await first.start(['default'])
+    await assert.rejects(() => other.start(['default']), errors.E_WORKER_ALREADY_RUNNING)
+
+    await first.stop()
+    await running
+  })
+
+  test('the process stays reserved until stop() has finalized every job', async ({
+    assert,
+    cleanup,
+  }) => {
+    class BlockedJob extends Job {
+      async execute() {}
+    }
+
+    const fixture = createWorkerFixture()
+    fixture.adapter.finalizations.block(1)
+    const other = new Worker(config(new MemoryAdapter()))
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(BlockedJob, { id: 'blocked-finalization' })
+    const running = fixture.start()
+    await fixture.adapter.finalizations.waitForStarted(1)
+
+    // The stop has begun, but the finalization still needs the Adapter.
+    const stop = trackPromise(fixture.worker.stop())
+    await setTimeout(10)
+    await assert.rejects(() => other.start(['default']), errors.E_WORKER_ALREADY_RUNNING)
+    assert.isFalse(stop.settled)
+
+    fixture.adapter.finalizations.release(1)
+    await stop.promise
+    await running
+
+    const otherRun = other.start(['default'])
+    await setTimeout(20)
+    await other.stop()
+    await otherRun
+  })
+
+  test('a restart requested during stop() reserves the process again', async ({
+    assert,
+    cleanup,
+  }) => {
+    class BlockedJob extends Job {
+      async execute() {}
+    }
+
+    const fixture = createWorkerFixture()
+    fixture.adapter.finalizations.block(1)
+    const other = new Worker(config(new MemoryAdapter()))
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(BlockedJob, { id: 'blocked-before-restart' })
+    const firstRun = fixture.start()
+    await fixture.adapter.finalizations.waitForStarted(1)
+
+    const stop = trackPromise(fixture.worker.stop())
+    const restart = fixture.start()
+    fixture.adapter.finalizations.release(1)
+    await stop.promise
+    await firstRun
+    await fixture.adapter.acquisitions.waitForStarted(2)
+
+    // The restarted Worker holds the process again.
+    await assert.rejects(() => other.start(['default']), errors.E_WORKER_ALREADY_RUNNING)
+
+    await fixture.worker.stop()
+    await restart
+  })
+
+  test('a start that fails to initialize does not block the next Worker', async ({
+    assert,
+    cleanup,
+  }) => {
+    const broken = new Worker({ default: 'memory', adapters: {} })
+    await assert.rejects(() => broken.start(['default']), errors.E_CONFIGURATION_ERROR)
+
+    const worker = new Worker(config(new MemoryAdapter()))
+    cleanup(() => worker.stop())
+
+    const run = worker.start(['default'])
+    await setTimeout(20)
+    await worker.stop()
+    await run
+  })
+})
