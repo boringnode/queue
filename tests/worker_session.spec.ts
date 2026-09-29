@@ -10,6 +10,7 @@ import {
 } from '../src/worker_session.js'
 import { ControllableAdapter } from './_mocks/controllable_adapter.js'
 import { trackPromise } from './_utils/track_promise.js'
+import { MemoryLogger } from './_mocks/memory_logger.js'
 
 type SessionOverrides = Partial<Omit<WorkerSessionOptions, 'settings' | 'jobExecutionRuntime'>> & {
   jobExecutionRuntime?: Partial<JobExecutor>
@@ -36,12 +37,14 @@ function createSession(overrides: SessionOverrides = {}): WorkerSession {
       dispatch: async () => ({ jobId: 'scheduled-job' }),
     },
     wrapInternal: (operation) => operation(),
+    logger: new MemoryLogger(),
     settings: {
       concurrency: 1,
       idleDelay: 10,
       stalledInterval: 30_000,
       stalledThreshold: 30_000,
       maxStalledCount: 1,
+      unknownJobRetries: 10,
       ...settings,
     },
     ...options,
@@ -379,6 +382,51 @@ test.group('WorkerSession', () => {
 
     assert.equal(executionsCompleted, 1)
     assert.isNull(await adapter.getJob('late-job-1', 'default'))
+  })
+
+  test('does not report or fail an unknown job whose lease was lost', async ({
+    assert,
+    cleanup,
+  }) => {
+    const adapter = new ControllableAdapter()
+    const logger = new MemoryLogger()
+    let failed = false
+    adapter.retryJob = async () => false
+    adapter.failJob = async () => {
+      failed = true
+      return true
+    }
+    const session = createSession({
+      adapter,
+      logger,
+      jobExecutionRuntime: {
+        execute: async () => ({
+          type: 'initialization-failed' as const,
+          error: new Error('not registered'),
+          jobNotFound: true as const,
+        }),
+      },
+    })
+
+    cleanup(() => session.stop())
+
+    await adapter.pushOn('default', {
+      id: 'lost-unknown-job',
+      name: 'UnknownJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    assert.equal((await session.processCycle())?.type, 'started')
+    assert.equal((await session.processCycle())?.type, 'completed')
+
+    // The job was acquired again elsewhere: no warning about a return that did not happen.
+    assert.deepEqual(
+      logger.logs.filter((entry) => entry.level === 'warn'),
+      []
+    )
+    assert.isFalse(failed)
   })
 
   test('cannot restart after reaching quiescence', async ({ assert }) => {

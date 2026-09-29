@@ -15,7 +15,9 @@ import {
   DEFAULT_IDLE_DELAY,
   DEFAULT_STALLED_INTERVAL,
   DEFAULT_STALLED_THRESHOLD,
+  DEFAULT_UNKNOWN_JOB_RETRIES,
 } from './constants.js'
+import * as errors from './exceptions.js'
 
 /**
  * Job processing worker.
@@ -79,6 +81,16 @@ export class Worker {
       stalledThreshold: parse(config.worker?.stalledThreshold ?? DEFAULT_STALLED_THRESHOLD),
       maxStalledCount: config.worker?.maxStalledCount ?? 1,
       concurrency: config.worker?.concurrency ?? 1,
+      unknownJobRetries: config.worker?.unknownJobRetries ?? DEFAULT_UNKNOWN_JOB_RETRIES,
+    }
+
+    if (
+      !Number.isInteger(this.#sessionSettings.unknownJobRetries) ||
+      this.#sessionSettings.unknownJobRetries < 0
+    ) {
+      throw new errors.E_CONFIGURATION_ERROR([
+        'worker.unknownJobRetries must be a non-negative integer',
+      ])
     }
     this.#gracefulShutdown = config.worker?.gracefulShutdown ?? true
     this.#onShutdownSignal = config.worker?.onShutdownSignal
@@ -250,6 +262,7 @@ export class Worker {
       jobExecutionRuntime: this.#jobExecutionRuntime,
       scheduleDispatcher: jobDispatchRuntime,
       wrapInternal: this.#wrapInternal,
+      logger: QueueManager.getLogger(),
       settings: this.#sessionSettings,
     })
 

@@ -8,8 +8,8 @@ import { Locator } from './locator.js'
 import type { SingleJobDispatchRequest } from './job_dispatch_runtime.js'
 import type { Adapter, AcquiredJob } from './contracts/adapter.js'
 import type { JobExecutionOutcome, JobExecutionRuntime } from './job_runtime.js'
-import type { WorkerCycle } from './types/main.js'
-import { DEFAULT_ERROR_RETRY_DELAY } from './constants.js'
+import type { Logger, WorkerCycle } from './types/main.js'
+import { DEFAULT_ERROR_RETRY_DELAY, UNKNOWN_JOB_RETRY_DELAY } from './constants.js'
 
 type StartedCycle = Extract<WorkerCycle, { type: 'started' }>
 type SessionMode = 'continuous' | 'manual'
@@ -31,6 +31,7 @@ export interface WorkerSessionSettings {
   stalledInterval: number
   stalledThreshold: number
   maxStalledCount: number
+  unknownJobRetries: number
 }
 
 export interface WorkerSessionOptions {
@@ -40,6 +41,7 @@ export interface WorkerSessionOptions {
   jobExecutionRuntime: JobExecutor
   scheduleDispatcher: ScheduleDispatcher
   wrapInternal: InternalOperationWrapper
+  logger: Logger
   settings: WorkerSessionSettings
 }
 
@@ -58,6 +60,7 @@ export class WorkerSession {
   readonly #jobExecutionRuntime: JobExecutor
   readonly #scheduleDispatcher: ScheduleDispatcher
   readonly #wrapInternal: InternalOperationWrapper
+  readonly #logger: Logger
   readonly #settings: WorkerSessionSettings
   readonly #heartbeat: WorkerHeartbeat
 
@@ -85,6 +88,7 @@ export class WorkerSession {
     this.#jobExecutionRuntime = options.jobExecutionRuntime
     this.#scheduleDispatcher = options.scheduleDispatcher
     this.#wrapInternal = options.wrapInternal
+    this.#logger = options.logger
     this.#settings = options.settings
     this.#heartbeat = new WorkerHeartbeat({
       workerId: options.workerId,
@@ -483,6 +487,8 @@ export class WorkerSession {
     }
 
     if (outcome.type === 'initialization-failed') {
+      if (outcome.jobNotFound && (await this.#requeueUnknownJob(job, queue))) return
+
       debug('worker %s: failed to initialize job %s (%s)', this.#workerId, job.id, job.name)
       this.#checkLease(
         job,
@@ -522,6 +528,35 @@ export class WorkerSession {
     } else {
       this.#checkLease(job, await this.#wrapInternal(() => this.#adapter.retryJob(job, queue)))
     }
+  }
+
+  /**
+   * Put a job whose class this worker does not know back in the queue, a
+   * bounded number of times. During a rolling deploy, an old worker can take
+   * a job dispatched by new code: a worker that knows it runs it later.
+   * Other initialization failures are bugs, and retrying them changes nothing:
+   * the runtime sets `jobNotFound` only when no class has the job name.
+   *
+   * @returns Whether the job was handled here: false once the limit is
+   * reached, so the caller fails it. A lost lease counts as handled.
+   */
+  async #requeueUnknownJob(job: AcquiredJob, queue: string): Promise<boolean> {
+    const limit = this.#settings.unknownJobRetries
+    if (job.attempts >= limit) return false
+
+    const retryAt = new Date(Date.now() + UNKNOWN_JOB_RETRY_DELAY)
+    const requeued = await this.#wrapInternal(() => this.#adapter.retryJob(job, queue, retryAt))
+    this.#checkLease(job, requeued)
+
+    if (requeued) {
+      this.#logger.warn(
+        `Job "${job.name}" (${job.id}) is not registered on this worker. It went back to queue ` +
+          `"${queue}" and runs again in ${UNKNOWN_JOB_RETRY_DELAY / 1000}s ` +
+          `(${job.attempts + 1}/${limit}).`
+      )
+    }
+
+    return true
   }
 
   /**

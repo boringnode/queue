@@ -812,6 +812,7 @@ const config = {
     stalledThreshold: '30s', // When to consider job stalled
     stalledInterval: '30s', // How often to check
     maxStalledCount: 1, // Max recoveries before failing
+    unknownJobRetries: 10, // Returns to the queue of a job with an unknown class
     gracefulShutdown: true, // Wait for jobs on SIGTERM
   },
 }
@@ -827,6 +828,14 @@ blocks the event loop longer than `stalledThreshold`. Each acquisition of a job 
 once the job is acquired again, the outcome of the earlier execution is ignored, and only the latest
 execution can complete, fail, or retry the job. The earlier execution still runs to the end, with
 its side effects and hooks, so keep handlers idempotent.
+
+A worker can take a job whose class it does not know, for example during a rolling deploy, when an
+old worker takes a job dispatched by new code. It puts the job back in the queue, to run again 30
+seconds later, and logs a warning. It does so while the job has fewer attempts than
+`unknownJobRetries` (10 by default), then the job fails for good. The limit counts all the
+attempts of the job: a new job gets up to 10 returns (about 5 minutes), a job that already retried
+gets fewer. Each return also counts as an attempt. Other errors while creating a job, such as a
+constructor or a `jobFactory` that throws, fail it right away.
 
 ## Logging
 

@@ -11,6 +11,7 @@ import * as errors from '../src/exceptions.js'
 import { ControllableAdapter } from './_mocks/controllable_adapter.js'
 import { createWorkerFixture } from './_utils/create_worker_fixture.js'
 import { trackPromise } from './_utils/track_promise.js'
+import { MemoryLogger } from './_mocks/memory_logger.js'
 
 const config = {
   default: 'memory',
@@ -1297,15 +1298,91 @@ test.group('Worker', () => {
     assert.isTrue(failedCalled, 'Failed callback should be called')
   })
 
-  test('should handle job class not found', async ({ assert, cleanup }) => {
+  test('should put a job with an unknown class back in the queue', async ({ assert, cleanup }) => {
     const sharedAdapter = memory()()
+    const logger = new MemoryLogger()
 
-    const localConfig = {
+    const worker = new Worker({
       default: 'memory',
       adapters: { memory: () => sharedAdapter },
+      logger,
+    })
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await sharedAdapter.push({
+      id: 'unknown-job',
+      name: 'UnknownJob',
+      payload: { value: 1 },
+      attempts: 0,
+      priority: 0,
+    })
+
+    await worker.processCycle(['default']) // started
+    const cycle = await worker.processCycle(['default']) // completed (requeued)
+    assert.equal(cycle?.type, 'completed')
+
+    // A worker that knows the class runs it later: the job is delayed, not lost.
+    const record = await sharedAdapter.getJob('unknown-job', 'default')
+    assert.equal(record!.status, 'delayed')
+    assert.equal(record!.data.attempts, 1)
+    assert.deepEqual(record!.data.payload, { value: 1 })
+
+    const warnings = logger.logs.filter((entry) => entry.level === 'warn')
+    assert.lengthOf(warnings, 1)
+    assert.include(warnings[0].message, '"UnknownJob" (unknown-job) is not registered')
+    assert.include(warnings[0].message, '(1/10)')
+  })
+
+  test('should fail a job with an unknown class after unknownJobRetries returns', async ({
+    assert,
+    cleanup,
+  }) => {
+    const sharedAdapter = memory()()
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      logger: new MemoryLogger(),
+      defaultJobOptions: { removeOnFail: false },
+      worker: { unknownJobRetries: 2 },
+    })
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    for (const [id, attempts] of [
+      ['returned-twice', 2],
+      ['returned-once', 1],
+    ] as const) {
+      await sharedAdapter.push({ id, name: 'UnknownJob', payload: {}, attempts, priority: 0 })
+      await worker.processCycle(['default']) // started
+      await worker.processCycle(['default']) // completed
     }
 
-    const worker = new Worker(localConfig)
+    const exhausted = await sharedAdapter.getJob('returned-twice', 'default')
+    assert.equal(exhausted!.status, 'failed')
+    assert.equal(exhausted!.error, 'Requested job "UnknownJob" is not registered')
+    assert.equal((await sharedAdapter.getJob('returned-once', 'default'))!.status, 'delayed')
+  })
+
+  test('should fail a job with an unknown class at once when unknownJobRetries is 0', async ({
+    assert,
+    cleanup,
+  }) => {
+    const sharedAdapter = memory()()
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      defaultJobOptions: { removeOnFail: false },
+      worker: { unknownJobRetries: 0 },
+    })
 
     cleanup(async () => {
       Locator.clear()
@@ -1321,11 +1398,73 @@ test.group('Worker', () => {
     })
 
     await worker.processCycle(['default']) // started
-    const cycle = await worker.processCycle(['default']) // completed (job failed)
+    await worker.processCycle(['default']) // completed
 
-    // Job initialization failure is handled gracefully - job is marked as failed
-    // @ts-ignore
-    assert.equal(cycle.type, 'completed')
+    assert.equal((await sharedAdapter.getJob('unknown-job', 'default'))!.status, 'failed')
+  })
+
+  test('should fail a registered job that throws E_JOB_NOT_FOUND at once', async ({
+    assert,
+    cleanup,
+  }) => {
+    class MissingDependencyJob extends Job {
+      constructor() {
+        super()
+        Locator.getOrThrow('MissingDependencyJob')
+      }
+
+      async execute() {}
+    }
+
+    const sharedAdapter = memory()()
+    const logger = new MemoryLogger()
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      logger,
+      defaultJobOptions: { removeOnFail: false },
+    })
+
+    Locator.register('RegisteredJob', MissingDependencyJob)
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await sharedAdapter.push({
+      id: 'registered-job',
+      name: 'RegisteredJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    await worker.processCycle(['default']) // started
+    await worker.processCycle(['default']) // completed
+
+    const record = await sharedAdapter.getJob('registered-job', 'default')
+    assert.equal(record!.status, 'failed')
+    assert.equal(record!.error, 'Requested job "MissingDependencyJob" is not registered')
+    assert.deepEqual(
+      logger.logs.filter((entry) => entry.level === 'warn'),
+      []
+    )
+  })
+
+  test('should reject an invalid unknownJobRetries', ({ assert }) => {
+    for (const unknownJobRetries of [-1, 1.5]) {
+      assert.throws(
+        () =>
+          new Worker({
+            default: 'memory',
+            adapters: { memory: memory() },
+            worker: { unknownJobRetries },
+          }),
+        'Configuration error. Reason: worker.unknownJobRetries must be a non-negative integer'
+      )
+    }
   })
 
   test('should handle job constructor that throws', async ({ assert, cleanup }) => {
@@ -1343,6 +1482,7 @@ test.group('Worker', () => {
     const localConfig = {
       default: 'memory',
       adapters: { memory: () => sharedAdapter },
+      defaultJobOptions: { removeOnFail: false },
     }
 
     Locator.register('BrokenJob', BrokenJob)
@@ -1368,6 +1508,11 @@ test.group('Worker', () => {
     // Job initialization failure is handled gracefully - job is marked as failed
     // @ts-ignore
     assert.equal(cycle.type, 'completed')
+
+    // Unlike an unknown class, a broken job is not put back in the queue.
+    const record = await sharedAdapter.getJob('broken-job', 'default')
+    assert.equal(record!.status, 'failed')
+    assert.equal(record!.error, 'Constructor failed')
   })
 
   test('should recover stalled jobs during processing', async ({ assert, cleanup }) => {

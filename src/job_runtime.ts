@@ -35,10 +35,20 @@ export type JobExecutionOutcome =
       removeOnFail?: JobRetention
       failedHookError?: Error
     } & TimedOutExecution)
-  | { type: 'initialization-failed'; error: Error; removeOnFail?: JobRetention }
+  | {
+      type: 'initialization-failed'
+      error: Error
+      removeOnFail?: JobRetention
+      /**
+       * Set when no class is registered under the job name, as opposed to a
+       * registered job that failed to load, construct, or configure.
+       */
+      jobNotFound?: true
+    }
 
 type JobExecutionRuntimeDependencies = {
-  resolveJob: (jobName: string) => JobClass | Promise<JobClass>
+  /** Returns undefined when no class is registered under the name. */
+  resolveJob: (jobName: string) => JobClass | undefined | Promise<JobClass | undefined>
   configResolver: QueueConfigResolver
   jobFactory?: JobFactory
   executionWrapper?: NonNullable<QueueManagerConfig['executionWrapper']>
@@ -51,6 +61,12 @@ type FailureDecision =
       reason: PermanentFailureReason
       hookError: Error
     }
+
+/**
+ * No class is registered under the job name. Only the runtime throws it, so
+ * it cannot be confused with an E_JOB_NOT_FOUND from the job's own code.
+ */
+class JobNotRegistered extends errors.E_JOB_NOT_FOUND {}
 
 const noopExecutionWrapper: NonNullable<QueueManagerConfig['executionWrapper']> = async (run) =>
   run()
@@ -146,6 +162,8 @@ export class JobExecutionRuntime {
 
   async #instantiate(job: AcquiredJob): Promise<{ instance: Job; options: JobOptions }> {
     const JobClass = await this.#resolveJob(job.name)
+    if (!JobClass) throw new JobNotRegistered([job.name])
+
     const instance = this.#jobFactory ? await this.#jobFactory(JobClass) : new JobClass()
 
     return { instance, options: JobClass.options || {} }
@@ -175,6 +193,9 @@ export class JobExecutionRuntime {
         type: 'initialization-failed',
         error: initializationError,
         removeOnFail: retention.removeOnFail,
+        // An E_JOB_NOT_FOUND thrown while loading or constructing a registered
+        // job, for another name, is an initialization error like any other.
+        ...(error instanceof JobNotRegistered ? { jobNotFound: true as const } : {}),
       }
     }
 

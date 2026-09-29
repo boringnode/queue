@@ -397,7 +397,7 @@ class QueueManagerSingleton {
     }
 
     return new JobExecutionRuntime({
-      resolveJob: (jobName) => Locator.resolveOrThrow(jobName),
+      resolveJob: (jobName) => Locator.resolve(jobName),
       configResolver: this.#configResolver,
       jobFactory: this.#jobFactory,
       executionWrapper: this.#executionWrapper,

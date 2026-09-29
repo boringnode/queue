@@ -520,6 +520,17 @@ export interface WorkerConfig {
   maxStalledCount?: number
 
   /**
+   * A job whose class this worker does not know goes back to the queue, to
+   * run again 30 seconds later, while it has fewer attempts than this limit;
+   * then it fails for good. This covers rolling deploys, where an old worker
+   * takes a job dispatched by new code. The limit counts all the attempts of
+   * the job: a new job gets up to 10 returns by default (about 5 minutes), a
+   * job that already retried gets fewer. Each return counts as an attempt.
+   * @default 10
+   */
+  unknownJobRetries?: number
+
+  /**
    * Whether to automatically stop the worker on SIGINT/SIGTERM signals.
    * When enabled, the worker will wait for running jobs to complete
    * before stopping.

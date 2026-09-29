@@ -28,6 +28,17 @@ export const DEFAULT_STALLED_INTERVAL = '30s'
 export const DEFAULT_STALLED_THRESHOLD = '30s'
 
 /**
+ * Default number of times a job whose class a worker does not know goes back
+ * to the queue before it fails
+ */
+export const DEFAULT_UNKNOWN_JOB_RETRIES = 10
+
+/**
+ * Delay before a job whose class a worker does not know runs again, in ms
+ */
+export const UNKNOWN_JOB_RETRY_DELAY = 30_000
+
+/**
  * Default delay before retrying after an error
  */
 export const DEFAULT_ERROR_RETRY_DELAY = '5s'
