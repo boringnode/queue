@@ -98,6 +98,50 @@ async function assertMigratedSchedules(
   assert.equal(claimed!.to!.toISOString(), '2030-01-01T00:00:00.000Z')
 }
 
+/**
+ * Asserts every schedule operation fails with the migration message on a 0.7
+ * table, then that the same adapter works once the table is migrated.
+ */
+async function assertScheduleOperationsWaitForMigration(
+  assert: any,
+  adapter: Adapter,
+  migrate: () => Promise<void>
+) {
+  const operations = {
+    upsertSchedule: () =>
+      adapter.upsertSchedule({
+        id: 'new',
+        name: 'NewJob',
+        payload: {},
+        everyMs: 60_000,
+        timezone: 'UTC',
+        nextRunAt: new Date(),
+      }),
+    getSchedule: () => adapter.getSchedule('legacy'),
+    listSchedules: () => adapter.listSchedules(),
+    updateSchedule: () => adapter.updateSchedule('legacy', { status: 'paused' }),
+    deleteSchedule: () => adapter.deleteSchedule('legacy'),
+    claimDueSchedule: () => adapter.claimDueSchedule(),
+  }
+
+  for (const [name, operation] of Object.entries(operations)) {
+    const error = await operation().then(
+      () => null,
+      (reason: Error) => reason
+    )
+    assert.match(
+      error?.message ?? '',
+      /migrateScheduleDates/,
+      `${name} should wait for the migration`
+    )
+  }
+
+  await migrate()
+
+  assert.equal((await adapter.getSchedule('legacy'))!.status, 'active')
+  assert.isNull(await adapter.claimDueSchedule())
+}
+
 for (const dialect of ['sqlite', 'postgres', 'mysql'] as const) {
   test.group(`Schedule dates migration | Knex (${dialect})`, (group) => {
     let connection: KnexType
@@ -340,6 +384,16 @@ for (const dialect of ['sqlite', 'postgres', 'mysql'] as const) {
       })
 
       await adapter().migrate()
+    })
+
+    test('schedule operations fail until the schedules table is migrated', async ({ assert }) => {
+      await insertLegacySchedule()
+
+      await assertScheduleOperationsWaitForMigration(assert, adapter(), () =>
+        new KnexQueueSchemaService(connection).migrateScheduleDates(TABLE, {
+          timezone: WRITER_TIME_ZONE,
+        })
+      )
     })
 
     test('does nothing on a table that is already migrated', async ({ assert }) => {
@@ -692,6 +746,16 @@ for (const dialect of ['sqlite', 'postgres', 'mysql'] as const) {
       })
 
       await adapter().migrate()
+    })
+
+    test('schedule operations fail until the schedules table is migrated', async ({ assert }) => {
+      await insertLegacySchedule()
+
+      await assertScheduleOperationsWaitForMigration(assert, adapter(), () =>
+        new KyselyQueueSchemaService(connection, { dialect }).migrateScheduleDates(TABLE, {
+          timezone: WRITER_TIME_ZONE,
+        })
+      )
     })
 
     test('does nothing on a table that is already migrated', async ({ assert }) => {

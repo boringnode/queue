@@ -501,7 +501,9 @@ example by setting `time_zone`), pass it as `databaseTimeZone`, such as `'+02:00
 
 The migration is idempotent and keeps custom columns. MySQL cannot change a schema inside a
 transaction: if a run fails there, fix the cause and run it again, it resumes where it stopped.
-Until the table is migrated, `adapter.migrate()` throws an error that points to this method.
+Until the table is migrated, schedule operations and `adapter.migrate()` throw an error that points
+to this method. This applies even if you never defined a schedule: a Worker claims due schedules at
+each cycle, so it logs this error and processes no job until the table is migrated.
 
 On MySQL, tables created before 0.8 also used `TEXT` columns for job payloads, error messages, and
 schedule payloads, which stop at 64 KB: a larger payload failed to insert, or was cut in non-strict

@@ -94,6 +94,7 @@ export class KnexAdapter implements Adapter {
   readonly #schedulesTable: string
   readonly #ownsConnection: boolean
   #workerId: string = ''
+  #scheduleDatesCheck: Promise<void> | undefined
 
   constructor(config: KnexAdapterOptions) {
     this.#connection = config.connection
@@ -125,6 +126,20 @@ export class KnexAdapter implements Adapter {
         scheduleDatesMigrationRequiredMessage(this.#schedulesTable, 'KnexQueueSchemaService')
       )
     }
+  }
+
+  /**
+   * Runs the migrate() check before the first schedule operation. The 0.8
+   * queries fail on the date columns of a table not migrated yet on
+   * PostgreSQL, and misread them on MySQL and SQLite. A failed check runs
+   * again on the next operation, so a migration run meanwhile is picked up.
+   */
+  #assertScheduleDatesMigrated(): Promise<void> {
+    this.#scheduleDatesCheck ??= this.migrate().catch((error) => {
+      this.#scheduleDatesCheck = undefined
+      throw error
+    })
+    return this.#scheduleDatesCheck
   }
 
   async pop(): Promise<AcquiredJob | null> {
@@ -742,6 +757,8 @@ export class KnexAdapter implements Adapter {
   }
 
   async upsertSchedule(config: ScheduleConfig): Promise<string> {
+    await this.#assertScheduleDatesMigrated()
+
     const id = config.id ?? randomUUID()
     const nextRunAt = config.nextRunAt?.getTime() ?? null
 
@@ -801,6 +818,8 @@ export class KnexAdapter implements Adapter {
   }
 
   async getSchedule(id: string): Promise<ScheduleData | null> {
+    await this.#assertScheduleDatesMigrated()
+
     const row = (await this.#connection(this.#schedulesTable).where('id', id).first()) as
       | ScheduleRow
       | undefined
@@ -810,6 +829,8 @@ export class KnexAdapter implements Adapter {
   }
 
   async listSchedules(options?: ScheduleListOptions): Promise<ScheduleData[]> {
+    await this.#assertScheduleDatesMigrated()
+
     let query = this.#connection(this.#schedulesTable).whereNot('status', 'cancelled')
 
     if (options?.status) {
@@ -824,6 +845,8 @@ export class KnexAdapter implements Adapter {
     id: string,
     updates: Partial<Pick<ScheduleData, 'status' | 'nextRunAt' | 'lastRunAt' | 'runCount'>>
   ): Promise<void> {
+    await this.#assertScheduleDatesMigrated()
+
     const data: Record<string, unknown> = {}
 
     if (updates.status !== undefined) data.status = updates.status
@@ -837,10 +860,14 @@ export class KnexAdapter implements Adapter {
   }
 
   async deleteSchedule(id: string): Promise<void> {
+    await this.#assertScheduleDatesMigrated()
+
     await this.#connection(this.#schedulesTable).where('id', id).delete()
   }
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
+    await this.#assertScheduleDatesMigrated()
+
     const now = Date.now()
 
     return this.#connection.transaction(async (trx) => {

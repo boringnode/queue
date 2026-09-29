@@ -51,8 +51,12 @@ through the PostgreSQL `search_path`.
 The migration is idempotent and keeps custom columns. MySQL cannot change a schema inside a
 transaction: if a run fails there, fix the cause and run it again, it resumes where it stopped.
 
-`adapter.migrate()` on the Knex and Kysely adapters now throws an error that points to
-`migrateScheduleDates()` while the schedules table is not migrated.
+The migration applies to every schedules table created before 0.8, even if the application never
+defined a schedule: a Worker claims due schedules at each cycle. Until the table is migrated, every
+schedule operation of the Knex and Kysely adapters, and `adapter.migrate()`, throws an error that
+points to `migrateScheduleDates()`. A Worker then logs this error at each cycle and processes no
+Job. The adapter checks the table once, before its first schedule operation, and again after a
+failed check, so a Worker picks up a migration run while it is waiting.
 
 In AdonisJS, run it from a new migration file.
 

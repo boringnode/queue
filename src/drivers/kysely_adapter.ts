@@ -123,6 +123,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   readonly #jobsTable: string
   readonly #schedulesTable: string
   #workerId: string = ''
+  #scheduleDatesCheck: Promise<void> | undefined
 
   constructor(config: KyselyAdapterConfig<DB>) {
     this.#connection = config.connection
@@ -152,6 +153,20 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
         scheduleDatesMigrationRequiredMessage(this.#schedulesTable, 'KyselyQueueSchemaService')
       )
     }
+  }
+
+  /**
+   * Runs the migrate() check before the first schedule operation. The 0.8
+   * queries fail on the date columns of a table not migrated yet on
+   * PostgreSQL, and misread them on MySQL and SQLite. A failed check runs
+   * again on the next operation, so a migration run meanwhile is picked up.
+   */
+  #assertScheduleDatesMigrated(): Promise<void> {
+    this.#scheduleDatesCheck ??= this.migrate().catch((error) => {
+      this.#scheduleDatesCheck = undefined
+      throw error
+    })
+    return this.#scheduleDatesCheck
   }
 
   async pop(): Promise<AcquiredJob | null> {
@@ -720,6 +735,8 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   }
 
   async upsertSchedule(config: ScheduleConfig): Promise<string> {
+    await this.#assertScheduleDatesMigrated()
+
     const id = config.id ?? randomUUID()
     const nextRunAt = config.nextRunAt?.getTime() ?? null
     const definition = {
@@ -782,6 +799,8 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   }
 
   async getSchedule(id: string): Promise<ScheduleData | null> {
+    await this.#assertScheduleDatesMigrated()
+
     const row = await this.#schedules(this.#connection)
       .selectFrom(this.#schedulesTable)
       .selectAll()
@@ -792,6 +811,8 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   }
 
   async listSchedules(options?: ScheduleListOptions): Promise<ScheduleData[]> {
+    await this.#assertScheduleDatesMigrated()
+
     let query = this.#schedules(this.#connection)
       .selectFrom(this.#schedulesTable)
       .selectAll()
@@ -806,6 +827,8 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     id: string,
     updates: Partial<Pick<ScheduleData, 'status' | 'nextRunAt' | 'lastRunAt' | 'runCount'>>
   ): Promise<void> {
+    await this.#assertScheduleDatesMigrated()
+
     const data: Updateable<QueueScheduleTable> = {}
     if (updates.status !== undefined) data.status = updates.status
     if (updates.nextRunAt !== undefined) data.next_run_at = updates.nextRunAt?.getTime() ?? null
@@ -821,6 +844,8 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   }
 
   async deleteSchedule(id: string): Promise<void> {
+    await this.#assertScheduleDatesMigrated()
+
     await this.#schedules(this.#connection)
       .deleteFrom(this.#schedulesTable)
       .where('id', '=', id)
@@ -828,6 +853,8 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   }
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
+    await this.#assertScheduleDatesMigrated()
+
     const now = Date.now()
 
     return this.#withTransaction(this.#connection, async (trx) => {
