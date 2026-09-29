@@ -355,6 +355,9 @@ rebuilds the derived index from the canonical schedule hashes. Existing Redis sc
 visible to the new version until it has run. Do not run the `O(number of schedules)` migration from
 the worker polling loop.
 
+Until then, defining a schedule still stored at its 0.7 key throws an error that points to
+`migrate()`, so a schedule defined at boot cannot replace its 0.7 status and run count.
+
 Processes still running 0.7 do not see migrated schedules, and the migration cannot be rolled back
 by downgrading. Do not mix 0.7 and newer processes during the deployment.
 

@@ -40,6 +40,11 @@ The migration moves every schedule to its new key and rebuilds the due index. Ex
 schedules are not visible to the new version until it has completed. It scans all schedules and
 should remain an explicit deployment step rather than run in the worker polling loop.
 
+Until then, defining a schedule still stored at its 0.7 key throws an error that points to
+`migrate()`, without changing anything. The migration keeps a schedule already stored at the new
+key, so a definition written first would have replaced the 0.7 one: a paused schedule came back
+active, and its run count started again from 0.
+
 The migration cannot be rolled back by downgrading: 0.7 processes do not see migrated schedules. Do
 not mix 0.7 and newer processes during the deployment.
 

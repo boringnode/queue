@@ -499,10 +499,11 @@ export class RedisAdapter implements Adapter {
 
     const unfinalizedClaim = (await this.#connection.eval(
       UPSERT_SCHEDULE_SCRIPT,
-      3,
+      4,
       scheduleKey,
       schedulesIndexKey,
       schedulesDueKey,
+      `${legacyScheduleDataPrefix}${id}`,
       id,
       now.toString(),
       JSON.stringify(scheduleData),

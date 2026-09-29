@@ -874,6 +874,86 @@ test.group('Adapter | Redis', (group) => {
     assert.deepEqual((await adapter.getSchedule('index'))!.payload, { id: 'index' })
   })
 
+  test('defining a schedule still stored at its 0.7 key fails until migrate runs', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+    const id = 'paused-cron'
+    const nextRunAt = (Date.now() + 3_600_000).toString()
+    const config = {
+      id,
+      name: 'CronJob',
+      payload: {},
+      cronExpression: '0 3 * * *',
+      timezone: 'UTC',
+      nextRunAt: new Date(Date.now() + 60_000),
+    }
+
+    // A schedule paused by 0.7, which the application defines at boot before migrate().
+    await connection
+      .multi()
+      .hset(`schedules::${id}`, {
+        id,
+        name: 'CronJob',
+        payload: '{}',
+        status: 'paused',
+        cron_expression: '0 3 * * *',
+        timezone: 'UTC',
+        next_run_at: nextRunAt,
+        run_count: '42',
+        created_at: Date.now().toString(),
+      })
+      .sadd('schedules::index', id)
+      .exec()
+
+    await assert.rejects(() => adapter.upsertSchedule(config), /run migrate\(\)/)
+    assert.equal(await connection.exists(`schedules::data::${id}`), 0)
+
+    await adapter.migrate()
+    await adapter.upsertSchedule(config)
+
+    const schedule = await adapter.getSchedule(id)
+    assert.equal(schedule!.status, 'paused')
+    assert.equal(schedule!.runCount, 42)
+    assert.equal(schedule!.nextRunAt!.getTime(), Number(nextRunAt))
+  })
+
+  test('defining a schedule again succeeds when its 0.7 key holds something else', async ({
+    assert,
+  }) => {
+    const adapter = new RedisAdapter(connection)
+    const config = { name: 'TestJob', payload: {}, everyMs: 60_000, timezone: 'UTC' }
+    // `schedules::data::x`, the 0.7 key of `data::x`, is the new key of `x`, and
+    // the 0.7 keys of `due` and `index` are the indexes.
+    const ids = ['x', 'data::x', 'due', 'index']
+
+    for (const id of [...ids, ...ids]) {
+      await adapter.upsertSchedule({ ...config, id })
+    }
+
+    assert.sameMembers(
+      (await adapter.listSchedules()).map((schedule) => schedule.id),
+      ids
+    )
+  })
+
+  test('defining a schedule succeeds when its 0.7 key is not indexed', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+
+    // migrate() only moves indexed schedules, so this hash would block the upsert forever.
+    await connection.hset('schedules::orphan', { id: 'orphan', name: 'OrphanJob' })
+
+    await adapter.upsertSchedule({
+      id: 'orphan',
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+
+    assert.equal((await adapter.getSchedule('orphan'))!.name, 'TestJob')
+  })
+
   test('migrate is idempotent', async ({ assert }) => {
     const adapter = new RedisAdapter(connection)
     const nextRunAt = Date.now() + 30_000

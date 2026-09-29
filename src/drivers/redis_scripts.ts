@@ -549,6 +549,10 @@ const SCHEDULE_DUE_INDEX_LUA = `
  * invalidated so its finalization cannot overwrite it. With the same timing,
  * the claim stays valid, since the next run it computes is still right.
  *
+ * Fails without changes while the schedule is still stored at its 0.7 key:
+ * migrate() keeps a hash already at the new key and drops the 0.7 one, so a
+ * schedule defined before the migration would lose its status and run count.
+ *
  * Returns the claim token, config revision, and claim time of a cron claim
  * not finalized yet, so the caller can finalize it in case the process that
  * claimed it died. Returns nil otherwise.
@@ -557,12 +561,23 @@ export const UPSERT_SCHEDULE_SCRIPT = `
   local schedule_key = KEYS[1]
   local schedules_index_key = KEYS[2]
   local due_key = KEYS[3]
+  local legacy_schedule_key = KEYS[4]
   local id = ARGV[1]
   local now = ARGV[2]
   local schedule = cjson.decode(ARGV[3])
   local next_run_at = ARGV[4]
 
 ${SCHEDULE_DUE_INDEX_LUA}
+
+  -- The same test as migrate(): an indexed id with a 0.7 hash at its old key.
+  if redis.call('SISMEMBER', schedules_index_key, id) == 1
+    and redis.call('TYPE', legacy_schedule_key).ok == 'hash'
+    and redis.call('HGET', legacy_schedule_key, 'id') == id then
+    return redis.error_reply(
+      'Schedule "' .. id .. '" is still stored in the format used before 0.8. ' ..
+      'Stop every process running the previous version, then run migrate() on the Redis adapter.'
+    )
+  end
 
   local exists = redis.call('EXISTS', schedule_key) == 1
   local timing_changed = not exists
