@@ -40,7 +40,8 @@ export class JobPool {
    * again while its first execution still runs: both stay in the pool.
    */
   #activeJobs = new Map<string, PoolEntry>()
-  #completedEntries: CompletedEntry[] = []
+  /** Consumed slots are cleared at once: an entry holds its job and payload. */
+  #completedEntries: Array<CompletedEntry | undefined> = []
   #completedHead = 0
   #completionAvailable?: PromiseWithResolvers<void>
 
@@ -127,7 +128,8 @@ export class JobPool {
         await this.#completionAvailable.promise
       }
 
-      const completed = this.#completedEntries[this.#completedHead++]!
+      const completed = this.#completedEntries[this.#completedHead]!
+      this.#completedEntries[this.#completedHead++] = undefined
       this.#compactCompletedJobs()
 
       if (this.#activeJobs.get(completed.leaseToken) !== completed.entry) continue
@@ -167,6 +169,12 @@ export class JobPool {
   }
 
   #compactCompletedJobs(): void {
+    if (this.#completedHead === this.#completedEntries.length) {
+      this.#completedEntries = []
+      this.#completedHead = 0
+      return
+    }
+
     if (this.#completedHead < 1_024 || this.#completedHead * 2 < this.#completedEntries.length) {
       return
     }

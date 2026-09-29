@@ -1,4 +1,6 @@
 import { setTimeout } from 'node:timers/promises'
+import { setFlagsFromString } from 'node:v8'
+import { runInNewContext } from 'node:vm'
 import { test } from '@japa/runner'
 import { JobPool } from '../src/job_pool.js'
 import type { AcquiredJob } from '../src/contracts/adapter.js'
@@ -13,6 +15,21 @@ function createJob(id: string, leaseToken = `worker:${id}`): AcquiredJob {
     acquiredAt: Date.now(),
     leaseToken,
   }
+}
+
+/** Force a full garbage collection, without starting Node with --expose-gc. */
+function collectGarbage(): void {
+  setFlagsFromString('--expose-gc')
+  ;(runInNewContext('gc') as () => void)()
+}
+
+/** Whether nothing references the target anymore, after a full collection. */
+async function isCollected(reference: WeakRef<object>): Promise<boolean> {
+  for (let i = 0; i < 5 && reference.deref(); i++) {
+    await setTimeout(0)
+    collectGarbage()
+  }
+  return reference.deref() === undefined
 }
 
 test.group('JobPool', () => {
@@ -189,6 +206,36 @@ test.group('JobPool', () => {
     currentExecution.resolve()
     assert.strictEqual((await pool.waitForNextCompletion()).job, current)
     assert.isTrue(pool.isEmpty())
+  })
+
+  test('releases a consumed job while other completions are still queued', async ({ assert }) => {
+    const pool = new JobPool()
+    let consumedPayload: object | undefined = { data: 'x'.repeat(1024) }
+    const consumed = new WeakRef(consumedPayload)
+
+    pool.add({ ...createJob('consumed'), payload: consumedPayload }, 'default', Promise.resolve())
+    pool.add(createJob('still-queued'), 'default', Promise.resolve())
+    consumedPayload = undefined
+    await setTimeout(0)
+
+    assert.equal((await pool.waitForNextCompletion()).job.id, 'consumed')
+
+    // The second completion is still queued, so the queue is not reset yet.
+    assert.isTrue(await isCollected(consumed))
+    assert.equal((await pool.waitForNextCompletion()).job.id, 'still-queued')
+  })
+
+  test('releases the last consumed job once the pool is empty', async ({ assert }) => {
+    const pool = new JobPool()
+    let payload: object | undefined = { data: 'x'.repeat(1024) }
+    const released = new WeakRef(payload)
+
+    pool.add({ ...createJob('only'), payload }, 'default', Promise.resolve())
+    payload = undefined
+    await pool.waitForNextCompletion()
+
+    assert.isTrue(pool.isEmpty())
+    assert.isTrue(await isCollected(released))
   })
 
   test('returns every job once in settlement order', async ({ assert }) => {
