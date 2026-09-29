@@ -82,20 +82,23 @@ async function assertMigratedSchedules(
     assert.closeTo(legacy!.createdAt.getTime(), createdAt.near, 60_000)
   }
 
-  // The adapter can create, schedule, and claim on the migrated table.
+  // The adapter can create, schedule, and claim on the migrated table. The
+  // legacy schedule is due from NEXT_RUN_AT on: pause it, so the claim only
+  // sees the new one whatever the date.
+  await adapter.updateSchedule('legacy', { status: 'paused' })
   await adapter.upsertSchedule({
     id: 'after-migration',
     name: 'NewJob',
     payload: {},
     everyMs: 60_000,
     timezone: 'UTC',
-    to: new Date('2030-01-01T00:00:00.000Z'),
+    to: new Date('2100-01-01T00:00:00.000Z'),
   })
   await adapter.updateSchedule('after-migration', { nextRunAt: new Date(Date.now() - 1_000) })
 
   const claimed = await adapter.claimDueSchedule()
   assert.equal(claimed!.id, 'after-migration')
-  assert.equal(claimed!.to!.toISOString(), '2030-01-01T00:00:00.000Z')
+  assert.equal(claimed!.to!.toISOString(), '2100-01-01T00:00:00.000Z')
 }
 
 /**
@@ -138,7 +141,10 @@ async function assertScheduleOperationsWaitForMigration(
 
   await migrate()
 
+  // The legacy schedule is due from NEXT_RUN_AT on: pause it, so nothing is
+  // claimable whatever the date.
   assert.equal((await adapter.getSchedule('legacy'))!.status, 'active')
+  await adapter.updateSchedule('legacy', { status: 'paused' })
   assert.isNull(await adapter.claimDueSchedule())
 }
 
