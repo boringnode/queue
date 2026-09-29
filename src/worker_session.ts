@@ -132,7 +132,10 @@ export class WorkerSession {
         const delay = parse(cycle.suggestedDelay)
 
         if (cycle.type === 'error') {
-          debug('worker %s encountered an error: %O', this.#workerId, cycle.error)
+          this.#logger.error(
+            { err: cycle.error, workerId: this.#workerId },
+            `Worker cycle failed, next attempt in ${delay}ms`
+          )
         } else {
           debug('worker %s is idle, waiting for %dms', this.#workerId, delay)
         }

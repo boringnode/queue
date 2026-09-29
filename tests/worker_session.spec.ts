@@ -546,6 +546,27 @@ test.group('WorkerSession', () => {
     assert.isTrue(start.settled)
   })
 
+  test('logs a failed cycle through the logger', async ({ assert, cleanup }) => {
+    const adapter = new ControllableAdapter()
+    const error = new Error('Failed to acquire job')
+    adapter.acquisitions.fail(1, error)
+    const logger = new MemoryLogger()
+    const session = createSession({ adapter, logger })
+    cleanup(() => session.stop())
+
+    const start = session.start()
+    await adapter.acquisitions.waitForSettled(1)
+    await setTimeout(0)
+    await session.stop()
+    await start
+
+    const errors = logger.logs.filter((entry) => entry.level === 'error')
+    assert.lengthOf(errors, 1)
+    assert.strictEqual(errors[0].obj?.err, error)
+    assert.equal(errors[0].obj?.workerId, 'test-worker')
+    assert.equal(errors[0].message, 'Worker cycle failed, next attempt in 5000ms')
+  })
+
   test('suppresses an acquired cycle after stopping', async ({ assert, cleanup }) => {
     const adapter = new ControllableAdapter()
     adapter.acquisitions.block(1)
