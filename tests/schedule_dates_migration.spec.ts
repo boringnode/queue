@@ -220,6 +220,7 @@ for (const dialect of ['sqlite', 'postgres', 'mysql'] as const) {
 
       const column = await connection(TABLE).columnInfo('next_run_at')
       assert.match(column.type, /int/i)
+      assert.isFalse((await connection(TABLE).columnInfo('created_at')).nullable)
       assert.equal((await connection(TABLE).where('id', 'legacy').first()).tenant, 'acme')
 
       await assertMigratedSchedules(assert, adapter(), createdAt)
@@ -249,6 +250,10 @@ for (const dialect of ['sqlite', 'postgres', 'mysql'] as const) {
         timezone: WRITER_TIME_ZONE,
       })
 
+      // SQLite migrates in one transaction, so it never resumes from nullable epoch columns.
+      if (dialect !== 'sqlite') {
+        assert.isFalse((await connection(TABLE).columnInfo('created_at')).nullable)
+      }
       await assertMigratedSchedules(assert, adapter(), createdAt)
     })
 
@@ -487,6 +492,10 @@ for (const dialect of ['sqlite', 'postgres', 'mysql'] as const) {
       const table = (await connection.introspection.getTables()).find(({ name }) => name === TABLE)
       return new Map(table!.columns.map(({ name, dataType }) => [name, dataType]))
     }
+    const isNullable = async (column: string) => {
+      const table = (await connection.introspection.getTables()).find(({ name }) => name === TABLE)
+      return table!.columns.find(({ name }) => name === column)!.isNullable
+    }
 
     test('converts the 0.7 dates to epoch milliseconds', async ({ assert }) => {
       const createdAt = await insertLegacySchedule()
@@ -495,6 +504,7 @@ for (const dialect of ['sqlite', 'postgres', 'mysql'] as const) {
       await schema.migrateScheduleDates(TABLE, { timezone: WRITER_TIME_ZONE })
 
       assert.match((await columnTypes()).get('next_run_at')!, /int/i)
+      assert.isFalse(await isNullable('created_at'))
       await assertMigratedSchedules(assert, adapter(), createdAt)
     })
 
@@ -522,6 +532,10 @@ for (const dialect of ['sqlite', 'postgres', 'mysql'] as const) {
         timezone: WRITER_TIME_ZONE,
       })
 
+      // SQLite migrates in one transaction, so it never resumes from nullable epoch columns.
+      if (dialect !== 'sqlite') {
+        assert.isFalse(await isNullable('created_at'))
+      }
       await assertMigratedSchedules(assert, adapter(), createdAt)
     })
 

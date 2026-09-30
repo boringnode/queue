@@ -2,7 +2,7 @@ import { sql, type AlterTableColumnAlteringBuilder, type Kysely, type Transactio
 import {
   assertTimeZone,
   epochColumn,
-  legacyScheduleDateToEpoch,
+  legacyScheduleRowToEpochs,
   processTimeZone,
   scheduleDatesMigrationState,
   type ScheduleDateColumn,
@@ -231,19 +231,23 @@ export class KyselyQueueSchemaService<DB> {
       const timeZone = this.#dialect === 'sqlite' ? 'UTC' : writerTimeZone
       const updates = rows.map((row) => ({
         id: row.id,
-        values: Object.fromEntries(
-          state.legacy.map((name) => [
-            epochColumn(name),
-            legacyScheduleDateToEpoch(row[name], timeZone),
-          ])
-        ),
+        values: legacyScheduleRowToEpochs(row, state.legacy, timeZone),
       }))
 
       await this.#dropNextRunIndexes(trx, tableName)
 
       for (const name of state.legacy) {
         if (state.withEpochColumn.includes(name)) continue
-        await trx.schema.alterTable(tableName).addColumn(epochColumn(name), 'bigint').execute()
+        await trx.schema
+          .alterTable(tableName)
+          .addColumn(epochColumn(name), 'bigint', (column) =>
+            // SQLite cannot add NOT NULL to an existing column, only to a new
+            // one with a default. Every row gets its value below.
+            name === 'created_at' && this.#dialect === 'sqlite'
+              ? column.notNull().defaultTo(0)
+              : column
+          )
+          .execute()
       }
 
       for (const { id, values } of updates) {
@@ -254,11 +258,25 @@ export class KyselyQueueSchemaService<DB> {
           .execute()
       }
 
+      // created_at is required, as in a new table. Before the legacy columns
+      // are dropped, so a failure on MySQL leaves a table the next run resumes.
+      const epochColumns = new Set([...state.legacy, ...state.withEpochColumn])
+      if (epochColumns.has('created_at') && this.#dialect !== 'sqlite') {
+        const alterTable = trx.schema.alterTable(tableName)
+        await (
+          this.#dialect === 'postgres'
+            ? alterTable.alterColumn(epochColumn('created_at'), (column) => column.setNotNull())
+            : alterTable.modifyColumn(epochColumn('created_at'), 'bigint', (column) =>
+                column.notNull()
+              )
+        ).execute()
+      }
+
       for (const name of state.legacy) {
         await trx.schema.alterTable(tableName).dropColumn(name).execute()
       }
 
-      for (const name of new Set([...state.legacy, ...state.withEpochColumn])) {
+      for (const name of epochColumns) {
         await trx.schema.alterTable(tableName).renameColumn(epochColumn(name), name).execute()
       }
 

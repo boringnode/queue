@@ -110,6 +110,34 @@ export function legacyScheduleDateToEpoch(
   return epoch
 }
 
+/**
+ * The epoch values of the legacy date columns of one schedule row, keyed by
+ * epoch column. created_at is required once migrated, so a row without one
+ * fails the migration here, before the first schema change.
+ */
+export function legacyScheduleRowToEpochs(
+  row: Record<string, string | number | null>,
+  columns: readonly ScheduleDateColumn[],
+  wallClockTimeZone: string
+): Record<string, number | null> {
+  const values: Record<string, number | null> = {}
+
+  for (const name of columns) {
+    const epoch = legacyScheduleDateToEpoch(row[name], wallClockTimeZone)
+
+    if (name === 'created_at' && epoch === null) {
+      throw new Error(
+        `Cannot migrate schedule "${row.id}": its created_at is empty, and the migrated column ` +
+          `is required. Set a date, then run the migration again.`
+      )
+    }
+
+    values[epochColumn(name)] = epoch
+  }
+
+  return values
+}
+
 type WallClockParts = [
   year: number,
   month: number,

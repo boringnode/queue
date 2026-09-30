@@ -2,7 +2,7 @@ import type { Knex } from 'knex'
 import {
   assertTimeZone,
   epochColumn,
-  legacyScheduleDateToEpoch,
+  legacyScheduleRowToEpochs,
   processTimeZone,
   scheduleDatesMigrationState,
   type ScheduleDateColumn,
@@ -235,12 +235,7 @@ export class KnexQueueSchemaService {
       const timeZone = dialect === 'sqlite' ? 'UTC' : writerTimeZone
       const updates = rows.map((row) => ({
         id: row.id,
-        values: Object.fromEntries(
-          state.legacy.map((name) => [
-            epochColumn(name),
-            legacyScheduleDateToEpoch(row[name], timeZone),
-          ])
-        ),
+        values: legacyScheduleRowToEpochs(row, state.legacy, timeZone),
       }))
 
       await this.#dropNextRunIndexes(trx, dialect, tableName)
@@ -250,12 +245,33 @@ export class KnexQueueSchemaService {
       )
       if (missingEpochColumns.length > 0) {
         await trx.schema.alterTable(tableName, (table) => {
-          for (const name of missingEpochColumns) table.bigint(epochColumn(name)).nullable()
+          for (const name of missingEpochColumns) {
+            // SQLite cannot add NOT NULL to an existing column, only to a new
+            // one with a default. Every row gets its value below.
+            if (name === 'created_at' && dialect === 'sqlite') {
+              table.bigint(epochColumn(name)).notNullable().defaultTo(0)
+            } else {
+              table.bigint(epochColumn(name)).nullable()
+            }
+          }
         })
       }
 
       for (const { id, values } of updates) {
         await trx(tableName).where('id', id).update(values)
+      }
+
+      // created_at is required, as in a new table. Before the legacy columns
+      // are dropped, so a failure on MySQL leaves a table the next run resumes.
+      const epochColumns = [...new Set([...state.legacy, ...state.withEpochColumn])]
+      if (epochColumns.includes('created_at') && dialect !== 'sqlite') {
+        await trx.schema.alterTable(tableName, (table) => {
+          if (dialect === 'pg') {
+            table.dropNullable(epochColumn('created_at'))
+          } else {
+            table.bigint(epochColumn('created_at')).notNullable().alter()
+          }
+        })
       }
 
       if (state.legacy.length > 0) {
@@ -264,7 +280,6 @@ export class KnexQueueSchemaService {
         })
       }
 
-      const epochColumns = [...new Set([...state.legacy, ...state.withEpochColumn])]
       await trx.schema.alterTable(tableName, (table) => {
         for (const name of epochColumns) table.renameColumn(epochColumn(name), name)
       })
