@@ -117,6 +117,7 @@ export const ACQUIRE_JOB_SCRIPT = `
   local overlay_key = KEYS[5]
   local worker_id = ARGV[1]
   local now = tonumber(ARGV[2])
+  local lease_token = ARGV[3]
 
 ${REDIS_JOB_STORAGE_LUA}
 
@@ -151,13 +152,28 @@ ${REDIS_JOB_STORAGE_LUA}
   -- Store in active hash (without data, it's in data_key)
   local active_data = cjson.encode({
     workerId = worker_id,
-    acquiredAt = now
+    acquiredAt = now,
+    leaseToken = lease_token
   })
   redis.call('HSET', active_key, job_id, active_data)
 
   return encode_job_result(job_data, overlay_key, job_id, {
     acquiredAt = now
   })
+`
+
+/**
+ * True if the active hash holds the job under the given lease token.
+ */
+const REDIS_LEASE_LUA = `
+  local function holds_lease(active_key, job_id, lease_token)
+    local active_data = redis.call('HGET', active_key, job_id)
+    if not active_data then
+      return false
+    end
+
+    return cjson.decode(active_data).leaseToken == lease_token
+  end
 `
 
 /**
@@ -168,12 +184,14 @@ export const REMOVE_JOB_SCRIPT = `
   local data_key = KEYS[1]
   local active_key = KEYS[2]
   local overlay_key = KEYS[3]
+  local dedup_prefix = KEYS[4]
   local job_id = ARGV[1]
-  local dedup_prefix = ARGV[2]
+  local lease_token = ARGV[2]
 
 ${REDIS_JOB_STORAGE_LUA}
+${REDIS_LEASE_LUA}
 
-  if redis.call('HEXISTS', active_key, job_id) == 0 then
+  if not holds_lease(active_key, job_id, lease_token) then
     return 0
   end
 
@@ -206,17 +224,19 @@ export const FINALIZE_JOB_SCRIPT = `
   local history_key = KEYS[3]
   local index_key = KEYS[4]
   local overlay_key = KEYS[5]
+  local dedup_prefix = KEYS[6]
   local job_id = ARGV[1]
   local now = tonumber(ARGV[2])
   local max_age = tonumber(ARGV[3])
   local max_count = tonumber(ARGV[4])
   local error_message = ARGV[5]
-  local dedup_prefix = ARGV[6]
+  local lease_token = ARGV[6]
 
 ${REDIS_JOB_STORAGE_LUA}
+${REDIS_LEASE_LUA}
 
-  -- Verify job is active
-  if redis.call('HEXISTS', active_key, job_id) == 0 then
+  -- Verify the caller still holds the job
+  if not holds_lease(active_key, job_id, lease_token) then
     return 0
   end
 
@@ -281,7 +301,7 @@ ${REDIS_JOB_STORAGE_LUA}
 
 /**
  * Lua script for retrying a job.
- * 1. Verify job is active
+ * 1. Verify the caller still holds the job
  * 2. Remove from active hash
  * 3. Increment attempts in data
  * 4. Add back to pending (or delayed if retryAt is set)
@@ -295,11 +315,13 @@ export const RETRY_JOB_SCRIPT = `
   local job_id = ARGV[1]
   local retry_at = tonumber(ARGV[2])
   local now = tonumber(ARGV[3])
+  local lease_token = ARGV[4]
 
 ${REDIS_JOB_STORAGE_LUA}
+${REDIS_LEASE_LUA}
 
-  -- Verify job is active
-  if redis.call('HEXISTS', active_key, job_id) == 0 then
+  -- Verify the caller still holds the job
+  if not holds_lease(active_key, job_id, lease_token) then
     return 0
   end
 
@@ -336,8 +358,10 @@ ${REDIS_JOB_STORAGE_LUA}
  * Lua script for recovering stalled jobs.
  * Scans the active hash for jobs that have been active too long.
  * - Jobs within maxStalledCount: move back to pending with incremented stalledCount
- * - Jobs exceeding maxStalledCount: remove permanently (fail)
- * Returns the number of recovered jobs (not including failed ones).
+ * - Jobs exceeding maxStalledCount: up to max_exceeded of them stay active,
+ *   reacquired by the calling worker, and are returned so the worker fails
+ *   them through the regular path. The others are left stalled.
+ * Returns {recovered, exceeded job 1, exceeded job 2, ...}.
  */
 export const RECOVER_STALLED_JOBS_SCRIPT = `
   local data_key = KEYS[1]
@@ -347,11 +371,15 @@ export const RECOVER_STALLED_JOBS_SCRIPT = `
   local now = tonumber(ARGV[1])
   local stalled_threshold = tonumber(ARGV[2])
   local max_stalled_count = tonumber(ARGV[3])
-  local dedup_prefix = ARGV[4]
+  local worker_id = ARGV[4]
+  local max_exceeded = tonumber(ARGV[5])
+  local lease_token_prefix = ARGV[6]
 
 ${REDIS_JOB_STORAGE_LUA}
 
   local recovered = 0
+  -- The first element is replaced by the recovered count before returning.
+  local result = { 0 }
   local stalled_cutoff = now - stalled_threshold
 
   -- Get all active jobs
@@ -371,20 +399,24 @@ ${REDIS_JOB_STORAGE_LUA}
         local overlay = read_job_overlay(overlay_key, job_id)
         local current_stalled_count = overlay.stalledCount or job.stalledCount or 0
 
-        -- Remove from active hash
-        redis.call('HDEL', active_key, job_id)
-
         -- Check if job has exceeded max stalled count
         if current_stalled_count >= max_stalled_count then
-          -- Job failed permanently, remove data + dedup key (only if pointer still ours)
-          if job.dedup and job.dedup.id then
-            local dkey = dedup_prefix .. job.dedup.id
-            if redis.call('GET', dkey) == job_id then
-              redis.call('DEL', dkey)
-            end
+          -- Reacquire for the calling worker, which fails it through the regular
+          -- path. Past max_exceeded, the job stays stalled for a later recovery.
+          if #result - 1 < max_exceeded then
+            local lease_token = lease_token_prefix .. ':' .. job_id
+            redis.call('HSET', active_key, job_id, cjson.encode({
+              workerId = worker_id,
+              acquiredAt = now,
+              leaseToken = lease_token
+            }))
+            result[#result + 1] = encode_job_result(job_data, overlay_key, job_id, {
+              acquiredAt = now,
+              leaseToken = lease_token
+            })
           end
-          delete_job_data(data_key, overlay_key, job_id)
         else
+          redis.call('HDEL', active_key, job_id)
           -- Recover: increment stalledCount without rewriting opaque job JSON.
           overlay.stalledCount = current_stalled_count + 1
           write_job_overlay(overlay_key, job_id, overlay)
@@ -398,30 +430,32 @@ ${REDIS_JOB_STORAGE_LUA}
     end
   end
 
-  return recovered
+  result[1] = recovered
+  return result
 `
 
 /**
  * Lua script for renewing the acquired timestamp of in-flight jobs (heartbeat).
- * Only entries still present in the active hash AND still owned by the calling
- * worker are renewed, so a job that was already recovered, finalized, or
- * re-acquired by another worker is never resurrected by a late heartbeat.
+ * Only entries still present in the active hash under the given lease token
+ * are renewed, so a job that was already recovered, finalized, or acquired
+ * again is never resurrected by a late heartbeat.
  * Preserves the existing worker info, updating only acquiredAt.
+ * ARGV = now, then job id and lease token pairs.
  * Returns the number of jobs renewed.
  */
 export const RENEW_JOBS_SCRIPT = `
   local active_key = KEYS[1]
   local now = tonumber(ARGV[1])
-  local worker_id = ARGV[2]
 
   local renewed = 0
-  for i = 3, #ARGV do
+  for i = 2, #ARGV, 2 do
     local job_id = ARGV[i]
+    local lease_token = ARGV[i + 1]
     local active_data = redis.call('HGET', active_key, job_id)
     if active_data then
       local active = cjson.decode(active_data)
-      -- Only the worker that currently owns the lease may renew it.
-      if active.workerId == worker_id then
+      -- Only the current holder of the lease may renew it.
+      if active.leaseToken == lease_token then
         active.acquiredAt = now
         redis.call('HSET', active_key, job_id, cjson.encode(active))
         renewed = renewed + 1
@@ -491,43 +525,364 @@ ${REDIS_JOB_STORAGE_LUA}
   })
 `
 
-/**
- * Lua script for atomically claiming a due schedule.
- * Iterates the schedule index server-side and claims the first due schedule.
- * Returns the schedule data if claimed, nil otherwise.
- */
-export const CLAIM_SCHEDULE_SCRIPT = `
-  local schedules_index_key = KEYS[1]
-  local schedule_key_prefix = KEYS[2]
-  local now = tonumber(ARGV[1])
+const SCHEDULE_DUE_INDEX_LUA = `
+  local function sync_schedule_due_index(schedule_key, due_key, id)
+    local status = redis.call('HGET', schedule_key, 'status')
+    local next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
+    local score = next_run_at and tonumber(next_run_at) or nil
 
+    if status == 'active' and score then
+      redis.call('ZADD', due_key, score, id)
+    else
+      redis.call('ZREM', due_key, id)
+    end
+  end
+`
+
+/**
+ * Atomically upserts schedule configuration while preserving runtime fields
+ * and synchronizing the derived due index from the resulting hash.
+ *
+ * A new schedule is created active with the given next run. An existing one
+ * keeps its status, run metadata, and next run, unless its timing changes:
+ * then it takes the given next run, and a cron claim in flight is
+ * invalidated so its finalization cannot overwrite it. With the same timing,
+ * the claim stays valid, since the next run it computes is still right.
+ *
+ * Fails without changes while the schedule is still stored at its 0.7 key:
+ * migrate() keeps a hash already at the new key and drops the 0.7 one, so a
+ * schedule defined before the migration would lose its status and run count.
+ *
+ * Returns the claim token, config revision, and claim time of a cron claim
+ * not finalized yet, so the caller can finalize it in case the process that
+ * claimed it died. Returns nil otherwise.
+ */
+export const UPSERT_SCHEDULE_SCRIPT = `
+  local schedule_key = KEYS[1]
+  local schedules_index_key = KEYS[2]
+  local due_key = KEYS[3]
+  local legacy_schedule_key = KEYS[4]
+  local id = ARGV[1]
+  local now = ARGV[2]
+  local schedule = cjson.decode(ARGV[3])
+  local next_run_at = ARGV[4]
+
+${SCHEDULE_DUE_INDEX_LUA}
+
+  -- The same test as migrate(): an indexed id with a 0.7 hash at its old key.
+  if redis.call('SISMEMBER', schedules_index_key, id) == 1
+    and redis.call('TYPE', legacy_schedule_key).ok == 'hash'
+    and redis.call('HGET', legacy_schedule_key, 'id') == id then
+    return redis.error_reply(
+      'Schedule "' .. id .. '" is still stored in the format used before 0.8. ' ..
+      'Stop every process running the previous version, then run migrate() on the Redis adapter.'
+    )
+  end
+
+  local exists = redis.call('EXISTS', schedule_key) == 1
+  local timing_changed = not exists
+  local timing_fields = { 'cron_expression', 'every_ms', 'timezone', 'from_date', 'to_date', 'run_limit' }
+  for _, field in ipairs(timing_fields) do
+    if (redis.call('HGET', schedule_key, field) or '') ~= (schedule[field] or '') then
+      timing_changed = true
+    end
+  end
+
+  local run_count = redis.call('HGET', schedule_key, 'run_count') or '0'
+  local created_at = redis.call('HGET', schedule_key, 'created_at') or now
+  local config_revision = tonumber(redis.call('HGET', schedule_key, 'config_revision') or '0')
+
+  redis.call('HDEL', schedule_key, 'cron_expression', 'every_ms', 'from_date', 'to_date', 'run_limit')
+
+  for field, value in pairs(schedule) do
+    redis.call('HSET', schedule_key, field, value)
+  end
+
+  if not exists then
+    redis.call('HSET', schedule_key, 'status', 'active')
+  end
+
+  if timing_changed then
+    config_revision = config_revision + 1
+    redis.call('HDEL', schedule_key, 'claim_token', 'claimed_at')
+    redis.call('HSET', schedule_key, 'next_run_at', next_run_at)
+  end
+
+  redis.call(
+    'HSET',
+    schedule_key,
+    'run_count',
+    run_count,
+    'created_at',
+    created_at,
+    'config_revision',
+    tostring(config_revision)
+  )
+  redis.call('SADD', schedules_index_key, id)
+  sync_schedule_due_index(schedule_key, due_key, id)
+
+  -- A finished schedule never keeps a claim token, so an empty next run with
+  -- one is a cron claim not finalized yet.
+  local claim_token = redis.call('HGET', schedule_key, 'claim_token') or ''
+  if claim_token ~= '' and redis.call('HGET', schedule_key, 'next_run_at') == '' then
+    return {
+      claim_token,
+      tostring(config_revision),
+      redis.call('HGET', schedule_key, 'claimed_at') or ''
+    }
+  end
+
+  return false
+`
+
+/**
+ * Atomically updates schedule runtime fields and synchronizes the derived due
+ * index from the resulting canonical hash.
+ */
+export const UPDATE_SCHEDULE_SCRIPT = `
+  local schedule_key = KEYS[1]
+  local due_key = KEYS[2]
+  local id = ARGV[1]
+  local updates = cjson.decode(ARGV[2])
+
+${SCHEDULE_DUE_INDEX_LUA}
+
+  if redis.call('EXISTS', schedule_key) == 0 then
+    redis.call('ZREM', due_key, id)
+    return 0
+  end
+
+  for field, value in pairs(updates) do
+    redis.call('HSET', schedule_key, field, value)
+  end
+
+  -- An explicit next run supersedes an in-flight cron claim, so the claim's
+  -- finalization must not overwrite it.
+  if updates.next_run_at ~= nil then
+    redis.call('HDEL', schedule_key, 'claim_token', 'claimed_at')
+  end
+
+  sync_schedule_due_index(schedule_key, due_key, id)
+
+  return 1
+`
+
+/**
+ * Finalizes the JS-calculated next run for a cron claim only when the same
+ * claimed occurrence still owns the canonical hash.
+ */
+export const FINALIZE_CRON_SCHEDULE_SCRIPT = `
+  local schedule_key = KEYS[1]
+  local due_key = KEYS[2]
+  local id = ARGV[1]
+  local expected_cron_expression = ARGV[2]
+  local expected_config_revision = ARGV[3]
+  local expected_claim_token = ARGV[4]
+  local next_run_at = ARGV[5]
+
+${SCHEDULE_DUE_INDEX_LUA}
+
+  if redis.call('EXISTS', schedule_key) == 0 then
+    redis.call('ZREM', due_key, id)
+    return 0
+  end
+
+  local current_next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
+  local cron_expression = redis.call('HGET', schedule_key, 'cron_expression')
+  local config_revision = redis.call('HGET', schedule_key, 'config_revision') or ''
+  local claim_token = redis.call('HGET', schedule_key, 'claim_token') or ''
+
+  -- Preserve the next run while paused; index synchronization excludes it until resume.
+  if current_next_run_at ~= ''
+    or cron_expression ~= expected_cron_expression
+    or config_revision ~= expected_config_revision
+    or claim_token ~= expected_claim_token then
+    if claim_token == expected_claim_token then
+      redis.call('HDEL', schedule_key, 'claim_token', 'claimed_at')
+    end
+    sync_schedule_due_index(schedule_key, due_key, id)
+    return 0
+  end
+
+  local run_count = tonumber(redis.call('HGET', schedule_key, 'run_count') or '0')
+  local run_limit = tonumber(redis.call('HGET', schedule_key, 'run_limit') or '')
+  local to_date = tonumber(redis.call('HGET', schedule_key, 'to_date') or '')
+  local next_score = tonumber(next_run_at)
+
+  if (run_limit and run_count >= run_limit)
+    or (to_date and next_score and next_score > to_date) then
+    next_run_at = ''
+  end
+
+  redis.call('HSET', schedule_key, 'next_run_at', next_run_at)
+  redis.call('HDEL', schedule_key, 'claim_token', 'claimed_at')
+  sync_schedule_due_index(schedule_key, due_key, id)
+
+  return 1
+`
+
+/**
+ * Atomically migrates schedule storage to the current layout.
+ *
+ * 1. Moves schedule hashes from `schedules::<id>` (0.7 and earlier) to
+ *    `schedules::data::<id>`. A hash already stored at the new key is kept and
+ *    the legacy copy is dropped.
+ * 2. Rebuilds the derived due index from the canonical schedule hashes.
+ *
+ * Legacy keys can overlap new ones: the 0.7 hash of the id `data::x` is stored
+ * at the new key of the id `x`. A key is treated as legacy only when its `id`
+ * field matches, and every legacy hash is removed before any is written back.
+ * The move also runs before the index rebuild because a 0.7 schedule with the
+ * id `due` is stored at the due index key.
+ *
+ * Every destination is validated before anything changes. A destination that
+ * holds anything other than this schedule, such as the `next_run_at`-only hash
+ * a 0.7 cron finalization recreates after a delete, aborts the migration.
+ *
+ * This is an explicit O(N) migration and blocks concurrent Redis commands
+ * until the complete index reflects one consistent point in time.
+ * Returns the number of indexed schedules.
+ */
+export const MIGRATE_SCHEDULES_SCRIPT = `
+  local schedules_index_key = KEYS[1]
+  local due_key = KEYS[2]
+  local schedule_key_prefix = KEYS[3]
+  local legacy_schedule_key_prefix = KEYS[4]
   local ids = redis.call('SMEMBERS', schedules_index_key)
+  local count = 0
+
+  local legacy_schedules = {}
+  local legacy_keys = {}
 
   for i = 1, #ids do
-    local schedule_key = schedule_key_prefix .. ids[i]
+    local id = ids[i]
+    local legacy_key = legacy_schedule_key_prefix .. id
+
+    if redis.call('TYPE', legacy_key).ok == 'hash'
+      and redis.call('HGET', legacy_key, 'id') == id then
+      legacy_schedules[#legacy_schedules + 1] = {
+        id = id,
+        legacy_key = legacy_key,
+        schedule_key = schedule_key_prefix .. id,
+        fields = redis.call('HGETALL', legacy_key),
+      }
+      legacy_keys[legacy_key] = true
+    end
+  end
+
+  for i = 1, #legacy_schedules do
+    local schedule = legacy_schedules[i]
+    local schedule_key = schedule.schedule_key
+
+    -- A destination freed by this migration is not a conflict.
+    if not legacy_keys[schedule_key] and redis.call('EXISTS', schedule_key) == 1 then
+      if redis.call('TYPE', schedule_key).ok ~= 'hash'
+        or redis.call('HGET', schedule_key, 'id') ~= schedule.id then
+        return redis.error_reply(
+          'Cannot migrate schedule "' .. schedule.id .. '": ' .. schedule_key ..
+          ' already exists and does not belong to it. Remove or rename that key, then run migrate() again.'
+        )
+      end
+      schedule.already_migrated = true
+    end
+  end
+
+  for i = 1, #legacy_schedules do
+    redis.call('DEL', legacy_schedules[i].legacy_key)
+  end
+
+  for i = 1, #legacy_schedules do
+    local schedule = legacy_schedules[i]
+    if not schedule.already_migrated then
+      redis.call('HSET', schedule.schedule_key, unpack(schedule.fields))
+    end
+  end
+
+  redis.call('DEL', due_key)
+
+  for i = 1, #ids do
+    local id = ids[i]
+    local schedule_key = schedule_key_prefix .. id
+    local status = redis.call('HGET', schedule_key, 'status')
+    local next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
+    local score = next_run_at and tonumber(next_run_at) or nil
+
+    if status == 'active' and score then
+      redis.call('ZADD', due_key, score, id)
+      count = count + 1
+    end
+  end
+
+  return count
+`
+
+/**
+ * Lua script for atomically claiming a due schedule using a sorted set index.
+ *
+ * Uses ZRANGEBYSCORE on schedules::due (scored by next_run_at) for O(log N)
+ * lookup instead of scanning all schedule hashes via SMEMBERS.
+ *
+ * Stale entries (paused, exhausted, deleted) are cleaned from the ZSET on
+ * sight so subsequent calls skip them.
+ *
+ * KEYS[1] = schedules::due (the ZSET)
+ * KEYS[2] = schedule key prefix (e.g. "schedules::data::")
+ * ARGV[1] = now (epoch milliseconds)
+ */
+export const CLAIM_SCHEDULE_SCRIPT = `
+  local due_key = KEYS[1]
+  local prefix = KEYS[2]
+  local now = tonumber(ARGV[1])
+  local claim_token = ARGV[2]
+
+  while true do
+    local candidates = redis.call('ZRANGEBYSCORE', due_key, '-inf', tostring(now), 'LIMIT', 0, 1)
+
+    if #candidates == 0 then
+      return nil
+    end
+
+    local id = candidates[1]
+    local schedule_key = prefix .. id
 
     -- Get schedule data
     local data = redis.call('HGETALL', schedule_key)
-    if #data > 0 then
+
+    -- Deleted schedule still in ZSET
+    if #data == 0 then
+      redis.call('ZREM', due_key, id)
+    else
       -- Convert HGETALL result to table
       local schedule = {}
       for j = 1, #data, 2 do
         schedule[data[j]] = data[j + 1]
       end
 
-      -- Check if schedule is due
-      if schedule.status == 'active' then
-        local next_run_at = tonumber(schedule.next_run_at)
-
-        if next_run_at and next_run_at <= now then
+      -- Check if schedule is active
+      if schedule.status ~= 'active' then
+        redis.call('ZREM', due_key, id)
+      else
+        -- Hash is the source of truth for next_run_at.
+        -- If the ZSET score is stale, repair it and skip this candidate.
+        local hash_nra = schedule.next_run_at
+        local hash_score = hash_nra and tonumber(hash_nra) or nil
+        if not hash_score then
+          redis.call('ZREM', due_key, id)
+        elseif hash_score > now then
+          redis.call('ZADD', due_key, hash_score, id)
+        else
           local run_count = tonumber(schedule.run_count or '0')
           local run_limit = schedule.run_limit and tonumber(schedule.run_limit) or nil
           local to_date = schedule.to_date and tonumber(schedule.to_date) or nil
 
           -- Check limits
-          if not (run_limit and run_count >= run_limit) and not (to_date and now > to_date) then
+          if (run_limit and run_count >= run_limit) or (to_date and now > to_date) then
+            redis.call('ZREM', due_key, id)
+          else
             -- This schedule is claimable - atomically update it
             local new_run_count = run_count + 1
+            local new_claim_token = ''
+            local new_claimed_at = ''
 
             -- Calculate new next_run_at (simple interval-based for now)
             -- Complex cron calculation happens in the caller
@@ -535,6 +890,9 @@ export const CLAIM_SCHEDULE_SCRIPT = `
             local every_ms = schedule.every_ms and tonumber(schedule.every_ms) or nil
             if every_ms then
               new_next_run_at = tostring(now + every_ms)
+            elseif schedule.cron_expression then
+              new_claim_token = claim_token
+              new_claimed_at = tostring(now)
             end
 
             -- Check if we've hit the limit after this run
@@ -551,7 +909,16 @@ export const CLAIM_SCHEDULE_SCRIPT = `
             redis.call('HSET', schedule_key,
               'next_run_at', new_next_run_at,
               'last_run_at', tostring(now),
-              'run_count', tostring(new_run_count))
+              'run_count', tostring(new_run_count),
+              'claim_token', new_claim_token,
+              'claimed_at', new_claimed_at)
+
+            -- Update or remove from ZSET
+            if new_next_run_at ~= '' then
+              redis.call('ZADD', due_key, tonumber(new_next_run_at), id)
+            else
+              redis.call('ZREM', due_key, id)
+            end
 
             -- Return the schedule data (before update) as JSON
             return cjson.encode(schedule)
@@ -560,6 +927,4 @@ export const CLAIM_SCHEDULE_SCRIPT = `
       end
     end
   end
-
-  return nil
 `

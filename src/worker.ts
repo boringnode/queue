@@ -15,7 +15,9 @@ import {
   DEFAULT_IDLE_DELAY,
   DEFAULT_STALLED_INTERVAL,
   DEFAULT_STALLED_THRESHOLD,
+  DEFAULT_UNKNOWN_JOB_RETRIES,
 } from './constants.js'
+import * as errors from './exceptions.js'
 
 /**
  * Job processing worker.
@@ -30,7 +32,8 @@ import {
  *
  * @example
  * ```typescript
- * import { Worker, redis } from '@boringnode/queue'
+ * import { Worker } from '@boringnode/queue'
+ * import { redis } from '@boringnode/queue/drivers/redis_adapter'
  *
  * const worker = new Worker({
  *   default: 'redis',
@@ -57,6 +60,9 @@ export class Worker {
   #session?: WorkerSession
   #stopOperation?: Promise<void>
   #shutdownGeneration = 0
+
+  /** The Worker whose `start()` is running in this process. */
+  static #running?: Worker
   #shutdownHandler?: () => Promise<void>
 
   /** Unique identifier for this worker instance. */
@@ -78,6 +84,16 @@ export class Worker {
       stalledThreshold: parse(config.worker?.stalledThreshold ?? DEFAULT_STALLED_THRESHOLD),
       maxStalledCount: config.worker?.maxStalledCount ?? 1,
       concurrency: config.worker?.concurrency ?? 1,
+      unknownJobRetries: config.worker?.unknownJobRetries ?? DEFAULT_UNKNOWN_JOB_RETRIES,
+    }
+
+    if (
+      !Number.isInteger(this.#sessionSettings.unknownJobRetries) ||
+      this.#sessionSettings.unknownJobRetries < 0
+    ) {
+      throw new errors.E_CONFIGURATION_ERROR([
+        'worker.unknownJobRetries must be a non-negative integer',
+      ])
     }
     this.#gracefulShutdown = config.worker?.gracefulShutdown ?? true
     this.#onShutdownSignal = config.worker?.onShutdownSignal
@@ -129,21 +145,53 @@ export class Worker {
    * This method blocks until the Worker is stopped. Jobs are processed
    * concurrently up to the configured concurrency limit.
    *
+   * Run one Worker per process: starting a second one while another runs
+   * throws, since initializing it would destroy the Adapters of the first.
+   * A Worker holds the process from `start()` until its `stop()` completes.
+   *
    * @param queues - Queue names to process in priority order
    */
   async start(queues: string[] = ['default']): Promise<void> {
-    while (this.#stopOperation) {
-      await this.#stopOperation
+    this.#reserveProcess()
+
+    let session: WorkerSession
+
+    try {
+      while (this.#stopOperation) {
+        await this.#stopOperation
+      }
+
+      // A stop that completed meanwhile released the process.
+      this.#reserveProcess()
+
+      const shutdownGeneration = this.#shutdownGeneration
+      await this.init()
+
+      if (shutdownGeneration !== this.#shutdownGeneration) return
+
+      session = this.#useSession(queues)
+      this.#setupGracefulShutdown()
+    } catch (error) {
+      // Nothing runs for this Worker yet: another one can start.
+      if (!this.#session) this.#releaseProcess()
+      throw error
     }
 
-    const shutdownGeneration = this.#shutdownGeneration
-    await this.init()
-
-    if (shutdownGeneration !== this.#shutdownGeneration) return
-
-    const session = this.#useSession(queues)
-    this.#setupGracefulShutdown()
     await session.start()
+  }
+
+  #reserveProcess(): void {
+    if (Worker.#running && Worker.#running !== this) {
+      throw new errors.E_WORKER_ALREADY_RUNNING()
+    }
+
+    Worker.#running = this
+  }
+
+  #releaseProcess(): void {
+    if (Worker.#running === this) {
+      Worker.#running = undefined
+    }
   }
 
   /**
@@ -191,6 +239,9 @@ export class Worker {
     }
 
     this.#removeShutdownHandlers()
+
+    // Every job has been finalized: the Adapters are no longer needed.
+    this.#releaseProcess()
   }
 
   /**
@@ -249,6 +300,7 @@ export class Worker {
       jobExecutionRuntime: this.#jobExecutionRuntime,
       scheduleDispatcher: jobDispatchRuntime,
       wrapInternal: this.#wrapInternal,
+      logger: QueueManager.getLogger(),
       settings: this.#sessionSettings,
     })
 

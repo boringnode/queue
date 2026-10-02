@@ -8,8 +8,8 @@ import { Locator } from './locator.js'
 import type { SingleJobDispatchRequest } from './job_dispatch_runtime.js'
 import type { Adapter, AcquiredJob } from './contracts/adapter.js'
 import type { JobExecutionOutcome, JobExecutionRuntime } from './job_runtime.js'
-import type { WorkerCycle } from './types/main.js'
-import { DEFAULT_ERROR_RETRY_DELAY } from './constants.js'
+import type { Logger, WorkerCycle } from './types/main.js'
+import { DEFAULT_ERROR_RETRY_DELAY, UNKNOWN_JOB_RETRY_DELAY } from './constants.js'
 
 type StartedCycle = Extract<WorkerCycle, { type: 'started' }>
 type SessionMode = 'continuous' | 'manual'
@@ -20,7 +20,7 @@ interface PoolFillResult {
 }
 
 export type InternalOperationWrapper = HeartbeatOperationWrapper
-export type JobExecutor = Pick<JobExecutionRuntime, 'execute'>
+export type JobExecutor = Pick<JobExecutionRuntime, 'execute' | 'failStalled'>
 export interface ScheduleDispatcher {
   dispatch(request: SingleJobDispatchRequest): Promise<unknown>
 }
@@ -31,6 +31,7 @@ export interface WorkerSessionSettings {
   stalledInterval: number
   stalledThreshold: number
   maxStalledCount: number
+  unknownJobRetries: number
 }
 
 export interface WorkerSessionOptions {
@@ -40,6 +41,7 @@ export interface WorkerSessionOptions {
   jobExecutionRuntime: JobExecutor
   scheduleDispatcher: ScheduleDispatcher
   wrapInternal: InternalOperationWrapper
+  logger: Logger
   settings: WorkerSessionSettings
 }
 
@@ -58,6 +60,7 @@ export class WorkerSession {
   readonly #jobExecutionRuntime: JobExecutor
   readonly #scheduleDispatcher: ScheduleDispatcher
   readonly #wrapInternal: InternalOperationWrapper
+  readonly #logger: Logger
   readonly #settings: WorkerSessionSettings
   readonly #heartbeat: WorkerHeartbeat
 
@@ -71,6 +74,7 @@ export class WorkerSession {
   #stopOperation?: Promise<void>
   #pool = new JobPool()
   #fillOperation?: Promise<PoolFillResult>
+  #stalledCheckOperation?: Promise<void>
   #completionOperation?: Promise<PoolEntry>
   #completedEntry?: PoolEntry
   #completionDelayController?: AbortController
@@ -84,6 +88,7 @@ export class WorkerSession {
     this.#jobExecutionRuntime = options.jobExecutionRuntime
     this.#scheduleDispatcher = options.scheduleDispatcher
     this.#wrapInternal = options.wrapInternal
+    this.#logger = options.logger
     this.#settings = options.settings
     this.#heartbeat = new WorkerHeartbeat({
       workerId: options.workerId,
@@ -127,7 +132,10 @@ export class WorkerSession {
         const delay = parse(cycle.suggestedDelay)
 
         if (cycle.type === 'error') {
-          debug('worker %s encountered an error: %O', this.#workerId, cycle.error)
+          this.#logger.error(
+            { err: cycle.error, workerId: this.#workerId },
+            `Worker cycle failed, next attempt in ${delay}ms`
+          )
         } else {
           debug('worker %s is idle, waiting for %dms', this.#workerId, delay)
         }
@@ -197,6 +205,12 @@ export class WorkerSession {
     if (this.#fillOperation) {
       debug('worker %s: waiting for in-flight job acquisitions to complete', this.#workerId)
       await this.#fillOperation.catch(() => {})
+    }
+
+    // A recovery in flight can still add reacquired stalled jobs to the pool.
+    if (this.#stalledCheckOperation) {
+      debug('worker %s: waiting for the in-flight stalled job check to complete', this.#workerId)
+      await this.#stalledCheckOperation.catch(() => {})
     }
 
     if (!this.#pool.isEmpty()) {
@@ -438,7 +452,17 @@ export class WorkerSession {
     debug('worker %s: executing job %s (%s)', this.#workerId, job.id, job.name)
 
     const outcome = await this.#jobExecutionRuntime.execute(job, queue)
-    await this.#finalizeExecution(job, queue, outcome)
+
+    try {
+      await this.#finalizeExecution(job, queue, outcome)
+    } finally {
+      // The job is finalized, but its timed out handler still runs: it keeps
+      // its slot, so concurrency and stop() account for it until it returns.
+      if ('timedOutExecution' in outcome && outcome.timedOutExecution) {
+        debug('worker %s: waiting for timed out job %s to return', this.#workerId, job.id)
+        await outcome.timedOutExecution
+      }
+    }
 
     if (outcome.type === 'completed') {
       debug(
@@ -456,23 +480,34 @@ export class WorkerSession {
     outcome: JobExecutionOutcome
   ): Promise<void> {
     if (outcome.type === 'completed') {
-      await this.#wrapInternal(() =>
-        this.#adapter.completeJob(job.id, queue, outcome.removeOnComplete)
+      this.#checkLease(
+        job,
+        await this.#wrapInternal(() =>
+          this.#adapter.completeJob(job, queue, outcome.removeOnComplete)
+        )
       )
       return
     }
 
     if (outcome.type === 'initialization-failed') {
+      if (outcome.jobNotFound && (await this.#requeueUnknownJob(job, queue))) return
+
       debug('worker %s: failed to initialize job %s (%s)', this.#workerId, job.id, job.name)
-      await this.#wrapInternal(() =>
-        this.#adapter.failJob(job.id, queue, outcome.error, outcome.removeOnFail)
+      this.#checkLease(
+        job,
+        await this.#wrapInternal(() =>
+          this.#adapter.failJob(job, queue, outcome.error, outcome.removeOnFail)
+        )
       )
       return
     }
 
     if (outcome.type === 'failed') {
-      await this.#wrapInternal(() =>
-        this.#adapter.failJob(job.id, queue, outcome.error, outcome.removeOnFail)
+      this.#checkLease(
+        job,
+        await this.#wrapInternal(() =>
+          this.#adapter.failJob(job, queue, outcome.error, outcome.removeOnFail)
+        )
       )
 
       if (outcome.failedHookError) {
@@ -489,10 +524,57 @@ export class WorkerSession {
         job.id,
         outcome.retryAt.toISOString()
       )
-      await this.#wrapInternal(() => this.#adapter.retryJob(job.id, queue, outcome.retryAt))
+      this.#checkLease(
+        job,
+        await this.#wrapInternal(() => this.#adapter.retryJob(job, queue, outcome.retryAt))
+      )
     } else {
-      await this.#wrapInternal(() => this.#adapter.retryJob(job.id, queue))
+      this.#checkLease(job, await this.#wrapInternal(() => this.#adapter.retryJob(job, queue)))
     }
+  }
+
+  /**
+   * Put a job whose class this worker does not know back in the queue, a
+   * bounded number of times. During a rolling deploy, an old worker can take
+   * a job dispatched by new code: a worker that knows it runs it later.
+   * Other initialization failures are bugs, and retrying them changes nothing:
+   * the runtime sets `jobNotFound` only when no class has the job name.
+   *
+   * @returns Whether the job was handled here: false once the limit is
+   * reached, so the caller fails it. A lost lease counts as handled.
+   */
+  async #requeueUnknownJob(job: AcquiredJob, queue: string): Promise<boolean> {
+    const limit = this.#settings.unknownJobRetries
+    if (job.attempts >= limit) return false
+
+    const retryAt = new Date(Date.now() + UNKNOWN_JOB_RETRY_DELAY)
+    const requeued = await this.#wrapInternal(() => this.#adapter.retryJob(job, queue, retryAt))
+    this.#checkLease(job, requeued)
+
+    if (requeued) {
+      this.#logger.warn(
+        `Job "${job.name}" (${job.id}) is not registered on this worker. It went back to queue ` +
+          `"${queue}" and runs again in ${UNKNOWN_JOB_RETRY_DELAY / 1000}s ` +
+          `(${job.attempts + 1}/${limit}).`
+      )
+    }
+
+    return true
+  }
+
+  /**
+   * The adapter changes nothing once a job has been recovered as stalled and
+   * acquired again or finalized: the execution that holds it now decides.
+   */
+  #checkLease(job: AcquiredJob, applied: boolean): void {
+    if (applied) return
+
+    debug(
+      'worker %s: job %s (%s) lost its lease before finishing, its outcome is ignored',
+      this.#workerId,
+      job.id,
+      job.name
+    )
   }
 
   async #acquireNextJob(): Promise<{ job: AcquiredJob; queue: string } | null> {
@@ -517,12 +599,31 @@ export class WorkerSession {
 
     this.#lastStalledCheck = now
 
+    const stalledCheckOperation = this.#recoverStalledJobs()
+    this.#stalledCheckOperation = stalledCheckOperation
+
+    try {
+      await stalledCheckOperation
+    } finally {
+      if (this.#stalledCheckOperation === stalledCheckOperation) {
+        this.#stalledCheckOperation = undefined
+      }
+    }
+  }
+
+  async #recoverStalledJobs(): Promise<void> {
     for (const queue of this.#queues) {
-      const recovered = await this.#wrapInternal(() =>
+      if (!this.#running) return
+
+      // Only reacquire as many exceeded jobs as there are free slots. The
+      // others stay stalled and are picked up by a later recovery.
+      const freeSlots = Math.max(this.#settings.concurrency - this.#pool.size, 0)
+      const { recovered, exceeded } = await this.#wrapInternal(() =>
         this.#adapter.recoverStalledJobs(
           queue,
           this.#settings.stalledThreshold,
-          this.#settings.maxStalledCount
+          this.#settings.maxStalledCount,
+          freeSlots
         )
       )
 
@@ -534,7 +635,25 @@ export class WorkerSession {
           queue
         )
       }
+
+      // The adapter reacquired these jobs for this worker. Failing them runs
+      // through the pool like an execution, so the heartbeat keeps their lease
+      // while failed() runs and stop() waits for them. A job left active by an
+      // error stalls again and comes back on a later recovery.
+      for (const job of exceeded) {
+        debug('worker %s: failing job %s after it stalled too many times', this.#workerId, job.id)
+        this.#pool.add(job, queue, this.#failStalled(job, queue))
+      }
     }
+  }
+
+  async #failStalled(job: AcquiredJob, queue: string): Promise<void> {
+    const outcome = await this.#jobExecutionRuntime.failStalled(
+      job,
+      queue,
+      this.#settings.maxStalledCount
+    )
+    await this.#finalizeExecution(job, queue, outcome)
   }
 
   async #dispatchDueSchedules(): Promise<void> {

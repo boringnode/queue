@@ -1,5 +1,5 @@
 import { test as JapaTest } from '@japa/runner'
-import type { Adapter } from '../../src/contracts/adapter.js'
+import type { AcquiredJob, Adapter, JobLease } from '../../src/contracts/adapter.js'
 
 interface DriverTestSuiteOptions {
   test: typeof JapaTest
@@ -18,8 +18,38 @@ interface DriverTestSuiteOptions {
   supportsAtomicDedup?: boolean
 }
 
+/** A lease on a job that was never acquired. */
+function unleased(id: string): JobLease {
+  return { id, leaseToken: 'worker-1:never-acquired' }
+}
+
+/**
+ * Acquire a job, let it stall and be recovered, then acquire it again with
+ * the same worker: the first lease is stale, the second one is current.
+ */
+async function acquireTwice(
+  adapter: Adapter
+): Promise<{ stale: AcquiredJob; current: AcquiredJob }> {
+  await adapter.pushOn('test-queue', { id: 'job-1', name: 'TestJob', payload: {}, attempts: 0 })
+
+  const stale = await adapter.popFrom('test-queue')
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const { recovered } = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
+  if (recovered !== 1) throw new Error('The job was not recovered')
+
+  const current = await adapter.popFrom('test-queue')
+  return { stale: stale!, current: current! }
+}
+
 export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
   const { test } = options
+
+  test('migrate should be safe to call repeatedly', async () => {
+    const adapter = await options.createAdapter()
+
+    await adapter.migrate()
+    await adapter.migrate()
+  })
 
   test('popFrom should return null when queue is empty', async ({ assert }) => {
     const adapter = await options.createAdapter()
@@ -82,10 +112,10 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const job = await adapter.popFrom('test-queue')
     assert.isNotNull(job)
 
-    await adapter.completeJob(job!.id, 'test-queue')
+    await adapter.completeJob(job!, 'test-queue')
 
     // Retry should have no effect since job is no longer active
-    await adapter.retryJob(job!.id, 'test-queue')
+    await adapter.retryJob(job!, 'test-queue')
 
     const nextJob = await adapter.popFrom('test-queue')
     assert.isNull(nextJob)
@@ -195,7 +225,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     const job = await adapter.popFrom('test-queue')
     const beforeComplete = Date.now()
-    await adapter.completeJob(job!.id, 'test-queue', false)
+    await adapter.completeJob(job!, 'test-queue', false)
     const afterComplete = Date.now()
 
     const record = await adapter.getJob(job!.id, 'test-queue')
@@ -219,7 +249,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     })
 
     const job = await adapter.popFrom('test-queue')
-    await adapter.failJob(job!.id, 'test-queue', new Error('Something went wrong'), false)
+    await adapter.failJob(job!, 'test-queue', new Error('Something went wrong'), false)
 
     const record = await adapter.getJob(job!.id, 'test-queue')
 
@@ -243,7 +273,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const job = await adapter.popFrom('test-queue')
     assert.isNotNull(job)
 
-    await adapter.completeJob(job!.id, 'test-queue', false)
+    await adapter.completeJob(job!, 'test-queue', false)
 
     const record = await adapter.getJob(job!.id, 'test-queue')
     assert.isNotNull(record)
@@ -264,7 +294,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const job = await adapter.popFrom('test-queue')
     assert.isNotNull(job)
 
-    await adapter.completeJob(job!.id, 'test-queue', true)
+    await adapter.completeJob(job!, 'test-queue', true)
 
     const record = await adapter.getJob(job!.id, 'test-queue')
     assert.isNull(record)
@@ -285,7 +315,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.isNotNull(job1)
     assert.equal(job1!.attempts, 0)
 
-    await adapter.retryJob(job1!.id, 'test-queue')
+    await adapter.retryJob(job1!, 'test-queue')
 
     const job2 = await adapter.popFrom('test-queue')
     assert.isNotNull(job2)
@@ -308,7 +338,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.isNotNull(job)
 
     const futureDate = new Date(Date.now() + 60000) // 1 minute in future
-    await adapter.retryJob(job!.id, 'test-queue', futureDate)
+    await adapter.retryJob(job!, 'test-queue', futureDate)
 
     // Job should not be immediately available
     const nextJob = await adapter.popFrom('test-queue')
@@ -329,10 +359,10 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const job = await adapter.popFrom('test-queue')
     assert.isNotNull(job)
 
-    await adapter.failJob(job!.id, 'test-queue', new Error('Test error'))
+    await adapter.failJob(job!, 'test-queue', new Error('Test error'))
 
     // Retry should have no effect since job is no longer active
-    await adapter.retryJob(job!.id, 'test-queue')
+    await adapter.retryJob(job!, 'test-queue')
 
     const nextJob = await adapter.popFrom('test-queue')
     assert.isNull(nextJob)
@@ -352,7 +382,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const job = await adapter.popFrom('test-queue')
     assert.isNotNull(job)
 
-    await adapter.failJob(job!.id, 'test-queue', new Error('Test error'), false)
+    await adapter.failJob(job!, 'test-queue', new Error('Test error'), false)
 
     const record = await adapter.getJob(job!.id, 'test-queue')
     assert.isNotNull(record)
@@ -382,8 +412,8 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.isNotNull(job1)
     assert.isNotNull(job2)
 
-    await adapter.completeJob(job1!.id, 'test-queue', { count: 1 })
-    await adapter.completeJob(job2!.id, 'test-queue', { count: 1 })
+    await adapter.completeJob(job1!, 'test-queue', { count: 1 })
+    await adapter.completeJob(job2!, 'test-queue', { count: 1 })
 
     const record1 = await adapter.getJob(job1!.id, 'test-queue')
     const record2 = await adapter.getJob(job2!.id, 'test-queue')
@@ -413,14 +443,14 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const job1 = await adapter.popFrom('test-queue')
     assert.isNotNull(job1)
 
-    await adapter.completeJob(job1!.id, 'test-queue', { age: '1ms' })
+    await adapter.completeJob(job1!, 'test-queue', { age: '1ms' })
 
     await new Promise((resolve) => setTimeout(resolve, 5))
 
     const job2 = await adapter.popFrom('test-queue')
     assert.isNotNull(job2)
 
-    await adapter.completeJob(job2!.id, 'test-queue', { age: '1ms' })
+    await adapter.completeJob(job2!, 'test-queue', { age: '1ms' })
 
     const record1 = await adapter.getJob(job1!.id, 'test-queue')
     const record2 = await adapter.getJob(job2!.id, 'test-queue')
@@ -468,7 +498,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     adapter.setWorkerId('worker-1')
 
     // No jobs at all
-    const recovered = await adapter.recoverStalledJobs('test-queue', 1000, 1)
+    const { recovered } = await adapter.recoverStalledJobs('test-queue', 1000, 1, 100)
     assert.equal(recovered, 0)
   })
 
@@ -488,7 +518,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.isNotNull(job)
 
     // Try to recover with a long threshold (job is not stalled yet)
-    const recovered = await adapter.recoverStalledJobs('test-queue', 60000, 1)
+    const { recovered } = await adapter.recoverStalledJobs('test-queue', 60000, 1, 100)
     assert.equal(recovered, 0)
 
     // Job should still be active, not back in pending
@@ -512,7 +542,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     // Wait a bit and recover with a very short threshold
     await new Promise((resolve) => setTimeout(resolve, 50))
-    const recovered = await adapter.recoverStalledJobs('test-queue', 10, 1)
+    const { recovered } = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
     assert.equal(recovered, 1)
 
     // Job should be back in pending queue
@@ -541,7 +571,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     await adapter.popFrom('test-queue')
     await new Promise((resolve) => setTimeout(resolve, 20))
-    await adapter.recoverStalledJobs('test-queue', 10, 3)
+    await adapter.recoverStalledJobs('test-queue', 10, 3, 100)
 
     const recovered = await adapter.popFrom('test-queue')
 
@@ -569,7 +599,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     // First stall cycle
     await adapter.popFrom('test-queue')
     await new Promise((resolve) => setTimeout(resolve, 50))
-    await adapter.recoverStalledJobs('test-queue', 10, 3)
+    await adapter.recoverStalledJobs('test-queue', 10, 3, 100)
 
     const job1 = await adapter.popFrom('test-queue')
     assert.isNotNull(job1)
@@ -577,14 +607,59 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     // Second stall cycle
     await new Promise((resolve) => setTimeout(resolve, 50))
-    await adapter.recoverStalledJobs('test-queue', 10, 3)
+    await adapter.recoverStalledJobs('test-queue', 10, 3, 100)
 
     const job2 = await adapter.popFrom('test-queue')
     assert.isNotNull(job2)
     assert.equal(job2!.stalledCount, 2)
   })
 
-  test('recoverStalledJobs should fail job permanently when maxStalledCount exceeded', async ({
+  test('recoverStalledJobs should hand back jobs that exceeded maxStalledCount', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('test-queue', {
+      id: 'job-1',
+      name: 'TestJob',
+      payload: { foo: 'bar' },
+      attempts: 0,
+      stalledCount: 0,
+    })
+
+    // First stall - recovered back to pending (stalledCount becomes 1)
+    await adapter.popFrom('test-queue')
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const first = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
+    assert.equal(first.recovered, 1)
+    assert.deepEqual(first.exceeded, [])
+
+    // Second stall - exceeds maxStalledCount=1 and is reacquired by the recovering worker
+    const stalled = await adapter.popFrom('test-queue')
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    adapter.setWorkerId('recovering-worker')
+    const before = Date.now()
+    const second = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
+
+    assert.equal(second.recovered, 0)
+    assert.lengthOf(second.exceeded, 1)
+    assert.equal(second.exceeded[0].id, 'job-1')
+    assert.deepEqual(second.exceeded[0].payload, { foo: 'bar' })
+    assert.equal(second.exceeded[0].stalledCount, 1)
+    assert.isAtLeast(second.exceeded[0].acquiredAt, before)
+
+    // The job stays active: it is neither pending nor removed
+    assert.isNull(await adapter.popFrom('test-queue'))
+    assert.equal((await adapter.getJob('job-1', 'test-queue'))!.status, 'active')
+
+    // Only the recovering worker holds the lease now
+    assert.match(second.exceeded[0].leaseToken, /^recovering-worker:/)
+    assert.equal(await adapter.renewJobs('test-queue', [second.exceeded[0]]), 1)
+    assert.equal(await adapter.renewJobs('test-queue', [stalled!]), 0)
+  })
+
+  test('recoverStalledJobs should hand back an exceeded job again if it is not failed', async ({
     assert,
   }) => {
     const adapter = await options.createAdapter()
@@ -595,24 +670,81 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: {},
       attempts: 0,
-      stalledCount: 0,
+      stalledCount: 1,
     })
 
-    // First stall - should recover (stalledCount becomes 1)
     await adapter.popFrom('test-queue')
     await new Promise((resolve) => setTimeout(resolve, 50))
-    let recovered = await adapter.recoverStalledJobs('test-queue', 10, 1)
-    assert.equal(recovered, 1)
+    const first = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
+    assert.lengthOf(first.exceeded, 1)
 
-    // Second stall - should fail permanently (stalledCount would be 2, exceeds maxStalledCount=1)
+    // The recovering worker crashed before failing it: the job stalls again
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const second = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
+    assert.equal(second.recovered, 0)
+    assert.lengthOf(second.exceeded, 1)
+    assert.equal(second.exceeded[0].id, 'job-1')
+    assert.equal(second.exceeded[0].stalledCount, 1)
+  })
+
+  test('recoverStalledJobs should reacquire at most maxExceeded exceeded jobs', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    for (const id of ['job-1', 'job-2']) {
+      await adapter.pushOn('test-queue', {
+        id,
+        name: 'TestJob',
+        payload: {},
+        attempts: 0,
+        stalledCount: 1,
+      })
+      await adapter.popFrom('test-queue')
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    adapter.setWorkerId('recovering-worker')
+
+    // No free slot: exceeded jobs are left stalled
+    const none = await adapter.recoverStalledJobs('test-queue', 10, 1, 0)
+    assert.deepEqual(none.exceeded, [])
+
+    const { exceeded } = await adapter.recoverStalledJobs('test-queue', 10, 1, 1)
+    assert.lengthOf(exceeded, 1)
+
+    // Only the returned job was reacquired; the other one is left untouched
+    const other = exceeded[0].id === 'job-1' ? 'job-2' : 'job-1'
+    assert.equal(await adapter.renewJobs('test-queue', [exceeded[0]]), 1)
+    assert.equal(
+      await adapter.renewJobs('test-queue', [{ id: other, leaseToken: exceeded[0].leaseToken }]),
+      0
+    )
+  })
+
+  test('failJob should finalize a job handed back by recoverStalledJobs', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    await adapter.pushOn('test-queue', {
+      id: 'job-1',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      stalledCount: 1,
+    })
+
     await adapter.popFrom('test-queue')
     await new Promise((resolve) => setTimeout(resolve, 50))
-    recovered = await adapter.recoverStalledJobs('test-queue', 10, 1)
-    assert.equal(recovered, 0) // Not recovered, but failed
+    const { exceeded } = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
+    assert.lengthOf(exceeded, 1)
 
-    // Job should be gone (failed permanently)
-    const nextJob = await adapter.popFrom('test-queue')
-    assert.isNull(nextJob)
+    await adapter.failJob(exceeded[0], 'test-queue', new Error('stalled'), false)
+
+    const record = await adapter.getJob('job-1', 'test-queue')
+    assert.equal(record!.status, 'failed')
+    assert.equal(record!.error, 'stalled')
   })
 
   test('recoverStalledJobs should handle multiple stalled jobs', async ({ assert }) => {
@@ -638,7 +770,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     // Recover all stalled jobs
     await new Promise((resolve) => setTimeout(resolve, 50))
-    const recovered = await adapter.recoverStalledJobs('test-queue', 10, 1)
+    const { recovered } = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
     assert.equal(recovered, 2)
 
     // Both jobs should be back
@@ -677,7 +809,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     await new Promise((resolve) => setTimeout(resolve, 50))
 
-    const recoveredA = await adapter.recoverStalledJobs('queue-a', 10, 1)
+    const { recovered: recoveredA } = await adapter.recoverStalledJobs('queue-a', 10, 1, 100)
     assert.equal(recoveredA, 1)
 
     const recoveredJobA = await adapter.popFrom('queue-a')
@@ -689,7 +821,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     await new Promise((resolve) => setTimeout(resolve, 50))
 
-    const recoveredB = await adapter.recoverStalledJobs('queue-b', 10, 1)
+    const { recovered: recoveredB } = await adapter.recoverStalledJobs('queue-b', 10, 1, 100)
     assert.equal(recoveredB, 1)
 
     const recoveredJobB = await adapter.popFrom('queue-b')
@@ -703,31 +835,36 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')
 
-    await adapter.pushOn('test-queue', {
-      id: 'long-running',
-      name: 'TestJob',
-      payload: {},
-      attempts: 0,
-    })
-
-    const job = await adapter.popFrom('test-queue')
-    assert.isNotNull(job)
-
-    // Keep renewing the job while it "runs" longer than the stalled threshold.
-    for (let i = 0; i < 5; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 20))
-      const renewed = await adapter.renewJobs('test-queue', ['long-running'])
-      assert.equal(renewed, 1)
-
-      // Even though more than 30ms has elapsed in total, the job is never
-      // stalled because each renewal refreshes its acquired timestamp.
-      const recovered = await adapter.recoverStalledJobs('test-queue', 30, 1)
-      assert.equal(recovered, 0)
+    for (const id of ['long-running', 'not-renewed']) {
+      await adapter.pushOn('test-queue', { id, name: 'TestJob', payload: {}, attempts: 0 })
     }
 
-    // Still active, not back in pending.
-    const pending = await adapter.popFrom('test-queue')
-    assert.isNull(pending)
+    // Jobs pushed in the same millisecond can be acquired in either order.
+    const acquired = [await adapter.popFrom('test-queue'), await adapter.popFrom('test-queue')]
+    const job = acquired.find((candidate) => candidate?.id === 'long-running')
+    assert.isDefined(job)
+
+    // Both jobs run longer than the 200ms stalled threshold; only one is renewed.
+    // A slow run only makes the control job more stalled, and the renewed job
+    // has a 200ms margin between each renewal and the next recovery.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(await adapter.renewJobs('test-queue', [job!]), 1)
+
+    const first = await adapter.recoverStalledJobs('test-queue', 200, 1, 100)
+
+    // The control job proves the threshold had passed; the renewed job stays active.
+    assert.equal(first.recovered, 1)
+    assert.equal((await adapter.getJob('long-running', 'test-queue'))!.status, 'active')
+    assert.equal((await adapter.getJob('not-renewed', 'test-queue'))!.status, 'pending')
+
+    // 300ms after the first renewal, the job would be stalled again: only the
+    // second renewal, with the same lease, keeps it active.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(await adapter.renewJobs('test-queue', [job!]), 1)
+
+    const second = await adapter.recoverStalledJobs('test-queue', 200, 1, 100)
+    assert.equal(second.recovered, 0)
+    assert.equal((await adapter.getJob('long-running', 'test-queue'))!.status, 'active')
   })
 
   test('renewJobs should only renew jobs that are still active', async ({ assert }) => {
@@ -746,11 +883,11 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
     // Let it stall and recover it back to pending.
     await new Promise((resolve) => setTimeout(resolve, 30))
-    const recovered = await adapter.recoverStalledJobs('test-queue', 10, 1)
+    const { recovered } = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
     assert.equal(recovered, 1)
 
     // A late heartbeat for the (no longer active) job must not resurrect it.
-    const renewed = await adapter.renewJobs('test-queue', ['job-1'])
+    const renewed = await adapter.renewJobs('test-queue', [job!])
     assert.equal(renewed, 0)
 
     // The recovered job is still pending and can be acquired exactly once.
@@ -767,10 +904,10 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     await adapter.pushOn('queue-b', { id: 'job-b', name: 'TestJob', payload: null, attempts: 0 })
 
     await adapter.popFrom('queue-a')
-    await adapter.popFrom('queue-b')
+    const jobB = await adapter.popFrom('queue-b')
 
     // job-b is active on queue-b, so renewing it on queue-a renews nothing.
-    const renewed = await adapter.renewJobs('queue-a', ['job-b'])
+    const renewed = await adapter.renewJobs('queue-a', [jobB!])
     assert.equal(renewed, 0)
   })
 
@@ -796,7 +933,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     })
 
     const job = await adapter.popFrom('test-queue')
-    await adapter.completeJob(job!.id, 'test-queue')
+    await adapter.completeJob(job!, 'test-queue')
 
     const record = await adapter.getJob(job!.id, 'test-queue')
     assert.isNull(record)
@@ -816,7 +953,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     })
 
     const job = await adapter.popFrom('test-queue')
-    await adapter.failJob(job!.id, 'test-queue', new Error('fail'))
+    await adapter.failJob(job!, 'test-queue', new Error('fail'))
 
     const record = await adapter.getJob(job!.id, 'test-queue')
     assert.isNull(record)
@@ -839,7 +976,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     // Complete all with count: 2
     for (let i = 1; i <= 3; i++) {
       const job = await adapter.popFrom('test-queue')
-      await adapter.completeJob(job!.id, 'test-queue', { count: 2, age: '1h' })
+      await adapter.completeJob(job!, 'test-queue', { count: 2, age: '1h' })
     }
 
     // Only last 2 should remain (count: 2)
@@ -872,8 +1009,8 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const job1 = await adapter.popFrom('test-queue')
     const job2 = await adapter.popFrom('test-queue')
 
-    await adapter.failJob(job1!.id, 'test-queue', new Error('error 1'), { count: 1 })
-    await adapter.failJob(job2!.id, 'test-queue', new Error('error 2'), { count: 1 })
+    await adapter.failJob(job1!, 'test-queue', new Error('error 1'), { count: 1 })
+    await adapter.failJob(job2!, 'test-queue', new Error('error 2'), { count: 1 })
 
     const record1 = await adapter.getJob(job1!.id, 'test-queue')
     const record2 = await adapter.getJob(job2!.id, 'test-queue')
@@ -895,7 +1032,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     })
 
     // Try to complete without popping (job is still pending)
-    await adapter.completeJob('job-pending-complete', 'test-queue', false)
+    await adapter.completeJob(unleased('job-pending-complete'), 'test-queue', false)
 
     // Job should still be pending
     const record = await adapter.getJob('job-pending-complete', 'test-queue')
@@ -923,8 +1060,8 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const job1 = await adapter.popFrom('test-queue')
     const job2 = await adapter.popFrom('test-queue')
 
-    await adapter.completeJob(job1!.id, 'test-queue', false)
-    await adapter.completeJob(job2!.id, 'test-queue', false)
+    await adapter.completeJob(job1!, 'test-queue', false)
+    await adapter.completeJob(job2!, 'test-queue', false)
 
     await adapter.pushOn('test-queue', {
       id: 'job-history-pending',
@@ -933,7 +1070,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       attempts: 0,
     })
 
-    await adapter.completeJob('job-history-pending', 'test-queue', { count: 1 })
+    await adapter.completeJob(unleased('job-history-pending'), 'test-queue', { count: 1 })
 
     const record1 = await adapter.getJob('job-history-1', 'test-queue')
     const record2 = await adapter.getJob('job-history-2', 'test-queue')
@@ -955,11 +1092,71 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       attempts: 0,
     })
 
-    await adapter.completeJob('job-pending-default', 'test-queue')
+    await adapter.completeJob(unleased('job-pending-default'), 'test-queue')
 
     const record = await adapter.getJob('job-pending-default', 'test-queue')
     assert.isNotNull(record)
     assert.equal(record!.status, 'pending')
+  })
+
+  test('popFrom should give each acquisition its own lease token', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    const { stale, current } = await acquireTwice(adapter)
+
+    assert.match(stale.leaseToken, /^worker-1:/)
+    assert.match(current.leaseToken, /^worker-1:/)
+    assert.notEqual(stale.leaseToken, current.leaseToken)
+  })
+
+  test('completeJob should ignore a stale lease', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    const { stale, current } = await acquireTwice(adapter)
+
+    assert.isFalse(await adapter.completeJob(stale, 'test-queue', false))
+    assert.isFalse(await adapter.completeJob(stale, 'test-queue', true))
+    assert.equal((await adapter.getJob('job-1', 'test-queue'))!.status, 'active')
+    assert.equal(await adapter.renewJobs('test-queue', [stale]), 0)
+    assert.equal(await adapter.renewJobs('test-queue', [current]), 1)
+
+    assert.isTrue(await adapter.completeJob(current, 'test-queue', false))
+    assert.equal((await adapter.getJob('job-1', 'test-queue'))!.status, 'completed')
+  })
+
+  test('failJob should ignore a stale lease', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    const { stale, current } = await acquireTwice(adapter)
+
+    assert.isFalse(await adapter.failJob(stale, 'test-queue', new Error('late'), false))
+    assert.isFalse(await adapter.failJob(stale, 'test-queue', new Error('late'), true))
+    assert.equal((await adapter.getJob('job-1', 'test-queue'))!.status, 'active')
+
+    assert.isTrue(await adapter.failJob(current, 'test-queue', new Error('boom'), false))
+    const record = await adapter.getJob('job-1', 'test-queue')
+    assert.equal(record!.status, 'failed')
+    assert.equal(record!.error, 'boom')
+  })
+
+  test('retryJob should ignore a stale lease', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    const { stale, current } = await acquireTwice(adapter)
+
+    assert.isFalse(await adapter.retryJob(stale, 'test-queue'))
+    assert.isFalse(await adapter.retryJob(stale, 'test-queue', new Date(Date.now() + 60_000)))
+    assert.equal((await adapter.getJob('job-1', 'test-queue'))!.status, 'active')
+    assert.isNull(await adapter.popFrom('test-queue'))
+
+    assert.isTrue(await adapter.retryJob(current, 'test-queue'))
+    const retried = await adapter.popFrom('test-queue')
+    assert.equal(retried!.id, 'job-1')
+    assert.equal(retried!.attempts, 1)
   })
 
   test('failJob on non-active job should be no-op', async ({ assert }) => {
@@ -974,7 +1171,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     })
 
     // Try to fail without popping (job is still pending)
-    await adapter.failJob('job-pending-fail', 'test-queue', new Error('fail'), false)
+    await adapter.failJob(unleased('job-pending-fail'), 'test-queue', new Error('fail'), false)
 
     // Job should still be pending
     const record = await adapter.getJob('job-pending-fail', 'test-queue')
@@ -994,10 +1191,10 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     })
 
     const job = await adapter.popFrom('test-queue')
-    await adapter.completeJob(job!.id, 'test-queue', false)
+    await adapter.completeJob(job!, 'test-queue', false)
 
     // Second complete should not throw
-    await adapter.completeJob(job!.id, 'test-queue', false)
+    await adapter.completeJob(job!, 'test-queue', false)
 
     const record = await adapter.getJob(job!.id, 'test-queue')
     assert.isNotNull(record)
@@ -1056,8 +1253,8 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const jobA = await adapter.popFrom('queue-prune-a')
     const jobB = await adapter.popFrom('queue-prune-b')
 
-    await adapter.completeJob(jobA!.id, 'queue-prune-a', { count: 1 })
-    await adapter.completeJob(jobB!.id, 'queue-prune-b', { count: 1 })
+    await adapter.completeJob(jobA!, 'queue-prune-a', { count: 1 })
+    await adapter.completeJob(jobB!, 'queue-prune-b', { count: 1 })
 
     // Both should still exist (different queues)
     const recordA = await adapter.getJob(jobA!.id, 'queue-prune-a')
@@ -1124,7 +1321,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.equal(record!.status, 'active')
 
     // Complete
-    await adapter.completeJob(job!.id, 'test-queue', false)
+    await adapter.completeJob(job!, 'test-queue', false)
     record = await adapter.getJob('job-lifecycle', 'test-queue')
     assert.equal(record!.status, 'completed')
     assert.isNumber(record!.finishedAt)
@@ -1148,7 +1345,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.equal(job1!.attempts, 0)
 
     // Retry
-    await adapter.retryJob(job1!.id, 'test-queue')
+    await adapter.retryJob(job1!, 'test-queue')
 
     // Check it's back to pending
     let record = await adapter.getJob('job-retry-lifecycle', 'test-queue')
@@ -1159,7 +1356,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.equal(job2!.attempts, 1)
 
     // Fail
-    await adapter.failJob(job2!.id, 'test-queue', new Error('max retries'), false)
+    await adapter.failJob(job2!, 'test-queue', new Error('max retries'), false)
 
     record = await adapter.getJob('job-retry-lifecycle', 'test-queue')
     assert.equal(record!.status, 'failed')
@@ -1183,7 +1380,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     })
 
     const first = await adapter.popFrom('test-queue')
-    await adapter.retryJob(first!.id, 'test-queue')
+    await adapter.retryJob(first!, 'test-queue')
 
     const retried = await adapter.popFrom('test-queue')
 
@@ -1286,7 +1483,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       assert.notEqual(job1!.id, job2!.id, 'Workers should acquire different jobs')
     })
 
-    test('renewJobs should not renew a job owned by another worker', async ({ assert }) => {
+    test('a worker cannot finalize a job acquired again by another worker', async ({ assert }) => {
       const adapter1 = await options.createAdapter()
       const adapter2 = await options.createAdapter()
 
@@ -1300,17 +1497,19 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
         attempts: 0,
       })
 
-      // worker-1 acquires the job, so worker-2 does not own its lease.
-      const job = await adapter1.popFrom('test-queue')
-      assert.equal(job!.id, 'job-1')
+      // worker-1 stalls, worker-2 recovers the job and acquires it.
+      const stale = await adapter1.popFrom('test-queue')
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      assert.equal((await adapter2.recoverStalledJobs('test-queue', 10, 1, 100)).recovered, 1)
+      const current = await adapter2.popFrom('test-queue')
+      assert.match(current!.leaseToken, /^worker-2:/)
 
-      // worker-2 must not be able to renew a job it doesn't own.
-      const renewedByOther = await adapter2.renewJobs('test-queue', ['job-1'])
-      assert.equal(renewedByOther, 0)
+      assert.equal(await adapter1.renewJobs('test-queue', [stale!]), 0)
+      assert.isFalse(await adapter1.completeJob(stale!, 'test-queue', false))
+      assert.equal((await adapter2.getJob('job-1', 'test-queue'))!.status, 'active')
 
-      // The legitimate owner can still renew it.
-      const renewedByOwner = await adapter1.renewJobs('test-queue', ['job-1'])
-      assert.equal(renewedByOwner, 1)
+      assert.equal(await adapter2.renewJobs('test-queue', [current!]), 1)
+      assert.isTrue(await adapter2.completeJob(current!, 'test-queue', true))
     })
   }
 
@@ -1414,6 +1613,107 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.isNull(schedule!.limit)
   })
 
+  test('upsertSchedule stores an undefined payload as an empty object', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+
+    await adapter.upsertSchedule({
+      id: 'schedule-undefined-payload',
+      name: 'TestJob',
+      payload: undefined,
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+
+    const schedule = await adapter.getSchedule('schedule-undefined-payload')
+    assert.deepEqual(schedule!.payload, {})
+  })
+
+  test('upsertSchedule without a payload replaces the previous payload', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    const config = {
+      id: 'schedule-cleared-payload',
+      name: 'TestJob',
+      everyMs: 60_000,
+      timezone: 'UTC',
+    }
+
+    await adapter.upsertSchedule({ ...config, payload: { version: 1 } })
+    await adapter.upsertSchedule({ ...config, payload: undefined })
+
+    const schedule = await adapter.getSchedule('schedule-cleared-payload')
+    assert.deepEqual(schedule!.payload, {})
+  })
+
+  test('schedule payloads keep empty arrays through claims', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    const payload = { items: [], nested: { tags: [] } }
+
+    await adapter.upsertSchedule({
+      id: 'schedule-empty-arrays',
+      name: 'TestJob',
+      payload,
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+    await adapter.updateSchedule('schedule-empty-arrays', {
+      nextRunAt: new Date(Date.now() - 1_000),
+    })
+
+    const claimed = await adapter.claimDueSchedule()
+    assert.deepEqual(claimed!.payload, payload)
+    assert.deepEqual((await adapter.getSchedule('schedule-empty-arrays'))!.payload, payload)
+  })
+
+  test('pushOn should store a payload larger than 64 KB', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+    const blob = 'x'.repeat(70_000)
+
+    await adapter.pushOn('test-queue', {
+      id: 'big',
+      name: 'TestJob',
+      payload: { blob },
+      attempts: 0,
+    })
+
+    const job = await adapter.popFrom('test-queue')
+    assert.equal((job!.payload as { blob: string }).blob.length, blob.length)
+  })
+
+  test('failJob should store an error message larger than 64 KB', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+    const message = 'e'.repeat(70_000)
+
+    await adapter.pushOn('test-queue', {
+      id: 'big-error',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+    })
+    const job = await adapter.popFrom('test-queue')
+    await adapter.failJob(job!, 'test-queue', new Error(message), false)
+
+    const record = await adapter.getJob('big-error', 'test-queue')
+    assert.equal(record!.error!.length, message.length)
+  })
+
+  test('upsertSchedule should store a payload larger than 64 KB', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    const blob = 'x'.repeat(70_000)
+
+    await adapter.upsertSchedule({
+      id: 'big-schedule',
+      name: 'TestJob',
+      payload: { blob },
+      everyMs: 60_000,
+      timezone: 'UTC',
+    })
+
+    const schedule = await adapter.getSchedule('big-schedule')
+    assert.equal((schedule!.payload as { blob: string }).blob.length, blob.length)
+  })
+
   test('upsertSchedule should preserve runtime runCount when id exists', async ({ assert }) => {
     const adapter = await options.createAdapter()
 
@@ -1445,6 +1745,128 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.equal(schedule!.cronExpression, '*/5 * * * *')
     assert.isNull(schedule!.everyMs)
     assert.equal(schedule!.runCount, 3)
+  })
+
+  test('upsertSchedule should create a new schedule active with its next run', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    const nextRunAt = new Date(Date.now() + 60_000)
+
+    await adapter.upsertSchedule({
+      id: 'upsert-new-next-run',
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+      nextRunAt,
+    })
+
+    const schedule = await adapter.getSchedule('upsert-new-next-run')
+    assert.equal(schedule!.status, 'active')
+    assert.equal(schedule!.nextRunAt!.getTime(), nextRunAt.getTime())
+  })
+
+  test('upsertSchedule should keep the status of an existing schedule', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    const config = {
+      id: 'upsert-keep-paused',
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+    }
+
+    await adapter.upsertSchedule(config)
+    await adapter.updateSchedule(config.id, { status: 'paused' })
+
+    // Even a new definition does not resume a paused schedule.
+    await adapter.upsertSchedule(config)
+    await adapter.upsertSchedule({ ...config, everyMs: 30_000 })
+
+    assert.equal((await adapter.getSchedule(config.id))!.status, 'paused')
+  })
+
+  test('upsertSchedule should keep the next run when the timing is unchanged', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    const config = {
+      id: 'upsert-keep-next-run',
+      name: 'TestJob',
+      cronExpression: '0 9 * * *',
+      timezone: 'Europe/Paris',
+      from: new Date('2026-01-01T00:00:00.000Z'),
+      to: new Date('2099-01-01T00:00:00.000Z'),
+      limit: 10,
+    }
+    const nextRunAt = new Date(Date.now() + 60_000)
+
+    await adapter.upsertSchedule({ ...config, payload: { version: 1 }, nextRunAt })
+
+    // A payload change is not a timing change.
+    await adapter.upsertSchedule({
+      ...config,
+      payload: { version: 2 },
+      nextRunAt: new Date(Date.now() + 3_600_000),
+    })
+
+    const schedule = await adapter.getSchedule(config.id)
+    assert.deepEqual(schedule!.payload, { version: 2 })
+    assert.equal(schedule!.nextRunAt!.getTime(), nextRunAt.getTime())
+  })
+
+  test('upsertSchedule should take the new next run when the timing changes', async ({
+    assert,
+  }) => {
+    const adapter = await options.createAdapter()
+    const base = {
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+      from: new Date('2026-01-01T00:00:00.000Z'),
+      to: new Date('2099-01-01T00:00:00.000Z'),
+      limit: 10,
+    }
+    const changes = {
+      cron: { everyMs: undefined, cronExpression: '0 9 * * *' },
+      every: { everyMs: 30_000 },
+      timezone: { timezone: 'Europe/Paris' },
+      from: { from: new Date('2026-02-01T00:00:00.000Z') },
+      to: { to: new Date('2098-01-01T00:00:00.000Z') },
+      limit: { limit: 20 },
+    }
+
+    for (const [field, change] of Object.entries(changes)) {
+      const id = `upsert-timing-${field}`
+      const nextRunAt = new Date(Date.now() + 3_600_000)
+
+      await adapter.upsertSchedule({ ...base, id, nextRunAt: new Date(Date.now() + 60_000) })
+      await adapter.upsertSchedule({ ...base, ...change, id, nextRunAt })
+
+      const schedule = await adapter.getSchedule(id)
+      assert.equal(schedule!.nextRunAt!.getTime(), nextRunAt.getTime(), field)
+    }
+  })
+
+  test('upsertSchedule should keep a finished schedule finished', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    const config = {
+      id: 'upsert-keep-finished',
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+      limit: 1,
+    }
+
+    await adapter.upsertSchedule({ ...config, nextRunAt: new Date(Date.now() + 60_000) })
+    await adapter.updateSchedule(config.id, { runCount: 1, nextRunAt: null })
+
+    await adapter.upsertSchedule({ ...config, nextRunAt: new Date(Date.now() + 60_000) })
+
+    assert.isNull((await adapter.getSchedule(config.id))!.nextRunAt)
   })
 
   test('getSchedule should return null for non-existent schedule', async ({ assert }) => {
@@ -1726,6 +2148,63 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       // Only one should succeed
       const claimedSchedules = [claimed1, claimed2].filter((s) => s !== null)
       assert.equal(claimedSchedules.length, 1, 'Only one adapter should claim the schedule')
+    })
+
+    test('concurrent upserts of a new schedule all succeed', async ({ assert }) => {
+      const adapters = await Promise.all(Array.from({ length: 10 }, () => options.createAdapter()))
+      const config = {
+        id: 'concurrent-new-identical',
+        name: 'TestJob',
+        payload: {},
+        everyMs: 60_000,
+        timezone: 'UTC',
+      }
+      const nextRunAt = new Date(Date.now() + 60_000)
+
+      // Workers booting together define the same schedule.
+      const results = await Promise.allSettled(
+        adapters.map((adapter) => adapter.upsertSchedule({ ...config, nextRunAt }))
+      )
+
+      assert.deepEqual(
+        results.filter((result) => result.status === 'rejected'),
+        []
+      )
+      const schedule = await adapters[0].getSchedule(config.id)
+      assert.equal(schedule!.status, 'active')
+      assert.equal(schedule!.nextRunAt!.getTime(), nextRunAt.getTime())
+    })
+
+    test('concurrent upserts keep the next run of the definition that wins', async ({ assert }) => {
+      const adapters = await Promise.all(Array.from({ length: 10 }, () => options.createAdapter()))
+      const base = Date.now() + 60_000
+
+      for (let round = 0; round < 3; round++) {
+        const id = `concurrent-new-timing-${round}`
+
+        // Each definition has its own interval and the next run that matches it.
+        const results = await Promise.allSettled(
+          adapters.map((adapter, index) => {
+            const everyMs = (index + 1) * 60_000
+            return adapter.upsertSchedule({
+              id,
+              name: 'TestJob',
+              payload: { index },
+              everyMs,
+              timezone: 'UTC',
+              nextRunAt: new Date(base + everyMs),
+            })
+          })
+        )
+
+        assert.deepEqual(
+          results.filter((result) => result.status === 'rejected'),
+          []
+        )
+        const schedule = await adapters[0].getSchedule(id)
+        assert.equal(schedule!.nextRunAt!.getTime() - base, schedule!.everyMs)
+        assert.deepEqual(schedule!.payload, { index: schedule!.everyMs! / 60_000 - 1 })
+      }
     })
 
     test('high-concurrency claimDueSchedule stress test', async ({ assert }) => {
@@ -2155,7 +2634,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     })
 
     const first = await adapter.popFrom('rep-retry-queue')
-    await adapter.retryJob(first!.id, 'rep-retry-queue')
+    await adapter.retryJob(first!, 'rep-retry-queue')
 
     const retried = await adapter.popFrom('rep-retry-queue')
 
@@ -2191,7 +2670,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     })
 
     const job = await adapter.popFrom('rep-history-queue')
-    await adapter.completeJob(job!.id, 'rep-history-queue', false)
+    await adapter.completeJob(job!, 'rep-history-queue', false)
 
     const record = await adapter.getJob('rep-history-uuid-1', 'rep-history-queue')
 
@@ -2211,29 +2690,30 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { n: 1 },
       attempts: 0,
-      dedup: { id: 'TestJob::ext-1', ttl: 100, extend: true },
+      dedup: { id: 'TestJob::ext-1', ttl: 400, extend: true },
     })
 
-    await new Promise((r) => setTimeout(r, 60))
+    await new Promise((r) => setTimeout(r, 250))
 
     const second = await adapter.pushOn('ext-queue', {
       id: 'ext-uuid-2',
       name: 'TestJob',
       payload: { n: 2 },
       attempts: 0,
-      dedup: { id: 'TestJob::ext-1', ttl: 100, extend: true },
+      dedup: { id: 'TestJob::ext-1', ttl: 400, extend: true },
     })
     assert.equal(second && typeof second === 'object' && second.outcome, 'extended')
 
-    await new Promise((r) => setTimeout(r, 60))
+    await new Promise((r) => setTimeout(r, 250))
 
-    // Without extend, 50ms elapsed > 40ms TTL would've expired.
+    // Without the extend at T=250, the window would have expired at T=400. With it,
+    // only 250ms of the new 400ms window have passed.
     const third = await adapter.pushOn('ext-queue', {
       id: 'ext-uuid-3',
       name: 'TestJob',
       payload: { n: 3 },
       attempts: 0,
-      dedup: { id: 'TestJob::ext-1', ttl: 100, extend: true },
+      dedup: { id: 'TestJob::ext-1', ttl: 400, extend: true },
     })
     assert.equal(third && typeof third === 'object' && third.outcome, 'extended')
   })
@@ -2253,7 +2733,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     })
 
     const popped = await adapter.popFrom('clean-queue')
-    await adapter.completeJob(popped!.id, 'clean-queue', true)
+    await adapter.completeJob(popped!, 'clean-queue', true)
 
     // Dedup should be cleaned — new push should succeed
     const second = await adapter.pushOn('clean-queue', {
@@ -2281,7 +2761,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     })
 
     const popped = await adapter.popFrom('clean-fail')
-    await adapter.failJob(popped!.id, 'clean-fail', new Error('boom'), true)
+    await adapter.failJob(popped!, 'clean-fail', new Error('boom'), true)
 
     const second = await adapter.pushOn('clean-fail', {
       id: 'fail-uuid-2',
@@ -2306,7 +2786,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     })
 
     const popped = await adapter.popFrom('retry-queue')
-    await adapter.retryJob(popped!.id, 'retry-queue')
+    await adapter.retryJob(popped!, 'retry-queue')
 
     // retry puts job back — dedup entry still points to same job
     const second = await adapter.pushOn('retry-queue', {
@@ -2423,7 +2903,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     })
 
     const popped = await adapter.popFrom('rep-retain-queue')
-    await adapter.completeJob(popped!.id, 'rep-retain-queue', false)
+    await adapter.completeJob(popped!, 'rep-retain-queue', false)
 
     const second = await adapter.pushOn('rep-retain-queue', {
       id: 'retain-uuid-2',
@@ -2492,17 +2972,17 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { version: 1 },
       attempts: 0,
-      dedup: { id: 'TestJob::debounce-1', ttl: 200, extend: true, replace: true },
+      dedup: { id: 'TestJob::debounce-1', ttl: 400, extend: true, replace: true },
     })
 
-    await new Promise((r) => setTimeout(r, 120))
+    await new Promise((r) => setTimeout(r, 250))
 
     const second = await adapter.pushOn('debounce-queue', {
       id: 'debounce-uuid-2',
       name: 'TestJob',
       payload: { version: 2 },
       attempts: 0,
-      dedup: { id: 'TestJob::debounce-1', ttl: 200, extend: true, replace: true },
+      dedup: { id: 'TestJob::debounce-1', ttl: 400, extend: true, replace: true },
     })
     assert.equal(second && typeof second === 'object' && second.outcome, 'replaced')
     assert.equal(second && typeof second === 'object' && second.jobId, 'debounce-uuid-1')
@@ -2510,16 +2990,16 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const midRecord = await adapter.getJob('debounce-uuid-1', 'debounce-queue')
     assert.deepEqual(midRecord!.data.payload, { version: 2 })
 
-    // 240ms total elapsed > original 200ms TTL, but the second dispatch reset
-    // the window at T=120. Only 120ms into the new window → still alive.
-    await new Promise((r) => setTimeout(r, 120))
+    // 500ms total elapsed > original 400ms TTL, but the second dispatch reset
+    // the window at T=250. Only 250ms into the new window → still alive.
+    await new Promise((r) => setTimeout(r, 250))
 
     const third = await adapter.pushOn('debounce-queue', {
       id: 'debounce-uuid-3',
       name: 'TestJob',
       payload: { version: 3 },
       attempts: 0,
-      dedup: { id: 'TestJob::debounce-1', ttl: 200, extend: true, replace: true },
+      dedup: { id: 'TestJob::debounce-1', ttl: 400, extend: true, replace: true },
     })
     assert.equal(third && typeof third === 'object' && third.outcome, 'replaced')
     assert.equal(third && typeof third === 'object' && third.jobId, 'debounce-uuid-1')
@@ -2572,11 +3052,11 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { n: 1 },
       attempts: 0,
-      dedup: { id: 'TestJob::active-ext-1', ttl: 200, extend: true },
+      dedup: { id: 'TestJob::active-ext-1', ttl: 400, extend: true },
     })
 
     // Move to active mid-window.
-    await new Promise((r) => setTimeout(r, 80))
+    await new Promise((r) => setTimeout(r, 250))
     const popped = await adapter.popFrom('active-ext-queue')
     assert.equal(popped!.id, 'active-ext-uuid-1')
 
@@ -2587,22 +3067,22 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { n: 2 },
       attempts: 0,
-      dedup: { id: 'TestJob::active-ext-1', ttl: 200, extend: true },
+      dedup: { id: 'TestJob::active-ext-1', ttl: 400, extend: true },
     })
     assert.equal(second && typeof second === 'object' && second.outcome, 'extended')
     assert.equal(second && typeof second === 'object' && second.jobId, 'active-ext-uuid-1')
 
-    // Without the extend, the slot would have expired by now (80 + 150 > 200).
-    // With the extend at T=80, the window restarted; at T=230 only 150ms into
+    // Without the extend, the slot would have expired by now (250 + 250 > 400).
+    // With the extend at T=250, the window restarted; at T=500 only 250ms into
     // new window → still blocking.
-    await new Promise((r) => setTimeout(r, 150))
+    await new Promise((r) => setTimeout(r, 250))
 
     const third = await adapter.pushOn('active-ext-queue', {
       id: 'active-ext-uuid-3',
       name: 'TestJob',
       payload: { n: 3 },
       attempts: 0,
-      dedup: { id: 'TestJob::active-ext-1', ttl: 200, extend: true },
+      dedup: { id: 'TestJob::active-ext-1', ttl: 400, extend: true },
     })
     assert.equal(third && typeof third === 'object' && third.outcome, 'extended')
     assert.equal(third && typeof third === 'object' && third.jobId, 'active-ext-uuid-1')

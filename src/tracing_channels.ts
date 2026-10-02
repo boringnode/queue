@@ -12,16 +12,13 @@ import type { JobDispatchMessage, JobExecuteMessage } from './types/tracing_chan
  * Traces job dispatch operations (push to queue).
  * Fires for single dispatch, batch dispatch, and scheduled job dispatch.
  */
-export const dispatchChannel = diagnostics_channel.tracingChannel<
-  'boringqueue.job.dispatch',
-  JobDispatchMessage
->('boringqueue.job.dispatch')
+export const dispatchChannel = diagnostics_channel.tracingChannel<JobDispatchMessage>(
+  'boringqueue.job.dispatch'
+)
 
 /**
  * Traces job execution by the worker or sync adapter.
  * Each retry attempt fires a separate trace.
  */
-export const executeChannel = diagnostics_channel.tracingChannel<
-  'boringqueue.job.execute',
-  JobExecuteMessage
->('boringqueue.job.execute')
+export const executeChannel =
+  diagnostics_channel.tracingChannel<JobExecuteMessage>('boringqueue.job.execute')

@@ -14,6 +14,7 @@ function makeJob(overrides: Partial<AcquiredJob> = {}): AcquiredJob {
     payload: {},
     attempts: 0,
     acquiredAt: Date.now(),
+    leaseToken: 'worker:lease',
     ...overrides,
   }
 }

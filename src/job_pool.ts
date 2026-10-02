@@ -13,7 +13,7 @@ export interface PoolEntry {
 }
 
 interface CompletedEntry {
-  id: string
+  leaseToken: string
   entry: PoolEntry
 }
 
@@ -35,8 +35,13 @@ interface CompletedEntry {
  * completes, its slot becomes available for new work.
  */
 export class JobPool {
+  /**
+   * Running jobs by lease token. A job recovered as stalled can be acquired
+   * again while its first execution still runs: both stay in the pool.
+   */
   #activeJobs = new Map<string, PoolEntry>()
-  #completedEntries: CompletedEntry[] = []
+  /** Consumed slots are cleared at once: an entry holds its job and payload. */
+  #completedEntries: Array<CompletedEntry | undefined> = []
   #completedHead = 0
   #completionAvailable?: PromiseWithResolvers<void>
 
@@ -78,31 +83,30 @@ export class JobPool {
    */
   add(job: AcquiredJob, queue: string, promise: Promise<void>) {
     const entry = { promise, job, queue }
-    this.#activeJobs.set(job.id, entry)
+    this.#activeJobs.set(job.leaseToken, entry)
     void promise.then(
-      () => this.#enqueueCompletion(job.id, entry),
-      () => this.#enqueueCompletion(job.id, entry)
+      () => this.#enqueueCompletion(job.leaseToken, entry),
+      () => this.#enqueueCompletion(job.leaseToken, entry)
     )
   }
 
   /**
-   * Get the ids of all currently running jobs, grouped by the queue they
-   * came from.
+   * Get all currently running jobs, grouped by the queue they came from.
    *
    * Used by the worker heartbeat to renew the acquired timestamp of in-flight
    * jobs so long-running handlers are not mistaken for stalled jobs.
    *
-   * @returns A map of queue name to the job ids running for that queue
+   * @returns A map of queue name to the jobs running for that queue
    */
-  activeJobIdsByQueue(): Map<string, string[]> {
-    const byQueue = new Map<string, string[]>()
+  activeJobsByQueue(): Map<string, AcquiredJob[]> {
+    const byQueue = new Map<string, AcquiredJob[]>()
 
     for (const { job, queue } of this.#activeJobs.values()) {
-      const ids = byQueue.get(queue)
-      if (ids) {
-        ids.push(job.id)
+      const jobs = byQueue.get(queue)
+      if (jobs) {
+        jobs.push(job)
       } else {
-        byQueue.set(queue, [job.id])
+        byQueue.set(queue, [job])
       }
     }
 
@@ -124,12 +128,13 @@ export class JobPool {
         await this.#completionAvailable.promise
       }
 
-      const completed = this.#completedEntries[this.#completedHead++]!
+      const completed = this.#completedEntries[this.#completedHead]!
+      this.#completedEntries[this.#completedHead++] = undefined
       this.#compactCompletedJobs()
 
-      if (this.#activeJobs.get(completed.id) !== completed.entry) continue
+      if (this.#activeJobs.get(completed.leaseToken) !== completed.entry) continue
 
-      this.#activeJobs.delete(completed.id)
+      this.#activeJobs.delete(completed.leaseToken)
       return completed.entry
     }
   }
@@ -155,15 +160,21 @@ export class JobPool {
     this.#completedHead = 0
   }
 
-  #enqueueCompletion(jobId: string, entry: PoolEntry): void {
-    if (this.#activeJobs.get(jobId) !== entry) return
+  #enqueueCompletion(leaseToken: string, entry: PoolEntry): void {
+    if (this.#activeJobs.get(leaseToken) !== entry) return
 
-    this.#completedEntries.push({ id: jobId, entry })
+    this.#completedEntries.push({ leaseToken, entry })
     this.#completionAvailable?.resolve()
     this.#completionAvailable = undefined
   }
 
   #compactCompletedJobs(): void {
+    if (this.#completedHead === this.#completedEntries.length) {
+      this.#completedEntries = []
+      this.#completedHead = 0
+      return
+    }
+
     if (this.#completedHead < 1_024 || this.#completedHead * 2 < this.#completedEntries.length) {
       return
     }

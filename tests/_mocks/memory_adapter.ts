@@ -1,5 +1,11 @@
 import { randomUUID } from 'node:crypto'
-import type { Adapter, AcquiredJob, PushResult } from '../../src/contracts/adapter.js'
+import type {
+  Adapter,
+  AcquiredJob,
+  JobLease,
+  PushResult,
+  StalledJobsRecovery,
+} from '../../src/contracts/adapter.js'
 import type {
   JobData,
   JobRecord,
@@ -8,13 +14,14 @@ import type {
   ScheduleData,
   ScheduleListOptions,
 } from '../../src/types/main.js'
-import { parse } from '../../src/utils.js'
+import { createLeaseToken, parse, resolveSchedulePayload } from '../../src/utils.js'
+import { sameScheduleTiming } from '../../src/services/schedule_timing.js'
 
 interface ActiveJob {
   job: JobData
   acquiredAt: number
   queue: string
-  workerId: string
+  leaseToken: string
 }
 
 interface DelayedJob {
@@ -152,49 +159,63 @@ export class MemoryAdapter implements Adapter {
     }
 
     const acquiredAt = Date.now()
-    this.#activeJobs.set(job.id, { job, acquiredAt, queue, workerId: this.#workerId })
+    const leaseToken = createLeaseToken(this.#workerId)
+    this.#activeJobs.set(job.id, { job, acquiredAt, queue, leaseToken })
 
-    return { ...job, acquiredAt }
+    return { ...job, acquiredAt, leaseToken }
   }
 
-  async completeJob(jobId: string, queue: string, removeOnComplete?: JobRetention): Promise<void> {
-    const active = this.#activeJobs.get(jobId)
-    if (!active) return
+  #leasedJob(job: JobLease, queue: string): ActiveJob | undefined {
+    const active = this.#activeJobs.get(job.id)
+    if (!active || active.queue !== queue || active.leaseToken !== job.leaseToken) return
 
-    this.#activeJobs.delete(jobId)
+    return active
+  }
+
+  async completeJob(
+    job: JobLease,
+    queue: string,
+    removeOnComplete?: JobRetention
+  ): Promise<boolean> {
+    const active = this.#leasedJob(job, queue)
+    if (!active) return false
+
+    this.#activeJobs.delete(job.id)
 
     if (removeOnComplete === undefined || removeOnComplete === true) {
       this.#cleanupDedupForJob(queue, active.job)
-      return
+      return true
     }
 
     this.#storeHistory(queue, 'completed', active.job, removeOnComplete)
+    return true
   }
 
   async failJob(
-    jobId: string,
+    job: JobLease,
     queue: string,
     error?: Error,
     removeOnFail?: JobRetention
-  ): Promise<void> {
-    const active = this.#activeJobs.get(jobId)
-    if (!active) return
+  ): Promise<boolean> {
+    const active = this.#leasedJob(job, queue)
+    if (!active) return false
 
-    this.#activeJobs.delete(jobId)
+    this.#activeJobs.delete(job.id)
 
     if (removeOnFail === undefined || removeOnFail === true) {
       this.#cleanupDedupForJob(queue, active.job)
-      return
+      return true
     }
 
     this.#storeHistory(queue, 'failed', active.job, removeOnFail, error)
+    return true
   }
 
-  async retryJob(jobId: string, queue: string, retryAt?: Date): Promise<void> {
-    const active = this.#activeJobs.get(jobId)
-    if (!active) return
+  async retryJob(job: JobLease, queue: string, retryAt?: Date): Promise<boolean> {
+    const active = this.#leasedJob(job, queue)
+    if (!active) return false
 
-    this.#activeJobs.delete(jobId)
+    this.#activeJobs.delete(job.id)
 
     const updatedJob = {
       ...active.job,
@@ -206,20 +227,23 @@ export class MemoryAdapter implements Adapter {
 
       if (delay > 0) {
         await this.pushLaterOn(queue, updatedJob, delay)
-        return
+        return true
       }
     }
 
     await this.pushOn(queue, updatedJob)
+    return true
   }
 
   async recoverStalledJobs(
     queue: string,
     stalledThreshold: number,
-    maxStalledCount: number
-  ): Promise<number> {
+    maxStalledCount: number,
+    maxExceeded: number
+  ): Promise<StalledJobsRecovery> {
     const now = Date.now()
     let recovered = 0
+    const exceeded: AcquiredJob[] = []
 
     for (const [jobId, active] of this.#activeJobs.entries()) {
       if (active.queue !== queue) {
@@ -236,9 +260,13 @@ export class MemoryAdapter implements Adapter {
 
       // Check if job has exceeded max stalled count
       if (currentStalledCount >= maxStalledCount) {
-        // Fail permanently - just remove from active
-        this.#activeJobs.delete(jobId)
-        this.#cleanupDedupForJob(queue, active.job)
+        // Past maxExceeded, the job stays stalled for a later recovery.
+        if (exceeded.length >= maxExceeded) continue
+
+        // Reacquire for this worker, which fails it through the regular path.
+        active.acquiredAt = now
+        active.leaseToken = createLeaseToken(this.#workerId)
+        exceeded.push({ ...active.job, acquiredAt: now, leaseToken: active.leaseToken })
         continue
       }
 
@@ -254,16 +282,16 @@ export class MemoryAdapter implements Adapter {
       recovered++
     }
 
-    return recovered
+    return { recovered, exceeded }
   }
 
-  async renewJobs(queue: string, jobIds: string[]): Promise<number> {
+  async renewJobs(queue: string, jobs: JobLease[]): Promise<number> {
     const now = Date.now()
     let renewed = 0
 
-    for (const jobId of jobIds) {
-      const active = this.#activeJobs.get(jobId)
-      if (active && active.queue === queue && active.workerId === this.#workerId) {
+    for (const job of jobs) {
+      const active = this.#leasedJob(job, queue)
+      if (active) {
         active.acquiredAt = now
         renewed++
       }
@@ -312,6 +340,10 @@ export class MemoryAdapter implements Adapter {
     return Promise.resolve()
   }
 
+  migrate(): Promise<void> {
+    return Promise.resolve()
+  }
+
   async upsertSchedule(config: ScheduleConfig): Promise<string> {
     const id = config.id ?? randomUUID()
     const existing = this.#schedules.get(id)
@@ -320,7 +352,7 @@ export class MemoryAdapter implements Adapter {
     const schedule: ScheduleData = {
       id,
       name: config.name,
-      payload: config.payload,
+      payload: resolveSchedulePayload(config.payload),
       cronExpression: config.cronExpression ?? null,
       everyMs: config.everyMs ?? null,
       timezone: config.timezone,
@@ -328,9 +360,12 @@ export class MemoryAdapter implements Adapter {
       to: config.to ?? null,
       limit: config.limit ?? null,
       runCount: existing?.runCount ?? 0,
-      nextRunAt: existing?.nextRunAt ?? null, // Will be (re)calculated by the caller
+      nextRunAt:
+        existing && sameScheduleTiming(scheduleTiming(existing), scheduleTiming(config))
+          ? existing.nextRunAt
+          : (config.nextRunAt ?? null),
       lastRunAt: existing?.lastRunAt ?? null,
-      status: 'active',
+      status: existing?.status ?? 'active',
       createdAt: existing?.createdAt ?? now,
     }
 
@@ -570,5 +605,17 @@ export class MemoryAdapter implements Adapter {
     if (entry && entry.jobId === job.id) {
       this.#dedupIndex.get(queue)?.delete(job.dedup.id)
     }
+  }
+}
+
+/** Timing of a schedule, in the column names `sameScheduleTiming()` compares. */
+function scheduleTiming(schedule: ScheduleConfig | ScheduleData) {
+  return {
+    cron_expression: schedule.cronExpression,
+    every_ms: schedule.everyMs,
+    timezone: schedule.timezone,
+    from_date: schedule.from?.getTime(),
+    to_date: schedule.to?.getTime(),
+    run_limit: schedule.limit,
   }
 }

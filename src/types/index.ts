@@ -3,6 +3,7 @@ export type {
   AdapterSelector,
   BackoffConfig,
   BackoffStrategy,
+  DedupOutcome,
   DispatchManyResult,
   DispatchResult,
   Duration,
@@ -28,8 +29,12 @@ export type {
   Logger,
 } from './main.js'
 
-export type { Adapter, AcquiredJob } from '../contracts/adapter.js'
+export type {
+  Adapter,
+  AcquiredJob,
+  JobLease,
+  PushResult,
+  StalledJobsRecovery,
+} from '../contracts/adapter.js'
 
 export type { JobDispatchMessage, JobExecuteMessage } from './tracing_channels.js'
-
-export type { QueueInstrumentationConfig } from '../otel.js'

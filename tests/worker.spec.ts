@@ -11,6 +11,7 @@ import * as errors from '../src/exceptions.js'
 import { ControllableAdapter } from './_mocks/controllable_adapter.js'
 import { createWorkerFixture } from './_utils/create_worker_fixture.js'
 import { trackPromise } from './_utils/track_promise.js'
+import { MemoryLogger } from './_mocks/memory_logger.js'
 
 const config = {
   default: 'memory',
@@ -489,6 +490,8 @@ test.group('Worker', () => {
   test('should timeout job that exceeds timeout duration', async ({ assert, cleanup }) => {
     assert.plan(2)
 
+    let failedAt = 0
+
     class SlowJob extends Job {
       static options = { timeout: 50 }
 
@@ -497,6 +500,7 @@ test.group('Worker', () => {
       }
 
       async failed(error: Error) {
+        failedAt = Date.now()
         assert.instanceOf(error, errors.E_JOB_TIMEOUT)
       }
     }
@@ -530,23 +534,27 @@ test.group('Worker', () => {
     await worker.processCycle(['default']) // started
     await worker.processCycle(['default']) // completed (timeout)
 
-    const elapsed = Date.now() - startTime
-
-    assert.isBelow(elapsed, 150, 'Job should be killed before completing')
+    // The timeout fires before the handler returns; the cycle ends once it has returned.
+    assert.isBelow(failedAt - startTime, 150)
   })
 
-  test('should apply timeout when timeout is set to 0', async ({ assert, cleanup }) => {
-    assert.plan(2)
+  test('should not time out a job whose timeout is 0, even with a default timeout', async ({
+    assert,
+    cleanup,
+  }) => {
+    let completed = false
+    let failedError: Error | undefined
 
-    class ZeroTimeoutJob extends Job {
+    class NoTimeoutJob extends Job {
       static options = { timeout: 0 }
 
       async execute() {
-        await setTimeout(200)
+        await setTimeout(100)
+        completed = true
       }
 
       async failed(error: Error) {
-        assert.instanceOf(error, errors.E_JOB_TIMEOUT)
+        failedError = error
       }
     }
 
@@ -555,9 +563,11 @@ test.group('Worker', () => {
     const localConfig = {
       default: 'memory',
       adapters: { memory: () => sharedAdapter },
+      worker: { timeout: 20 },
+      defaultJobOptions: { timeout: 20 },
     }
 
-    Locator.register('ZeroTimeoutJob', ZeroTimeoutJob)
+    Locator.register('NoTimeoutJob', NoTimeoutJob)
 
     const worker = new Worker(localConfig)
 
@@ -568,20 +578,17 @@ test.group('Worker', () => {
 
     await sharedAdapter.push({
       id: 'timeout-zero-job',
-      name: 'ZeroTimeoutJob',
+      name: 'NoTimeoutJob',
       payload: {},
       attempts: 0,
       priority: 0,
     })
 
-    const startTime = Date.now()
-
     await worker.processCycle(['default']) // started
-    await worker.processCycle(['default']) // completed (timeout)
+    await worker.processCycle(['default']) // completed
 
-    const elapsed = Date.now() - startTime
-
-    assert.isBelow(elapsed, 150, 'Job should be killed before completing')
+    assert.isTrue(completed)
+    assert.isUndefined(failedError)
   })
 
   test('should remove timeout abort listener when job completes before timeout', async ({
@@ -759,12 +766,15 @@ test.group('Worker', () => {
   }) => {
     assert.plan(2)
 
+    let failedAt = 0
+
     class SlowJob extends Job {
       async execute() {
         await setTimeout(200)
       }
 
       async failed(error: Error) {
+        failedAt = Date.now()
         assert.instanceOf(error, errors.E_JOB_TIMEOUT)
       }
     }
@@ -801,9 +811,249 @@ test.group('Worker', () => {
     await worker.processCycle(['default']) // started
     await worker.processCycle(['default']) // completed (timeout)
 
-    const elapsed = Date.now() - startTime
+    // The timeout fires before the handler returns; the cycle ends once it has returned.
+    assert.isBelow(failedAt - startTime, 150)
+  })
 
-    assert.isBelow(elapsed, 150)
+  test('should apply the timeout and failOnTimeout of the global defaultJobOptions', async ({
+    assert,
+    cleanup,
+  }) => {
+    assert.plan(2)
+
+    let attempts = 0
+
+    class SlowJob extends Job {
+      async execute() {
+        attempts++
+        await setTimeout(200)
+      }
+
+      async failed(error: Error) {
+        assert.instanceOf(error, errors.E_JOB_TIMEOUT)
+      }
+    }
+
+    const sharedAdapter = memory()()
+
+    const localConfig = {
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      retry: { maxRetries: 3 },
+      defaultJobOptions: { timeout: 50, failOnTimeout: true },
+    }
+
+    Locator.register('SlowJob', SlowJob)
+
+    const worker = new Worker(localConfig)
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await sharedAdapter.push({
+      id: 'default-options-timeout-job',
+      name: 'SlowJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    await worker.processCycle(['default']) // started
+    await worker.processCycle(['default']) // completed (timeout, failed)
+    await worker.processCycle(['default']) // idle: failOnTimeout skips the retries
+
+    assert.equal(attempts, 1)
+  })
+
+  test('should apply the timeout of the queue defaultJobOptions', async ({ assert, cleanup }) => {
+    assert.plan(2)
+
+    let failedAt = 0
+
+    class SlowJob extends Job {
+      async execute() {
+        await setTimeout(200)
+      }
+
+      async failed(error: Error) {
+        failedAt = Date.now()
+        assert.instanceOf(error, errors.E_JOB_TIMEOUT)
+      }
+    }
+
+    const sharedAdapter = memory()()
+
+    const localConfig = {
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      defaultJobOptions: { timeout: 5_000 },
+      queues: { default: { defaultJobOptions: { timeout: 50 } } },
+    }
+
+    Locator.register('SlowJob', SlowJob)
+
+    const worker = new Worker(localConfig)
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await sharedAdapter.push({
+      id: 'queue-options-timeout-job',
+      name: 'SlowJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    const startTime = Date.now()
+
+    await worker.processCycle(['default']) // started
+    await worker.processCycle(['default']) // completed (timeout)
+
+    // The timeout fires before the handler returns; the cycle ends once it has returned.
+    assert.isBelow(failedAt - startTime, 150)
+  })
+
+  test('should keep the slot of a timed out job until its handler returns', async ({
+    assert,
+    cleanup,
+  }) => {
+    let handlerReturned = false
+    let statusWhenHandlerReturned: string | undefined
+    const sharedAdapter = memory()()
+
+    class StubbornJob extends Job {
+      static options = { timeout: 50, retry: { maxRetries: 1 } }
+
+      async execute() {
+        // Ignores this.signal and keeps running after the timeout.
+        await setTimeout(200)
+        statusWhenHandlerReturned = (await sharedAdapter.getJob('stubborn-job', 'default'))?.status
+        handlerReturned = true
+      }
+    }
+
+    Locator.register('StubbornJob', StubbornJob)
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      worker: { concurrency: 1 },
+    })
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await sharedAdapter.push({
+      id: 'stubborn-job',
+      name: 'StubbornJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    await worker.processCycle(['default']) // started
+    await worker.processCycle(['default']) // completed (timeout), once the handler returned
+
+    // The retry was scheduled at the timeout, while the handler still ran...
+    assert.equal(statusWhenHandlerReturned, 'pending')
+    // ...but the slot stayed taken until the handler returned.
+    assert.isTrue(handlerReturned)
+  })
+
+  test('should wait for a timed out handler before stopping', async ({ assert, cleanup }) => {
+    let timedOut = false
+    let handlerReturned = false
+
+    class StubbornJob extends Job {
+      static options = { timeout: 20 }
+
+      async execute() {
+        await setTimeout(150)
+        handlerReturned = true
+      }
+
+      async failed() {
+        timedOut = true
+      }
+    }
+
+    const sharedAdapter = memory()()
+
+    Locator.register('StubbornJob', StubbornJob)
+
+    const worker = new Worker({ default: 'memory', adapters: { memory: () => sharedAdapter } })
+
+    cleanup(async () => {
+      Locator.clear()
+    })
+
+    await sharedAdapter.push({
+      id: 'stubborn-stop-job',
+      name: 'StubbornJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    await worker.processCycle(['default']) // started
+    await setTimeout(60)
+    assert.isTrue(timedOut)
+    assert.isFalse(handlerReturned)
+
+    await worker.stop()
+
+    assert.isTrue(handlerReturned, 'stop() should wait for the timed out handler')
+  })
+
+  test('should keep the slot of a timed out job when its failed() hook throws', async ({
+    assert,
+    cleanup,
+  }) => {
+    let handlerReturned = false
+
+    class StubbornJob extends Job {
+      static options = { timeout: 20 }
+
+      async execute() {
+        await setTimeout(150)
+        handlerReturned = true
+      }
+
+      async failed() {
+        throw new Error('failed() hook error')
+      }
+    }
+
+    const sharedAdapter = memory()()
+
+    Locator.register('StubbornJob', StubbornJob)
+
+    const worker = new Worker({ default: 'memory', adapters: { memory: () => sharedAdapter } })
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await sharedAdapter.push({
+      id: 'stubborn-hook-job',
+      name: 'StubbornJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    await worker.processCycle(['default']) // started
+    await worker.processCycle(['default']) // settles once the handler returned
+
+    assert.isTrue(handlerReturned)
   })
 
   test('should wait for running jobs to complete before stopping', async ({ assert, cleanup }) => {
@@ -1048,15 +1298,91 @@ test.group('Worker', () => {
     assert.isTrue(failedCalled, 'Failed callback should be called')
   })
 
-  test('should handle job class not found', async ({ assert, cleanup }) => {
+  test('should put a job with an unknown class back in the queue', async ({ assert, cleanup }) => {
     const sharedAdapter = memory()()
+    const logger = new MemoryLogger()
 
-    const localConfig = {
+    const worker = new Worker({
       default: 'memory',
       adapters: { memory: () => sharedAdapter },
+      logger,
+    })
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await sharedAdapter.push({
+      id: 'unknown-job',
+      name: 'UnknownJob',
+      payload: { value: 1 },
+      attempts: 0,
+      priority: 0,
+    })
+
+    await worker.processCycle(['default']) // started
+    const cycle = await worker.processCycle(['default']) // completed (requeued)
+    assert.equal(cycle?.type, 'completed')
+
+    // A worker that knows the class runs it later: the job is delayed, not lost.
+    const record = await sharedAdapter.getJob('unknown-job', 'default')
+    assert.equal(record!.status, 'delayed')
+    assert.equal(record!.data.attempts, 1)
+    assert.deepEqual(record!.data.payload, { value: 1 })
+
+    const warnings = logger.logs.filter((entry) => entry.level === 'warn')
+    assert.lengthOf(warnings, 1)
+    assert.include(warnings[0].message, '"UnknownJob" (unknown-job) is not registered')
+    assert.include(warnings[0].message, '(1/10)')
+  })
+
+  test('should fail a job with an unknown class after unknownJobRetries returns', async ({
+    assert,
+    cleanup,
+  }) => {
+    const sharedAdapter = memory()()
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      logger: new MemoryLogger(),
+      defaultJobOptions: { removeOnFail: false },
+      worker: { unknownJobRetries: 2 },
+    })
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    for (const [id, attempts] of [
+      ['returned-twice', 2],
+      ['returned-once', 1],
+    ] as const) {
+      await sharedAdapter.push({ id, name: 'UnknownJob', payload: {}, attempts, priority: 0 })
+      await worker.processCycle(['default']) // started
+      await worker.processCycle(['default']) // completed
     }
 
-    const worker = new Worker(localConfig)
+    const exhausted = await sharedAdapter.getJob('returned-twice', 'default')
+    assert.equal(exhausted!.status, 'failed')
+    assert.equal(exhausted!.error, 'Requested job "UnknownJob" is not registered')
+    assert.equal((await sharedAdapter.getJob('returned-once', 'default'))!.status, 'delayed')
+  })
+
+  test('should fail a job with an unknown class at once when unknownJobRetries is 0', async ({
+    assert,
+    cleanup,
+  }) => {
+    const sharedAdapter = memory()()
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      defaultJobOptions: { removeOnFail: false },
+      worker: { unknownJobRetries: 0 },
+    })
 
     cleanup(async () => {
       Locator.clear()
@@ -1072,11 +1398,73 @@ test.group('Worker', () => {
     })
 
     await worker.processCycle(['default']) // started
-    const cycle = await worker.processCycle(['default']) // completed (job failed)
+    await worker.processCycle(['default']) // completed
 
-    // Job initialization failure is handled gracefully - job is marked as failed
-    // @ts-ignore
-    assert.equal(cycle.type, 'completed')
+    assert.equal((await sharedAdapter.getJob('unknown-job', 'default'))!.status, 'failed')
+  })
+
+  test('should fail a registered job that throws E_JOB_NOT_FOUND at once', async ({
+    assert,
+    cleanup,
+  }) => {
+    class MissingDependencyJob extends Job {
+      constructor() {
+        super()
+        Locator.getOrThrow('MissingDependencyJob')
+      }
+
+      async execute() {}
+    }
+
+    const sharedAdapter = memory()()
+    const logger = new MemoryLogger()
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      logger,
+      defaultJobOptions: { removeOnFail: false },
+    })
+
+    Locator.register('RegisteredJob', MissingDependencyJob)
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await sharedAdapter.push({
+      id: 'registered-job',
+      name: 'RegisteredJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    await worker.processCycle(['default']) // started
+    await worker.processCycle(['default']) // completed
+
+    const record = await sharedAdapter.getJob('registered-job', 'default')
+    assert.equal(record!.status, 'failed')
+    assert.equal(record!.error, 'Requested job "MissingDependencyJob" is not registered')
+    assert.deepEqual(
+      logger.logs.filter((entry) => entry.level === 'warn'),
+      []
+    )
+  })
+
+  test('should reject an invalid unknownJobRetries', ({ assert }) => {
+    for (const unknownJobRetries of [-1, 1.5]) {
+      assert.throws(
+        () =>
+          new Worker({
+            default: 'memory',
+            adapters: { memory: memory() },
+            worker: { unknownJobRetries },
+          }),
+        'Configuration error. Reason: worker.unknownJobRetries must be a non-negative integer'
+      )
+    }
   })
 
   test('should handle job constructor that throws', async ({ assert, cleanup }) => {
@@ -1094,6 +1482,7 @@ test.group('Worker', () => {
     const localConfig = {
       default: 'memory',
       adapters: { memory: () => sharedAdapter },
+      defaultJobOptions: { removeOnFail: false },
     }
 
     Locator.register('BrokenJob', BrokenJob)
@@ -1119,6 +1508,11 @@ test.group('Worker', () => {
     // Job initialization failure is handled gracefully - job is marked as failed
     // @ts-ignore
     assert.equal(cycle.type, 'completed')
+
+    // Unlike an unknown class, a broken job is not put back in the queue.
+    const record = await sharedAdapter.getJob('broken-job', 'default')
+    assert.equal(record!.status, 'failed')
+    assert.equal(record!.error, 'Constructor failed')
   })
 
   test('should recover stalled jobs during processing', async ({ assert, cleanup }) => {
@@ -1205,8 +1599,21 @@ test.group('Worker', () => {
       },
     }
 
+    let executed = false
+    let hookError: Error | undefined
+    let hookPayload: unknown
+
     class TestJob extends Job {
-      async execute() {}
+      static options = { removeOnFail: false }
+
+      async execute() {
+        executed = true
+      }
+
+      async failed(error: Error) {
+        hookError = error
+        hookPayload = this.payload
+      }
     }
 
     Locator.register('TestJob', TestJob)
@@ -1216,7 +1623,7 @@ test.group('Worker', () => {
     await sharedAdapter.pushOn('default', {
       id: 'multi-stalled-job',
       name: 'TestJob',
-      payload: {},
+      payload: { orderId: 42 },
       attempts: 0,
       stalledCount: 1, // Already stalled once
     })
@@ -1227,7 +1634,7 @@ test.group('Worker', () => {
     // Wait for it to become stalled
     await setTimeout(100)
 
-    // Now start a worker - it should detect the stalled job but fail it permanently
+    // Now start a worker - it should detect the stalled job and fail it permanently
     // because stalledCount (1) >= maxStalledCount (1)
     const worker = new Worker(localConfig)
 
@@ -1236,7 +1643,7 @@ test.group('Worker', () => {
       await worker.stop()
     })
 
-    // Run cycles - job should NOT be recovered, just removed
+    // Run cycles - the job must not run again
     let cycles = 0
     let foundJob = false
     while (cycles < 5) {
@@ -1253,6 +1660,132 @@ test.group('Worker', () => {
     }
 
     assert.isFalse(foundJob, 'Job should not have been recovered - it exceeded maxStalledCount')
+    assert.isFalse(executed)
+
+    // It went through the regular failure path: failed() hook and retention
+    assert.instanceOf(hookError, errors.E_JOB_STALLED)
+    assert.deepEqual(hookPayload, { orderId: 42 })
+
+    const record = await sharedAdapter.getJob('multi-stalled-job', 'default')
+    assert.equal(record!.status, 'failed')
+    assert.equal(record!.error, hookError!.message)
+  })
+
+  test('should keep processing and renewing while a stalled job runs failed()', async ({
+    assert,
+    cleanup,
+  }) => {
+    const sharedAdapter = memory()()
+    const hook = Promise.withResolvers<void>()
+    let hookCalls = 0
+    let executedJobId: string | undefined
+
+    class TestJob extends Job {
+      async execute() {
+        executedJobId = this.context.jobId
+      }
+
+      async failed() {
+        hookCalls++
+        await hook.promise
+      }
+    }
+
+    Locator.register('TestJob', TestJob)
+
+    sharedAdapter.setWorkerId('crashed-worker')
+    await sharedAdapter.pushOn('default', {
+      id: 'stalled-slow-hook',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      stalledCount: 1,
+    })
+    await sharedAdapter.popFrom('default')
+    await setTimeout(100)
+
+    await sharedAdapter.pushOn('default', {
+      id: 'fresh-job',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+    })
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      worker: { concurrency: 2, stalledThreshold: 50, stalledInterval: 50, maxStalledCount: 1 },
+    })
+
+    cleanup(async () => {
+      hook.resolve()
+      Locator.clear()
+      await worker.stop()
+    })
+
+    // The stalled job's failed() hangs, but the worker still starts the fresh job.
+    const started = await worker.processCycle(['default'])
+    assert.equal(started?.type, 'started')
+    assert.equal(started?.type === 'started' && started.job.id, 'fresh-job')
+    assert.equal(hookCalls, 1)
+
+    // The heartbeat keeps renewing the stalled job while failed() runs.
+    await setTimeout(120)
+    sharedAdapter.setWorkerId('another-worker')
+    const { exceeded } = await sharedAdapter.recoverStalledJobs('default', 50, 1, 100)
+    assert.deepEqual(exceeded, [])
+
+    hook.resolve()
+    await worker.stop()
+
+    assert.equal(executedJobId, 'fresh-job')
+    assert.equal(hookCalls, 1)
+    assert.isNull(await sharedAdapter.getJob('stalled-slow-hook', 'default'))
+  })
+
+  test('should remove a failed stalled job with the default retention', async ({
+    assert,
+    cleanup,
+  }) => {
+    const sharedAdapter = memory()()
+    let hookCalls = 0
+
+    class TestJob extends Job {
+      async execute() {}
+
+      async failed() {
+        hookCalls++
+      }
+    }
+
+    Locator.register('TestJob', TestJob)
+
+    sharedAdapter.setWorkerId('crashed-worker')
+    await sharedAdapter.pushOn('default', {
+      id: 'stalled-default-retention',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      stalledCount: 1,
+    })
+    await sharedAdapter.popFrom('default')
+    await setTimeout(100)
+
+    const worker = new Worker({
+      default: 'memory',
+      adapters: { memory: () => sharedAdapter },
+      worker: { stalledThreshold: 50, stalledInterval: 50, maxStalledCount: 1 },
+    })
+
+    cleanup(async () => {
+      Locator.clear()
+      await worker.stop()
+    })
+
+    await worker.processCycle(['default'])
+
+    assert.equal(hookCalls, 1)
+    assert.isNull(await sharedAdapter.getJob('stalled-default-retention', 'default'))
   })
 
   test('should not process the same job multiple times with concurrency > 1', async ({
@@ -2315,5 +2848,174 @@ test.group('Worker | Scheduler Integration', () => {
 
     assert.equal(executedJobs.length, 2)
     assert.includeMembers(executedJobs, ['scheduled', 'regular'])
+  })
+})
+
+test.group('Worker | one per process', (group) => {
+  group.each.teardown(() => Locator.clear())
+
+  const config = (adapter: MemoryAdapter) => ({
+    default: 'memory',
+    adapters: { memory: () => adapter },
+    logger: new MemoryLogger(),
+    worker: { idleDelay: 5, gracefulShutdown: false },
+  })
+
+  async function waitFor(condition: () => boolean) {
+    for (let i = 0; i < 200 && !condition(); i++) {
+      await setTimeout(5)
+    }
+  }
+
+  test('start() rejects a second Worker and keeps the first one working', async ({
+    assert,
+    cleanup,
+  }) => {
+    let executed = 0
+
+    class CountedJob extends Job {
+      async execute() {
+        executed++
+      }
+    }
+
+    Locator.register('CountedJob', CountedJob)
+    const adapter = new MemoryAdapter()
+    const first = new Worker(config(adapter))
+    const second = new Worker(config(adapter))
+    cleanup(() => first.stop())
+
+    const running = first.start(['default'])
+    await setTimeout(20)
+
+    await assert.rejects(() => second.start(['default']), errors.E_WORKER_ALREADY_RUNNING)
+
+    // Starting the second Worker did not re-initialize the QueueManager and
+    // destroy the Adapter of the first one.
+    await adapter.push({ id: 'after-second', name: 'CountedJob', payload: {}, attempts: 0 })
+    await waitFor(() => executed === 1)
+    assert.equal(executed, 1)
+
+    await first.stop()
+    await running
+  })
+
+  test('start() accepts another Worker once the first one stopped', async ({ cleanup }) => {
+    const adapter = new MemoryAdapter()
+    const first = new Worker(config(adapter))
+    const second = new Worker(config(adapter))
+    cleanup(async () => {
+      await first.stop()
+      await second.stop()
+    })
+
+    const firstRun = first.start(['default'])
+    await setTimeout(20)
+    await first.stop()
+    await firstRun
+
+    const secondRun = second.start(['default'])
+    await setTimeout(20)
+    await second.stop()
+    await secondRun
+  })
+
+  test('a second start() of the same Worker keeps the process reserved', async ({
+    assert,
+    cleanup,
+  }) => {
+    const first = new Worker(config(new MemoryAdapter()))
+    const other = new Worker(config(new MemoryAdapter()))
+    cleanup(() => first.stop())
+
+    const running = first.start(['default'])
+    await setTimeout(20)
+
+    // The loop already runs: this call returns at once and must not release the process.
+    await first.start(['default'])
+    await assert.rejects(() => other.start(['default']), errors.E_WORKER_ALREADY_RUNNING)
+
+    await first.stop()
+    await running
+  })
+
+  test('the process stays reserved until stop() has finalized every job', async ({
+    assert,
+    cleanup,
+  }) => {
+    class BlockedJob extends Job {
+      async execute() {}
+    }
+
+    const fixture = createWorkerFixture()
+    fixture.adapter.finalizations.block(1)
+    const other = new Worker(config(new MemoryAdapter()))
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(BlockedJob, { id: 'blocked-finalization' })
+    const running = fixture.start()
+    await fixture.adapter.finalizations.waitForStarted(1)
+
+    // The stop has begun, but the finalization still needs the Adapter.
+    const stop = trackPromise(fixture.worker.stop())
+    await setTimeout(10)
+    await assert.rejects(() => other.start(['default']), errors.E_WORKER_ALREADY_RUNNING)
+    assert.isFalse(stop.settled)
+
+    fixture.adapter.finalizations.release(1)
+    await stop.promise
+    await running
+
+    const otherRun = other.start(['default'])
+    await setTimeout(20)
+    await other.stop()
+    await otherRun
+  })
+
+  test('a restart requested during stop() reserves the process again', async ({
+    assert,
+    cleanup,
+  }) => {
+    class BlockedJob extends Job {
+      async execute() {}
+    }
+
+    const fixture = createWorkerFixture()
+    fixture.adapter.finalizations.block(1)
+    const other = new Worker(config(new MemoryAdapter()))
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(BlockedJob, { id: 'blocked-before-restart' })
+    const firstRun = fixture.start()
+    await fixture.adapter.finalizations.waitForStarted(1)
+
+    const stop = trackPromise(fixture.worker.stop())
+    const restart = fixture.start()
+    fixture.adapter.finalizations.release(1)
+    await stop.promise
+    await firstRun
+    await fixture.adapter.acquisitions.waitForStarted(2)
+
+    // The restarted Worker holds the process again.
+    await assert.rejects(() => other.start(['default']), errors.E_WORKER_ALREADY_RUNNING)
+
+    await fixture.worker.stop()
+    await restart
+  })
+
+  test('a start that fails to initialize does not block the next Worker', async ({
+    assert,
+    cleanup,
+  }) => {
+    const broken = new Worker({ default: 'memory', adapters: {} })
+    await assert.rejects(() => broken.start(['default']), errors.E_CONFIGURATION_ERROR)
+
+    const worker = new Worker(config(new MemoryAdapter()))
+    cleanup(() => worker.stop())
+
+    const run = worker.start(['default'])
+    await setTimeout(20)
+    await worker.stop()
+    await run
   })
 })

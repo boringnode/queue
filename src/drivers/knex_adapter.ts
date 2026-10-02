@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import KnexPkg from 'knex'
 import type { Knex } from 'knex'
-import type { Adapter, AcquiredJob, PushResult } from '../contracts/adapter.js'
+import type {
+  Adapter,
+  AcquiredJob,
+  JobLease,
+  PushResult,
+  StalledJobsRecovery,
+} from '../contracts/adapter.js'
 import type {
   DedupOutcome,
   JobData,
@@ -13,7 +19,21 @@ import type {
   ScheduleListOptions,
 } from '../types/main.js'
 import { DEFAULT_PRIORITY } from '../constants.js'
-import { calculateScore, resolveRetention } from '../utils.js'
+import {
+  calculateScore,
+  createLeaseToken,
+  epochToDate,
+  resolveRetention,
+  resolveSchedulePayload,
+} from '../utils.js'
+
+import { KnexQueueSchemaService } from '../services/knex_queue_schema.js'
+import { scheduleDatesMigrationRequiredMessage } from '../services/schedule_dates.js'
+import { SCHEDULE_TIMING_COLUMNS } from '../services/schedule_timing.js'
+
+export { KnexQueueSchemaService } from '../services/knex_queue_schema.js'
+export type { ScheduleDatesMigrationOptions } from '../services/schedule_dates.js'
+export type { TextColumnsMigrationOptions } from '../services/text_columns.js'
 
 export interface KnexAdapterOptions {
   connection: Knex
@@ -22,7 +42,11 @@ export interface KnexAdapterOptions {
   ownsConnection?: boolean
 }
 
-type KnexConfig = Knex | Knex.Config
+/**
+ * A Knex instance, or the config to create one.
+ */
+export type KnexConfig = Knex | Knex.Config
+
 type DbRow = Record<string, unknown>
 
 interface ScheduleRow extends DbRow {
@@ -32,14 +56,14 @@ interface ScheduleRow extends DbRow {
   cron_expression: string | null
   every_ms: number | string | null
   timezone: string | null
-  from_date: Date | string | number | null
-  to_date: Date | string | number | null
+  from_date: number | string | null
+  to_date: number | string | null
   run_limit: number | string | null
   run_count: number | string | null
-  next_run_at: Date | string | number | null
-  last_run_at: Date | string | number | null
+  next_run_at: number | string | null
+  last_run_at: number | string | null
   status: string
-  created_at: Date | string | number | null
+  created_at: number | string | null
 }
 
 /**
@@ -70,6 +94,7 @@ export class KnexAdapter implements Adapter {
   readonly #schedulesTable: string
   readonly #ownsConnection: boolean
   #workerId: string = ''
+  #scheduleDatesCheck: Promise<void> | undefined
 
   constructor(config: KnexAdapterOptions) {
     this.#connection = config.connection
@@ -86,6 +111,35 @@ export class KnexAdapter implements Adapter {
     if (this.#ownsConnection) {
       await this.#connection.destroy()
     }
+  }
+
+  /**
+   * Schema changes of SQL tables belong to the application's migrations, run
+   * through KnexQueueSchemaService. This only fails fast when the schedules
+   * table still needs one.
+   */
+  async migrate(): Promise<void> {
+    const schema = new KnexQueueSchemaService(this.#connection)
+
+    if (await schema.needsScheduleDatesMigration(this.#schedulesTable)) {
+      throw new Error(
+        scheduleDatesMigrationRequiredMessage(this.#schedulesTable, 'KnexQueueSchemaService')
+      )
+    }
+  }
+
+  /**
+   * Runs the migrate() check before the first schedule operation. The 0.8
+   * queries fail on the date columns of a table not migrated yet on
+   * PostgreSQL, and misread them on MySQL and SQLite. A failed check runs
+   * again on the next operation, so a migration run meanwhile is picked up.
+   */
+  #assertScheduleDatesMigrated(): Promise<void> {
+    this.#scheduleDatesCheck ??= this.migrate().catch((error) => {
+      this.#scheduleDatesCheck = undefined
+      throw error
+    })
+    return this.#scheduleDatesCheck
   }
 
   async pop(): Promise<AcquiredJob | null> {
@@ -124,9 +178,11 @@ export class KnexAdapter implements Adapter {
         updateQuery.where('status', 'pending')
       }
 
+      // worker_id holds the lease token of the acquisition.
+      const leaseToken = createLeaseToken(this.#workerId)
       const updated = await updateQuery.update({
         status: 'active',
-        worker_id: this.#workerId,
+        worker_id: leaseToken,
         acquired_at: now,
       })
 
@@ -140,6 +196,7 @@ export class KnexAdapter implements Adapter {
       return {
         ...jobData,
         acquiredAt: now,
+        leaseToken,
       }
     })
   }
@@ -152,6 +209,16 @@ export class KnexAdapter implements Adapter {
   #supportsSkipLocked(): boolean {
     const client = this.#connection.client.config.client
     return client === 'pg' || client === 'mysql' || client === 'mysql2' || client === 'mariadb'
+  }
+
+  #isMysql(): boolean {
+    const client = this.#connection.client.config.client
+    return client === 'mysql' || client === 'mysql2' || client === 'mariadb'
+  }
+
+  #isSqlite(): boolean {
+    const client = String(this.#connection.client.config.client)
+    return client.includes('sqlite')
   }
 
   async #processDelayedJobs(queue: string, now: number): Promise<void> {
@@ -186,74 +253,75 @@ export class KnexAdapter implements Adapter {
     })
   }
 
-  async completeJob(jobId: string, queue: string, removeOnComplete?: JobRetention): Promise<void> {
+  async completeJob(
+    job: JobLease,
+    queue: string,
+    removeOnComplete?: JobRetention
+  ): Promise<boolean> {
     const { keep, maxAge, maxCount } = resolveRetention(removeOnComplete)
 
     if (!keep) {
-      await this.#connection(this.#jobsTable)
-        .where('id', jobId)
-        .where('queue', queue)
-        .where('status', 'active')
-        .delete()
-      return
+      const deleted = await this.#leasedJob(job, queue).delete()
+      return deleted > 0
     }
 
     const now = Date.now()
 
-    const updated = await this.#connection(this.#jobsTable)
-      .where('id', jobId)
-      .where('queue', queue)
-      .where('status', 'active')
-      .update({
-        status: 'completed',
-        worker_id: null,
-        acquired_at: null,
-        finished_at: now,
-      })
+    const updated = await this.#leasedJob(job, queue).update({
+      status: 'completed',
+      worker_id: null,
+      acquired_at: null,
+      finished_at: now,
+    })
 
     if (!updated) {
-      return
+      return false
     }
 
     await this.#pruneHistory(queue, 'completed', maxAge, maxCount, now)
+    return true
   }
 
   async failJob(
-    jobId: string,
+    job: JobLease,
     queue: string,
     error?: Error,
     removeOnFail?: JobRetention
-  ): Promise<void> {
+  ): Promise<boolean> {
     const { keep, maxAge, maxCount } = resolveRetention(removeOnFail)
 
     if (!keep) {
-      await this.#connection(this.#jobsTable)
-        .where('id', jobId)
-        .where('queue', queue)
-        .where('status', 'active')
-        .delete()
-      return
+      const deleted = await this.#leasedJob(job, queue).delete()
+      return deleted > 0
     }
 
     const now = Date.now()
 
-    const updated = await this.#connection(this.#jobsTable)
-      .where('id', jobId)
-      .where('queue', queue)
-      .where('status', 'active')
-      .update({
-        status: 'failed',
-        worker_id: null,
-        acquired_at: null,
-        finished_at: now,
-        error: error?.message || null,
-      })
+    const updated = await this.#leasedJob(job, queue).update({
+      status: 'failed',
+      worker_id: null,
+      acquired_at: null,
+      finished_at: now,
+      error: error?.message || null,
+    })
 
     if (!updated) {
-      return
+      return false
     }
 
     await this.#pruneHistory(queue, 'failed', maxAge, maxCount, now)
+    return true
+  }
+
+  /**
+   * Query on a job still active under the given lease token.
+   */
+  #leasedJob(job: JobLease, queue: string) {
+    return this.#connection(this.#jobsTable)
+      .where('id', job.id)
+      .where('queue', queue)
+      .where('status', 'active')
+      .where('worker_id', job.leaseToken)
   }
 
   async getJob(jobId: string, queue: string): Promise<JobRecord | null> {
@@ -308,26 +376,22 @@ export class KnexAdapter implements Adapter {
     }
   }
 
-  async retryJob(jobId: string, queue: string, retryAt?: Date): Promise<void> {
+  async retryJob(job: JobLease, queue: string, retryAt?: Date): Promise<boolean> {
     const now = Date.now()
 
-    // Get the active job
-    const activeJob = await this.#connection(this.#jobsTable)
-      .where('id', jobId)
-      .where('queue', queue)
-      .where('status', 'active')
-      .first()
+    const activeJob = await this.#leasedJob(job, queue).first()
 
-    if (!activeJob) return
+    if (!activeJob) return false
 
     const jobData: JobData = JSON.parse(activeJob.data)
     jobData.attempts = (jobData.attempts || 0) + 1
 
     const updatedData = JSON.stringify(jobData)
 
+    // The update checks the lease again: it may have been lost since the read.
     if (retryAt && retryAt.getTime() > now) {
       // Move to delayed
-      await this.#connection(this.#jobsTable).where('id', jobId).where('queue', queue).update({
+      const updated = await this.#leasedJob(job, queue).update({
         status: 'delayed',
         data: updatedData,
         worker_id: null,
@@ -335,20 +399,22 @@ export class KnexAdapter implements Adapter {
         score: null,
         execute_at: retryAt.getTime(),
       })
-    } else {
-      // Move back to pending
-      const priority = jobData.priority ?? DEFAULT_PRIORITY
-      const score = calculateScore(priority, now)
-
-      await this.#connection(this.#jobsTable).where('id', jobId).where('queue', queue).update({
-        status: 'pending',
-        data: updatedData,
-        worker_id: null,
-        acquired_at: null,
-        score,
-        execute_at: null,
-      })
+      return updated > 0
     }
+
+    // Move back to pending
+    const priority = jobData.priority ?? DEFAULT_PRIORITY
+    const score = calculateScore(priority, now)
+
+    const updated = await this.#leasedJob(job, queue).update({
+      status: 'pending',
+      data: updatedData,
+      worker_id: null,
+      acquired_at: null,
+      score,
+      execute_at: null,
+    })
+    return updated > 0
   }
 
   async push(jobData: JobData): Promise<PushResult | void> {
@@ -417,7 +483,7 @@ export class KnexAdapter implements Adapter {
     } catch (err) {
       if (this.#isMissingDedupColumn(err)) {
         throw new Error(
-          `Dedup columns missing on "${this.#jobsTable}". Run QueueSchemaService.addDedupColumns() on your jobs table before dispatching jobs with .dedup().`,
+          `Dedup columns missing on "${this.#jobsTable}". Run KnexQueueSchemaService.addDedupColumns() on your jobs table before dispatching jobs with .dedup().`,
           { cause: err }
         )
       }
@@ -444,87 +510,108 @@ export class KnexAdapter implements Adapter {
     dedup: NonNullable<JobData['dedup']>
   ): Promise<PushResult> {
     return this.#connection.transaction(async (trx) => {
-      const existing = await trx(this.#jobsTable)
+      const now = Date.now()
+      const existingResult = await this.#resolveExistingDedup(trx, queue, jobData, dedup, now)
+      if (existingResult) return existingResult
+
+      return this.#insertDedup(trx, queue, jobData.id, insertRow, dedup, now)
+    })
+  }
+
+  async #resolveExistingDedup(
+    trx: Knex.Transaction,
+    queue: string,
+    jobData: JobData,
+    dedup: NonNullable<JobData['dedup']>,
+    now: number
+  ): Promise<PushResult | null> {
+    const existing = await trx(this.#jobsTable)
+      .where('queue', queue)
+      .where('dedup_id', dedup.id)
+      .orderBy('dedup_at', 'desc')
+      .forUpdate()
+      .first()
+
+    if (!existing) return null
+
+    const dedupAt = existing.dedup_at != null ? Number(existing.dedup_at) : null
+    const dedupTtl = existing.dedup_ttl != null ? Number(existing.dedup_ttl) : null
+    const withinTtl = dedupTtl === null || (dedupAt !== null && now - dedupAt < dedupTtl)
+
+    if (withinTtl) {
+      const status = existing.status as JobStatus
+      const replaceable = status === 'pending' || status === 'delayed'
+
+      if (dedup.replace && replaceable) {
+        const storedData =
+          typeof existing.data === 'string' ? JSON.parse(existing.data) : existing.data
+        const newData = { ...storedData, payload: jobData.payload }
+        const updates: Record<string, unknown> = { data: JSON.stringify(newData) }
+        if (dedup.extend && dedupTtl) {
+          updates.dedup_at = now
+        }
+        await trx(this.#jobsTable).where({ id: existing.id, queue }).update(updates)
+        return { outcome: 'replaced' as DedupOutcome, jobId: existing.id as string }
+      }
+
+      if (dedup.extend && dedupTtl) {
+        await trx(this.#jobsTable).where({ id: existing.id, queue }).update({ dedup_at: now })
+        return { outcome: 'extended' as DedupOutcome, jobId: existing.id as string }
+      }
+
+      return { outcome: 'skipped' as DedupOutcome, jobId: existing.id as string }
+    }
+
+    // Release the expired dedup slot. The old job keeps running to completion.
+    const status = existing.status as JobStatus
+    if (status === 'pending' || status === 'delayed' || status === 'active') {
+      await trx(this.#jobsTable)
+        .where({ id: existing.id, queue })
+        .update({ dedup_id: null, dedup_at: null, dedup_ttl: null })
+    }
+
+    return null
+  }
+
+  async #insertDedup(
+    trx: Knex.Transaction,
+    queue: string,
+    jobId: string,
+    insertRow: Record<string, unknown>,
+    dedup: NonNullable<JobData['dedup']>,
+    now: number
+  ): Promise<PushResult> {
+    let raceLost = false
+    try {
+      await trx.transaction(async (sp) => {
+        await sp(this.#jobsTable).insert({
+          ...insertRow,
+          dedup_id: dedup.id,
+          dedup_at: now,
+          dedup_ttl: dedup.ttl ?? null,
+        })
+      })
+    } catch (err) {
+      if (this.#isUniqueViolation(err)) {
+        raceLost = true
+      } else {
+        throw err
+      }
+    }
+
+    if (raceLost) {
+      const winner = await trx(this.#jobsTable)
         .where('queue', queue)
         .where('dedup_id', dedup.id)
+        .whereIn('status', ['pending', 'delayed'])
         .orderBy('dedup_at', 'desc')
-        .forUpdate()
         .first()
-
-      const now = Date.now()
-
-      if (existing) {
-        const dedupAt = existing.dedup_at != null ? Number(existing.dedup_at) : null
-        const dedupTtl = existing.dedup_ttl != null ? Number(existing.dedup_ttl) : null
-        const withinTtl = dedupTtl === null || (dedupAt !== null && now - dedupAt < dedupTtl)
-
-        if (withinTtl) {
-          const status = existing.status as JobStatus
-          const replaceable = status === 'pending' || status === 'delayed'
-
-          if (dedup.replace && replaceable) {
-            const storedData =
-              typeof existing.data === 'string' ? JSON.parse(existing.data) : existing.data
-            const newData = { ...storedData, payload: jobData.payload }
-            const updates: Record<string, unknown> = { data: JSON.stringify(newData) }
-            if (dedup.extend && dedupTtl) {
-              updates.dedup_at = now
-            }
-            await trx(this.#jobsTable).where({ id: existing.id, queue }).update(updates)
-            return { outcome: 'replaced' as DedupOutcome, jobId: existing.id as string }
-          }
-
-          if (dedup.extend && dedupTtl) {
-            await trx(this.#jobsTable).where({ id: existing.id, queue }).update({ dedup_at: now })
-            return { outcome: 'extended' as DedupOutcome, jobId: existing.id as string }
-          }
-
-          return { outcome: 'skipped' as DedupOutcome, jobId: existing.id as string }
-        }
-        // TTL expired — release the dedup slot from the old row so the new
-        // insert can claim it. The old job keeps running to completion; only
-        // its dedup identity is cleared. Retained history rows are excluded
-        // from the partial unique index predicate, so no update needed there.
-        const status = existing.status as JobStatus
-        if (status === 'pending' || status === 'delayed' || status === 'active') {
-          await trx(this.#jobsTable)
-            .where({ id: existing.id, queue })
-            .update({ dedup_id: null, dedup_at: null, dedup_ttl: null })
-        }
+      if (winner) {
+        return { outcome: 'skipped' as DedupOutcome, jobId: winner.id as string }
       }
+    }
 
-      let raceLost = false
-      try {
-        await trx.transaction(async (sp) => {
-          await sp(this.#jobsTable).insert({
-            ...insertRow,
-            dedup_id: dedup.id,
-            dedup_at: now,
-            dedup_ttl: dedup.ttl ?? null,
-          })
-        })
-      } catch (err) {
-        if (this.#isUniqueViolation(err)) {
-          raceLost = true
-        } else {
-          throw err
-        }
-      }
-
-      if (raceLost) {
-        const winner = await trx(this.#jobsTable)
-          .where('queue', queue)
-          .where('dedup_id', dedup.id)
-          .whereIn('status', ['pending', 'delayed'])
-          .orderBy('dedup_at', 'desc')
-          .first()
-        if (winner) {
-          return { outcome: 'skipped' as DedupOutcome, jobId: winner.id as string }
-        }
-      }
-
-      return { outcome: 'added' as DedupOutcome, jobId: jobData.id }
-    })
+    return { outcome: 'added' as DedupOutcome, jobId }
   }
 
   #isUniqueViolation(err: unknown): boolean {
@@ -577,14 +664,16 @@ export class KnexAdapter implements Adapter {
   async recoverStalledJobs(
     queue: string,
     stalledThreshold: number,
-    maxStalledCount: number
-  ): Promise<number> {
+    maxStalledCount: number,
+    maxExceeded: number
+  ): Promise<StalledJobsRecovery> {
     const now = Date.now()
     const stalledCutoff = now - stalledThreshold
 
     // Use a transaction with row locking to prevent race conditions
     return this.#connection.transaction(async (trx) => {
       let recovered = 0
+      const exceeded: AcquiredJob[] = []
 
       let query = trx(this.#jobsTable)
         .where('queue', queue)
@@ -603,8 +692,18 @@ export class KnexAdapter implements Adapter {
         const currentStalledCount = jobData.stalledCount ?? 0
 
         if (currentStalledCount >= maxStalledCount) {
-          // Fail permanently - remove the job
-          await trx(this.#jobsTable).where('id', row.id).where('queue', queue).delete()
+          // Past maxExceeded, the job stays stalled for a later recovery.
+          if (exceeded.length >= maxExceeded) continue
+
+          // Reacquire for this worker, which fails it through the regular path.
+          const leaseToken = createLeaseToken(this.#workerId)
+          const updated = await trx(this.#jobsTable)
+            .where('id', row.id)
+            .where('queue', queue)
+            .where('status', 'active')
+            .update({ worker_id: leaseToken, acquired_at: now })
+
+          if (updated > 0) exceeded.push({ ...jobData, acquiredAt: now, leaseToken })
         } else {
           // Recover: increment stalledCount and put back in pending
           jobData.stalledCount = currentStalledCount + 1
@@ -626,64 +725,86 @@ export class KnexAdapter implements Adapter {
         }
       }
 
-      return recovered
+      return { recovered, exceeded }
     })
   }
 
-  async renewJobs(queue: string, jobIds: string[]): Promise<number> {
-    if (jobIds.length === 0) {
+  async renewJobs(queue: string, jobs: JobLease[]): Promise<number> {
+    if (jobs.length === 0) {
       return 0
     }
 
     const now = Date.now()
 
-    // Only renew jobs that are still active AND still owned by this worker; a
-    // job that was already recovered, finalized, or re-acquired by another
-    // worker will not match and is therefore never resurrected.
+    // Only renew jobs that are still active under their lease token; a job
+    // that was already recovered, finalized, or acquired again will not match
+    // and is therefore never resurrected. A token belongs to one acquisition of
+    // one job, so matching ids and tokens separately cannot mix up two jobs.
     const renewed = await this.#connection(this.#jobsTable)
       .where('queue', queue)
       .where('status', 'active')
-      .where('worker_id', this.#workerId)
-      .whereIn('id', jobIds)
+      .whereIn(
+        'id',
+        jobs.map((job) => job.id)
+      )
+      .whereIn(
+        'worker_id',
+        jobs.map((job) => job.leaseToken)
+      )
       .update({ acquired_at: now })
 
     return renewed
   }
 
   async upsertSchedule(config: ScheduleConfig): Promise<string> {
-    const id = config.id ?? randomUUID()
+    await this.#assertScheduleDatesMigrated()
 
-    const data = {
-      id,
+    const id = config.id ?? randomUUID()
+    const nextRunAt = config.nextRunAt?.getTime() ?? null
+
+    const definition = {
       name: config.name,
-      payload: JSON.stringify(config.payload),
+      payload: JSON.stringify(resolveSchedulePayload(config.payload)),
       cron_expression: config.cronExpression ?? null,
       every_ms: config.everyMs ?? null,
       timezone: config.timezone,
-      from_date: config.from ?? null,
-      to_date: config.to ?? null,
+      from_date: config.from?.getTime() ?? null,
+      to_date: config.to?.getTime() ?? null,
       run_limit: config.limit ?? null,
-      status: 'active',
     }
 
-    // Atomic upsert
+    // One statement creates or updates the row. It takes the row lock (the
+    // write lock on SQLite) itself, so concurrent upserts and claims apply one
+    // after the other: a transaction reading the row first can deadlock on
+    // MySQL, and fail with SQLITE_BUSY on SQLite.
+    const column = (name: string) => `${this.#schedulesTable}.${name}`
+    const nullSafeEquals = this.#isMysql()
+      ? '<=>'
+      : this.#isSqlite()
+        ? 'is'
+        : 'is not distinct from'
+    const sameTiming = SCHEDULE_TIMING_COLUMNS.map(() => `?? ${nullSafeEquals} ?`).join(' and ')
+
     await this.#connection(this.#schedulesTable)
       .insert({
-        ...data,
+        ...definition,
+        id,
+        status: 'active',
+        next_run_at: nextRunAt,
         run_count: 0,
-        created_at: this.#connection.fn.now(),
+        created_at: Date.now(),
       })
       .onConflict('id')
       .merge({
-        name: data.name,
-        payload: data.payload,
-        cron_expression: data.cron_expression,
-        every_ms: data.every_ms,
-        timezone: data.timezone,
-        from_date: data.from_date,
-        to_date: data.to_date,
-        run_limit: data.run_limit,
-        status: 'active',
+        // The status, run metadata, and next run belong to the running
+        // schedule; a new timing takes this next run. First, since MySQL
+        // assigns in order and the timing columns must hold stored values.
+        next_run_at: this.#connection.raw(`case when ${sameTiming} then ?? else ? end`, [
+          ...SCHEDULE_TIMING_COLUMNS.flatMap((name) => [column(name), definition[name]]),
+          column('next_run_at'),
+          nextRunAt,
+        ]),
+        ...definition,
       })
 
     return id
@@ -697,6 +818,8 @@ export class KnexAdapter implements Adapter {
   }
 
   async getSchedule(id: string): Promise<ScheduleData | null> {
+    await this.#assertScheduleDatesMigrated()
+
     const row = (await this.#connection(this.#schedulesTable).where('id', id).first()) as
       | ScheduleRow
       | undefined
@@ -706,6 +829,8 @@ export class KnexAdapter implements Adapter {
   }
 
   async listSchedules(options?: ScheduleListOptions): Promise<ScheduleData[]> {
+    await this.#assertScheduleDatesMigrated()
+
     let query = this.#connection(this.#schedulesTable).whereNot('status', 'cancelled')
 
     if (options?.status) {
@@ -720,11 +845,13 @@ export class KnexAdapter implements Adapter {
     id: string,
     updates: Partial<Pick<ScheduleData, 'status' | 'nextRunAt' | 'lastRunAt' | 'runCount'>>
   ): Promise<void> {
+    await this.#assertScheduleDatesMigrated()
+
     const data: Record<string, unknown> = {}
 
     if (updates.status !== undefined) data.status = updates.status
-    if (updates.nextRunAt !== undefined) data.next_run_at = updates.nextRunAt
-    if (updates.lastRunAt !== undefined) data.last_run_at = updates.lastRunAt
+    if (updates.nextRunAt !== undefined) data.next_run_at = updates.nextRunAt?.getTime() ?? null
+    if (updates.lastRunAt !== undefined) data.last_run_at = updates.lastRunAt?.getTime() ?? null
     if (updates.runCount !== undefined) data.run_count = updates.runCount
 
     if (Object.keys(data).length > 0) {
@@ -733,11 +860,15 @@ export class KnexAdapter implements Adapter {
   }
 
   async deleteSchedule(id: string): Promise<void> {
+    await this.#assertScheduleDatesMigrated()
+
     await this.#connection(this.#schedulesTable).where('id', id).delete()
   }
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
-    const now = new Date()
+    await this.#assertScheduleDatesMigrated()
+
+    const now = Date.now()
 
     return this.#connection.transaction(async (trx) => {
       // Find one due schedule with row locking
@@ -762,19 +893,19 @@ export class KnexAdapter implements Adapter {
       if (!row) return null
 
       // Calculate next run time
-      let nextRunAt: Date | null = null
+      let nextRunAt: number | null = null
       const newRunCount = Number(row.run_count ?? 0) + 1
 
       if (row.every_ms) {
-        nextRunAt = new Date(now.getTime() + Number(row.every_ms))
+        nextRunAt = now + Number(row.every_ms)
       } else if (row.cron_expression) {
         // Import cron-parser dynamically to calculate next run
         const { CronExpressionParser } = await import('cron-parser')
         const cron = CronExpressionParser.parse(row.cron_expression, {
-          currentDate: now,
+          currentDate: new Date(now),
           tz: row.timezone || 'UTC',
         })
-        nextRunAt = cron.next().toDate()
+        nextRunAt = cron.next().getTime()
       }
 
       // Check if limit will be reached
@@ -783,7 +914,7 @@ export class KnexAdapter implements Adapter {
       }
 
       // Check if past end date
-      if (nextRunAt && row.to_date && nextRunAt > new Date(row.to_date)) {
+      if (nextRunAt && row.to_date && nextRunAt > Number(row.to_date)) {
         nextRunAt = null
       }
 
@@ -807,14 +938,14 @@ export class KnexAdapter implements Adapter {
       cronExpression: row.cron_expression ?? null,
       everyMs: row.every_ms ? Number(row.every_ms) : null,
       timezone: row.timezone ?? 'UTC',
-      from: row.from_date ? new Date(row.from_date) : null,
-      to: row.to_date ? new Date(row.to_date) : null,
+      from: epochToDate(row.from_date),
+      to: epochToDate(row.to_date),
       limit: row.run_limit ? Number(row.run_limit) : null,
       runCount: Number(row.run_count ?? 0),
-      nextRunAt: row.next_run_at ? new Date(row.next_run_at) : null,
-      lastRunAt: row.last_run_at ? new Date(row.last_run_at) : null,
+      nextRunAt: epochToDate(row.next_run_at),
+      lastRunAt: epochToDate(row.last_run_at),
       status: row.status === 'paused' || row.status === 'cancelled' ? 'paused' : 'active',
-      createdAt: row.created_at ? new Date(row.created_at) : new Date(),
+      createdAt: epochToDate(row.created_at) ?? new Date(),
     }
   }
 }

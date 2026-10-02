@@ -4,18 +4,21 @@ import { fake } from '../src/drivers/fake_adapter.js'
 import { JobPool } from '../src/job_pool.js'
 import {
   WorkerSession,
+  type JobExecutor,
   type WorkerSessionOptions,
   type WorkerSessionSettings,
 } from '../src/worker_session.js'
 import { ControllableAdapter } from './_mocks/controllable_adapter.js'
 import { trackPromise } from './_utils/track_promise.js'
+import { MemoryLogger } from './_mocks/memory_logger.js'
 
-type SessionOverrides = Partial<Omit<WorkerSessionOptions, 'settings'>> & {
+type SessionOverrides = Partial<Omit<WorkerSessionOptions, 'settings' | 'jobExecutionRuntime'>> & {
+  jobExecutionRuntime?: Partial<JobExecutor>
   settings?: Partial<WorkerSessionSettings>
 }
 
 function createSession(overrides: SessionOverrides = {}): WorkerSession {
-  const { settings, ...options } = overrides
+  const { settings, jobExecutionRuntime, ...options } = overrides
 
   return new WorkerSession({
     workerId: 'test-worker',
@@ -23,17 +26,25 @@ function createSession(overrides: SessionOverrides = {}): WorkerSession {
     adapter: fake()(),
     jobExecutionRuntime: {
       execute: async () => ({ type: 'completed' as const }),
+      failStalled: async () => ({
+        type: 'failed' as const,
+        reason: 'stalled' as const,
+        error: new Error('stalled'),
+      }),
+      ...jobExecutionRuntime,
     },
     scheduleDispatcher: {
       dispatch: async () => ({ jobId: 'scheduled-job' }),
     },
     wrapInternal: (operation) => operation(),
+    logger: new MemoryLogger(),
     settings: {
       concurrency: 1,
       idleDelay: 10,
       stalledInterval: 30_000,
       stalledThreshold: 30_000,
       maxStalledCount: 1,
+      unknownJobRetries: 10,
       ...settings,
     },
     ...options,
@@ -373,6 +384,51 @@ test.group('WorkerSession', () => {
     assert.isNull(await adapter.getJob('late-job-1', 'default'))
   })
 
+  test('does not report or fail an unknown job whose lease was lost', async ({
+    assert,
+    cleanup,
+  }) => {
+    const adapter = new ControllableAdapter()
+    const logger = new MemoryLogger()
+    let failed = false
+    adapter.retryJob = async () => false
+    adapter.failJob = async () => {
+      failed = true
+      return true
+    }
+    const session = createSession({
+      adapter,
+      logger,
+      jobExecutionRuntime: {
+        execute: async () => ({
+          type: 'initialization-failed' as const,
+          error: new Error('not registered'),
+          jobNotFound: true as const,
+        }),
+      },
+    })
+
+    cleanup(() => session.stop())
+
+    await adapter.pushOn('default', {
+      id: 'lost-unknown-job',
+      name: 'UnknownJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    assert.equal((await session.processCycle())?.type, 'started')
+    assert.equal((await session.processCycle())?.type, 'completed')
+
+    // The job was acquired again elsewhere: no warning about a return that did not happen.
+    assert.deepEqual(
+      logger.logs.filter((entry) => entry.level === 'warn'),
+      []
+    )
+    assert.isFalse(failed)
+  })
+
   test('cannot restart after reaching quiescence', async ({ assert }) => {
     const session = createSession()
 
@@ -490,6 +546,27 @@ test.group('WorkerSession', () => {
     assert.isTrue(start.settled)
   })
 
+  test('logs a failed cycle through the logger', async ({ assert, cleanup }) => {
+    const adapter = new ControllableAdapter()
+    const error = new Error('Failed to acquire job')
+    adapter.acquisitions.fail(1, error)
+    const logger = new MemoryLogger()
+    const session = createSession({ adapter, logger })
+    cleanup(() => session.stop())
+
+    const start = session.start()
+    await adapter.acquisitions.waitForSettled(1)
+    await setTimeout(0)
+    await session.stop()
+    await start
+
+    const errors = logger.logs.filter((entry) => entry.level === 'error')
+    assert.lengthOf(errors, 1)
+    assert.strictEqual(errors[0].obj?.err, error)
+    assert.equal(errors[0].obj?.workerId, 'test-worker')
+    assert.equal(errors[0].message, 'Worker cycle failed, next attempt in 5000ms')
+  })
+
   test('suppresses an acquired cycle after stopping', async ({ assert, cleanup }) => {
     const adapter = new ControllableAdapter()
     adapter.acquisitions.block(1)
@@ -514,6 +591,106 @@ test.group('WorkerSession', () => {
 
     assert.isNull(await cycle)
     await stop
+  })
+
+  test('waits for stalled jobs recovered while stopping to be failed', async ({
+    assert,
+    cleanup,
+  }) => {
+    const adapter = new ControllableAdapter()
+    const hookStarted = Promise.withResolvers<void>()
+    const hookGate = Promise.withResolvers<void>()
+
+    adapter.setWorkerId('crashed-worker')
+    await adapter.pushOn('default', {
+      id: 'stalled-job',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      stalledCount: 1,
+    })
+    await adapter.popFrom('default')
+    await setTimeout(20)
+
+    adapter.stalledChecks.block(1)
+    const session = createSession({
+      adapter,
+      jobExecutionRuntime: {
+        async failStalled() {
+          hookStarted.resolve()
+          await hookGate.promise
+          return { type: 'failed', reason: 'stalled', error: new Error('stalled') }
+        },
+      },
+      settings: { stalledThreshold: 10 },
+    })
+    cleanup(async () => {
+      hookGate.resolve()
+      adapter.releaseAll()
+      await session.stop()
+    })
+
+    const cycle = session.processCycle()
+    await adapter.stalledChecks.waitForStarted()
+    const stop = trackPromise(session.stop())
+    adapter.stalledChecks.release(1)
+
+    await hookStarted.promise
+    await setTimeout(20)
+    assert.isFalse(stop.settled)
+
+    hookGate.resolve()
+    await stop.promise
+    assert.isNull(await cycle)
+    assert.isNull(await adapter.getJob('stalled-job', 'default'))
+  })
+
+  test('fails at most as many stalled jobs as there are free slots', async ({
+    assert,
+    cleanup,
+  }) => {
+    const adapter = new ControllableAdapter()
+    const hookGate = Promise.withResolvers<void>()
+    const firstHookStarted = Promise.withResolvers<void>()
+    const failed: string[] = []
+
+    adapter.setWorkerId('crashed-worker')
+    for (const id of ['stalled-1', 'stalled-2']) {
+      await adapter.pushOn('default', {
+        id,
+        name: 'TestJob',
+        payload: {},
+        attempts: 0,
+        stalledCount: 1,
+      })
+      await adapter.popFrom('default')
+    }
+    await setTimeout(20)
+
+    const session = createSession({
+      adapter,
+      jobExecutionRuntime: {
+        async failStalled(job) {
+          failed.push(job.id)
+          firstHookStarted.resolve()
+          await hookGate.promise
+          return { type: 'failed', reason: 'stalled', error: new Error('stalled') }
+        },
+      },
+      settings: { concurrency: 1, stalledThreshold: 10 },
+    })
+    cleanup(async () => {
+      hookGate.resolve()
+      await session.stop()
+    })
+
+    void session.processCycle()
+    await firstHookStarted.promise
+    await setTimeout(20)
+
+    assert.lengthOf(failed, 1)
+    const [other] = ['stalled-1', 'stalled-2'].filter((id) => id !== failed[0])
+    assert.equal((await adapter.getJob(other, 'default'))!.status, 'active')
   })
 
   test('suppresses a stalled-check error after stopping', async ({ assert, cleanup }) => {

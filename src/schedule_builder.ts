@@ -50,7 +50,8 @@ export class ScheduleBuilder<TPayload = unknown> implements PromiseLike<Schedule
   /**
    * Set a custom schedule ID.
    * If not specified, defaults to the job name.
-   * If a schedule with this ID exists, it will be updated (upsert).
+   * If a schedule with this ID exists, it will be updated (upsert): it keeps
+   * its status, and its next run unless its timing changes.
    */
   id(scheduleId: string): this {
     this.#id = scheduleId
@@ -170,16 +171,15 @@ export class ScheduleBuilder<TPayload = unknown> implements PromiseLike<Schedule
       from: this.#from,
       to: this.#to,
       limit: this.#limit,
+      // Only used if the schedule is new or its timing changed: running the
+      // same definition again, at every boot, keeps its status and next run.
+      nextRunAt: this.#calculateNextRunAt(),
     }
 
     const { adapter } = resolveJobDispatchTarget(jobOptions, {
       adapter: this.#adapter,
     })
     const scheduleId = await adapter.upsertSchedule(config)
-
-    // Calculate and set nextRunAt
-    const nextRunAt = this.#calculateNextRunAt()
-    await adapter.updateSchedule(scheduleId, { nextRunAt })
 
     return { scheduleId }
   }

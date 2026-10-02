@@ -40,9 +40,26 @@ export const E_JOB_MAX_ATTEMPTS_REACHED = createError<[jobName: string]>(
   'E_JOB_MAX_ATTEMPTS_REACHED'
 )
 
+export const E_JOB_STALLED = createError<[jobName: string, maxStalledCount: number]>(
+  'The job "%s" stalled more than the allowed %d time(s)',
+  'E_JOB_STALLED'
+)
+
 export const E_JOB_TIMEOUT = createError<[jobName: string, timeout: number]>(
   'The job "%s" has exceeded the timeout of %dms',
   'E_JOB_TIMEOUT'
+)
+
+export const E_INVALID_TIMEOUT = createError<[timeout: string]>(
+  'Invalid timeout "%s": use 0 for no timeout, or a whole number of milliseconds from 1 to 2147483647 (about 24.8 days)',
+  'E_INVALID_TIMEOUT',
+  500
+)
+
+export const E_WORKER_ALREADY_RUNNING = createError(
+  'Another Worker is already running in this process. Run one Worker per process.',
+  'E_WORKER_ALREADY_RUNNING',
+  500
 )
 
 export const E_QUEUE_NOT_INITIALIZED = createError(
@@ -54,12 +71,6 @@ export const E_QUEUE_NOT_INITIALIZED = createError(
 export const E_ADAPTER_INIT_ERROR = createError<[adapterName: string, originalMessage: string]>(
   'Failed to initialize adapter "%s". Reason: %s',
   'E_ADAPTER_INIT_ERROR',
-  500
-)
-
-export const E_NO_JOBS_FOUND = createError<[patterns: string]>(
-  'No jobs found for the specified locations: %s. Verify your glob patterns match your job files.',
-  'E_NO_JOBS_FOUND',
   500
 )
 

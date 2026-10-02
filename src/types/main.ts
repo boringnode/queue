@@ -281,6 +281,9 @@ export interface JobOptions {
   /**
    * Maximum execution time before timeout.
    *
+   * `0` disables the timeout, including one set by default. Must not exceed
+   * 2^31 - 1 ms (about 24.8 days).
+   *
    * @default undefined (no timeout)
    */
   timeout?: Duration
@@ -489,7 +492,8 @@ export interface WorkerConfig {
 
   /**
    * Maximum duration a job can run before being timed out.
-   * Can be overridden per job via JobOptions.timeout.
+   * Can be overridden per job via JobOptions.timeout. `0` means no timeout.
+   * Must not exceed 2^31 - 1 ms (about 24.8 days).
    * @default undefined (no timeout)
    */
   timeout?: Duration
@@ -514,6 +518,17 @@ export interface WorkerConfig {
    * @default 1
    */
   maxStalledCount?: number
+
+  /**
+   * A job whose class this worker does not know goes back to the queue, to
+   * run again 30 seconds later, while it has fewer attempts than this limit;
+   * then it fails for good. This covers rolling deploys, where an old worker
+   * takes a job dispatched by new code. The limit counts all the attempts of
+   * the job: a new job gets up to 10 returns by default (about 5 minutes), a
+   * job that already retried gets fewer. Each return counts as an attempt.
+   * @default 10
+   */
+  unknownJobRetries?: number
 
   /**
    * Whether to automatically stop the worker on SIGINT/SIGTERM signals.
@@ -599,6 +614,14 @@ export interface ScheduleConfig {
 
   /** Maximum number of runs (null = unlimited) */
   limit?: number
+
+  /**
+   * Next run of a new schedule, or of an existing one whose timing (cron,
+   * interval, timezone, boundaries, or limit) changes. An existing schedule
+   * with the same timing keeps its next run. Without it, such a schedule has
+   * no next run until `updateSchedule()` sets one.
+   */
+  nextRunAt?: Date
 }
 
 /**

@@ -1,6 +1,7 @@
 import { setTimeout as sleep } from 'node:timers/promises'
 import { QueueManager } from '../queue_manager.js'
-import type { Adapter, AcquiredJob } from '../contracts/adapter.js'
+import { createLeaseToken } from '../utils.js'
+import type { Adapter, AcquiredJob, JobLease, StalledJobsRecovery } from '../contracts/adapter.js'
 import type {
   JobData,
   JobRetention,
@@ -78,33 +79,34 @@ export class SyncAdapter implements Adapter {
     throw new Error('SyncAdapter does not support pop - jobs are executed immediately on push')
   }
 
-  completeJob(_jobId: string, _queue: string, _removeOnComplete?: JobRetention): Promise<void> {
-    return Promise.resolve()
+  completeJob(_job: JobLease, _queue: string, _removeOnComplete?: JobRetention): Promise<boolean> {
+    return Promise.resolve(false)
   }
 
   failJob(
-    _jobId: string,
+    _job: JobLease,
     _queue: string,
     _error?: Error,
     _removeOnFail?: JobRetention
-  ): Promise<void> {
-    return Promise.resolve()
+  ): Promise<boolean> {
+    return Promise.resolve(false)
   }
 
-  retryJob(_jobId: string, _queue: string, _retryAt?: Date): Promise<void> {
-    return Promise.resolve()
+  retryJob(_job: JobLease, _queue: string, _retryAt?: Date): Promise<boolean> {
+    return Promise.resolve(false)
   }
 
   recoverStalledJobs(
     _queue: string,
     _stalledThreshold: number,
-    _maxStalledCount: number
-  ): Promise<number> {
+    _maxStalledCount: number,
+    _maxExceeded: number
+  ): Promise<StalledJobsRecovery> {
     // SyncAdapter has no stalled jobs - jobs are executed immediately
-    return Promise.resolve(0)
+    return Promise.resolve({ recovered: 0, exceeded: [] })
   }
 
-  renewJobs(_queue: string, _jobIds: string[]): Promise<number> {
+  renewJobs(_queue: string, _jobs: JobLease[]): Promise<number> {
     // SyncAdapter executes jobs immediately - there is nothing to renew
     return Promise.resolve(0)
   }
@@ -114,6 +116,10 @@ export class SyncAdapter implements Adapter {
   }
 
   destroy(): Promise<void> {
+    return Promise.resolve()
+  }
+
+  migrate(): Promise<void> {
     return Promise.resolve()
   }
 
@@ -160,8 +166,19 @@ export class SyncAdapter implements Adapter {
 
     while (true) {
       const now = Date.now()
-      const acquiredJob: AcquiredJob = { ...jobData, attempts, acquiredAt: now }
+      const acquiredJob: AcquiredJob = {
+        ...jobData,
+        attempts,
+        acquiredAt: now,
+        leaseToken: createLeaseToken('sync'),
+      }
       const outcome = await runtime.execute(acquiredJob, queue)
+
+      // A timed out handler keeps running until it returns: wait for it, so
+      // the caller never sees two attempts running at once.
+      if ('timedOutExecution' in outcome) {
+        await outcome.timedOutExecution
+      }
 
       if (outcome.type === 'initialization-failed') {
         throw outcome.error

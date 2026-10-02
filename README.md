@@ -257,7 +257,7 @@ const { jobId, deduped } = await SaveDraftJob.dispatch({ content: '...' })
 
 - The dedup ID is automatically prefixed with the job name (`SendInvoiceJob::order-123`), so different job types can reuse the same key.
 - The user-supplied `id` must be ≤ 400 characters, and the combined `<jobName>::<id>` key must be ≤ 510 characters (constrained by the Knex storage column). Both limits are validated at `.dedup()` time.
-- `ttl` accepts a Duration (`'5s'`, `'1m'`) or milliseconds, and must be **positive** when provided. Use `0` or omit `ttl` if you want no expiry — `ttl: 0` is rejected to avoid an ambiguous "expired immediately vs no-expiry" interpretation across engines.
+- `ttl` accepts a Duration (`'5s'`, `'1m'`) or milliseconds, and must be **positive** when provided. Omit `ttl` if you want no expiry. `ttl: 0` is rejected to avoid an ambiguous "expired immediately vs no-expiry" interpretation across engines.
 - `extend` and `replace` **require** `ttl` — calling them without `ttl` throws.
 - `replace` only applies to jobs in `pending` or `delayed` state. Jobs that are active (executing) or retained in history (`completed`/`failed` with retention) are left alone; the dispatch returns `{ deduped: 'skipped' }`.
 - `replace` swaps the **payload only** — priority, queue, delay, groupId, and stored dedup options of the existing job are retained. To change those, use a different dedup id or wait for the TTL to expire.
@@ -265,9 +265,9 @@ const { jobId, deduped } = await SaveDraftJob.dispatch({ content: '...' })
 - `extend` works in **all states** — even when the existing job is `active` (executing) or retained in history. Unlike `replace` (which is no-op on non-replaceable states), `extend` always refreshes the dedup TTL window. Use this when you want the dedup slot to keep blocking new dispatches for the lifetime of a long-running job.
 - `extend` requires the **first** dispatch to have set a `ttl`. If the slot was created without a `ttl`, later `extend` dispatches have no window to refresh and return `{ deduped: 'skipped' }` instead of `'extended'`.
 - `retryJob` does not touch the dedup entry — a retried job continues to occupy the dedup slot. TTL runs on wall-clock time, so long-running retries may outlive the TTL window. Use a generous TTL or no TTL if retries must stay deduped.
-- Atomic and race-free:
+- Atomicity:
   - **Redis**: a single Lua script per dispatch performs the dedup-key lookup, state check (pending/delayed ZSCORE), payload swap, and TTL refresh atomically.
-  - **Knex/Kysely**: transactional `SELECT ... FOR UPDATE` + insert/update inside a transaction. A savepoint catches unique-constraint violations under concurrent inserts and returns `{ deduped: 'skipped' }` pointing at the winner.
+  - **Knex/Kysely**: transactional `SELECT ... FOR UPDATE` + insert/update inside a transaction. On PostgreSQL and SQLite, a partial unique index makes concurrent first dispatches race-free: a savepoint catches the unique-constraint violation and returns `{ deduped: 'skipped' }` pointing at the winner. MySQL has no partial unique index, see the caveat below.
   - **SyncAdapter**: executes inline, no dedup support.
 
 ### Caveats
@@ -334,6 +334,37 @@ const connection = new Redis({ host: 'localhost' })
 const adapter = redis(connection)
 ```
 
+#### Migrating Redis schedules after an upgrade
+
+The Redis adapter stores each schedule at `schedules::data::<id>` and uses a `schedules::due`
+sorted-set index to find due schedules. When upgrading from 0.7 or earlier, stop every process that
+runs the previous version, then run the adapter migration once, before starting any workers:
+
+```typescript
+import { QueueManager, Worker } from '@boringnode/queue'
+
+await QueueManager.init(config)
+await QueueManager.use('redis').migrate()
+
+const worker = new Worker(config)
+await worker.start(['default'])
+```
+
+The migration is idempotent. It moves schedules from their 0.7 location (`schedules::<id>`) and
+rebuilds the derived index from the canonical schedule hashes. Existing Redis schedules are not
+visible to the new version until it has run. Do not run the `O(number of schedules)` migration from
+the worker polling loop.
+
+Until then, defining a schedule still stored at its 0.7 key throws an error that points to
+`migrate()`, so a schedule defined at boot cannot replace its 0.7 status and run count.
+
+Processes still running 0.7 do not see migrated schedules, and the migration cannot be rolled back
+by downgrading. Do not mix 0.7 and newer processes during the deployment.
+
+If a destination key already holds something other than the schedule being moved, the migration
+stops without changing anything and its error names that key. Remove or rename the key, then run the
+migration again.
+
 ### Knex (PostgreSQL, MySQL, SQLite)
 
 ```typescript
@@ -361,16 +392,16 @@ const adapter = knex(config, 'custom_jobs_table')
 </details>
 
 <details>
-<summary><strong>Database setup with QueueSchemaService</strong></summary>
+<summary><strong>Database setup with KnexQueueSchemaService</strong></summary>
 
-The Knex adapter requires tables to be created before use. Use `QueueSchemaService` to create them:
+The Knex adapter requires tables to be created before use. Use `KnexQueueSchemaService` to create them:
 
 ```typescript
-import { QueueSchemaService } from '@boringnode/queue'
+import { KnexQueueSchemaService } from '@boringnode/queue/drivers/knex_adapter'
 import Knex from 'knex'
 
 const connection = Knex({ client: 'pg', connection: '...' })
-const schemaService = new QueueSchemaService(connection)
+const schemaService = new KnexQueueSchemaService(connection)
 
 // Create tables with default names
 await schemaService.createJobsTable()
@@ -386,17 +417,17 @@ await schemaService.createJobsTable('queue_jobs', (table) => {
 
 ```typescript
 import { BaseSchema } from '@adonisjs/lucid/schema'
-import { QueueSchemaService } from '@boringnode/queue'
+import { KnexQueueSchemaService } from '@boringnode/queue/drivers/knex_adapter'
 
 export default class extends BaseSchema {
   async up() {
-    const schemaService = new QueueSchemaService(this.db.connection().getWriteClient())
+    const schemaService = new KnexQueueSchemaService(this.db.connection().getWriteClient())
     await schemaService.createJobsTable()
     await schemaService.createSchedulesTable()
   }
 
   async down() {
-    const schemaService = new QueueSchemaService(this.db.connection().getWriteClient())
+    const schemaService = new KnexQueueSchemaService(this.db.connection().getWriteClient())
     await schemaService.dropSchedulesTable()
     await schemaService.dropJobsTable()
   }
@@ -441,6 +472,56 @@ await schema.dropJobsTable()
 ```
 
 </details>
+
+#### Migrating SQL schedules after an upgrade
+
+The schedules table stores its dates as epoch milliseconds (`bigint`), so they do not depend on the
+time zone of the database connection or of the process. Tables created before 0.8 used SQL date
+columns. Stop every process running the previous version, convert the table once with the schema
+service, then start the new version:
+
+```typescript
+// Knex
+await new KnexQueueSchemaService(connection).migrateScheduleDates('queue_schedules', {
+  timezone: 'Europe/Paris',
+})
+
+// Kysely
+await new KyselyQueueSchemaService(db, { dialect: 'postgres' }).migrateScheduleDates(
+  'queue_schedules',
+  { timezone: 'Europe/Paris' }
+)
+```
+
+`timezone` is the time zone the database driver wrote dates in with the previous version, used for
+the dates stored without a time zone (Kysely on PostgreSQL and MySQL, Knex on MySQL). It is the time
+zone of the process, unless the driver was configured otherwise: with the mysql2 `timezone: 'Z'`
+option, pass `'UTC'`. It defaults to the time zone of the process running the migration.
+
+On MySQL, dates are also converted through the session time zone of the connection. If the
+previous version used a session time zone other than the one of the migration connection (for
+example by setting `time_zone`), pass it as `databaseTimeZone`, such as `'+02:00'`.
+
+The migration is idempotent and keeps custom columns. MySQL cannot change a schema inside a
+transaction: if a run fails there, fix the cause and run it again, it resumes where it stopped.
+Until the table is migrated, schedule operations and `adapter.migrate()` throw an error that points
+to this method. This applies even if you never defined a schedule: a Worker claims due schedules at
+each cycle, so it logs this error and processes no job until the table is migrated.
+
+On MySQL, tables created before 0.8 also used `TEXT` columns for job payloads, error messages, and
+schedule payloads, which stop at 64 KB: a larger payload failed to insert, or was cut in non-strict
+mode. New tables use `LONGTEXT`. Convert existing ones once:
+
+```typescript
+await schemaService.migrateTextColumns({
+  jobsTable: 'queue_jobs',
+  schedulesTable: 'queue_schedules',
+})
+```
+
+It keeps the nullability, collation, and comment of each column, does nothing on PostgreSQL, SQLite,
+or columns already converted, and skips a missing table. MySQL rebuilds each table for this change
+and blocks writes to it while the copy runs: plan it like any other schema change on a large table.
 
 ### Fake (testing + assertions)
 
@@ -525,13 +606,12 @@ export default class ReliableJob extends Job<Payload> {
   static options: JobOptions = {
     maxRetries: 5,
     retry: {
-      backoff: () =>
-        exponentialBackoff({
-          baseDelay: '1s',
-          maxDelay: '1m',
-          multiplier: 2,
-          jitter: true,
-        }),
+      backoff: exponentialBackoff({
+        baseDelay: '1s',
+        maxDelay: '1m',
+        multiplier: 2,
+        jitter: true,
+      }),
     },
   }
 }
@@ -558,7 +638,7 @@ exponentialBackoff({ baseDelay: '1s', maxDelay: '1m', multiplier: 2 })
 linearBackoff({ baseDelay: '1s', maxDelay: '30s', multiplier: 1 })
 
 // Fixed: 5s, 5s, 5s...
-fixedBackoff({ baseDelay: '5s', jitter: true })
+fixedBackoff('5s')
 ```
 
 </details>
@@ -583,6 +663,31 @@ export default class LongRunningJob extends Job<Payload> {
   }
 }
 ```
+
+Cancellation is cooperative: when the timeout fires, the job fails or is retried right away, but
+the handler keeps running until it returns. It keeps its worker slot until then, so `concurrency`
+and `worker.stop()` account for it. A handler that ignores `this.signal` and never returns holds its
+slot forever and blocks `worker.stop()`: stop long operations when the signal aborts, or pass it to
+the APIs that accept one, such as `fetch()`.
+
+`timeout` and `failOnTimeout` can also be set for every job in `defaultJobOptions`, globally or per
+queue:
+
+```typescript
+const config = {
+  defaultJobOptions: { timeout: '5m' },
+  queues: {
+    reports: { defaultJobOptions: { timeout: '30m', failOnTimeout: true } },
+  },
+}
+```
+
+The job's own options win, then the queue's `defaultJobOptions`, then the global ones, then
+`worker.timeout`. Set `timeout: 0` on a job or a queue to disable a default timeout.
+
+A timeout is a whole number of milliseconds, at most 2147483647 ms (about 24.8 days), the longest
+delay Node timers support. A negative, fractional, or longer timeout in the config makes `QueueManager.init()` throw `E_INVALID_TIMEOUT`; in
+a job's options, it fails the job with that error, without retrying it.
 
 ## Job Context
 
@@ -640,19 +745,29 @@ const redisSchedules = await Schedule.list({}, { adapter: 'redis' })
 
 **Schedule options:**
 
-| Method              | Description                       |
-| ------------------- | --------------------------------- |
-| `.id(string)`       | Unique identifier                 |
-| `.every(duration)`  | Fixed interval ('5s', '1m', '1h') |
-| `.cron(expression)` | Cron schedule                     |
-| `.timezone(tz)`     | Timezone (default: 'UTC')         |
-| `.from(date)`       | Start boundary                    |
-| `.to(date)`         | End boundary                      |
-| `.limit(n)`         | Maximum runs                      |
-| `.with(adapter)`    | Adapter that owns the Schedule    |
+| Method              | Description                                  |
+| ------------------- | -------------------------------------------- |
+| `.id(string)`       | Unique identifier (defaults to the job name) |
+| `.every(duration)`  | Fixed interval ('5s', '1m', '1h')            |
+| `.cron(expression)` | Cron schedule                                |
+| `.timezone(tz)`     | Timezone (default: 'UTC')                    |
+| `.from(date)`       | Start boundary                               |
+| `.to(date)`         | End boundary                                 |
+| `.limit(n)`         | Maximum runs                                 |
+| `.with(adapter)`    | Adapter that owns the Schedule               |
 
-A Schedule and every Job it dispatches stay on the same Adapter. Start a Worker for each Adapter
-that owns Schedules.
+Scheduling the same Job twice without `.id()` replaces the first Schedule, since both use the job
+name as their id.
+
+Defining a Schedule that already exists updates it without resetting it, so you can define your
+Schedules at every boot:
+
+- it keeps its status: a paused Schedule stays paused until `schedule.resume()`;
+- it keeps its next run, unless its timing changes (cron expression, interval, timezone, `from`,
+  `to`, or `limit`). A payload change alone does not move the next run.
+
+A Schedule and every Job it dispatches stay on the same Adapter. Start a Worker, in its own
+process, for each Adapter that owns Schedules.
 
 </details>
 
@@ -702,10 +817,35 @@ const config = {
     stalledThreshold: '30s', // When to consider job stalled
     stalledInterval: '30s', // How often to check
     maxStalledCount: 1, // Max recoveries before failing
+    unknownJobRetries: 10, // Returns to the queue of a job with an unknown class
     gracefulShutdown: true, // Wait for jobs on SIGTERM
   },
 }
 ```
+
+Run one Worker per process. A Worker listens on one Adapter, so to process the queues of several
+Adapters, start one process per Adapter. Starting a second Worker while another one runs in the
+same process throws `E_WORKER_ALREADY_RUNNING`: initializing it would destroy the Adapters of the
+first one. A Worker holds the process until its `stop()` completes.
+
+A job is stalled when its worker stops renewing it for longer than `stalledThreshold`, usually
+because the process crashed. A stalled job goes back to the queue up to `maxStalledCount` times.
+After that, the worker that detects it fails it like any other permanent failure: `failed()`
+receives `E_JOB_STALLED`, and `removeOnFail` decides whether the job is kept in history.
+
+A job can also stall while its execution is still running, for example when a CPU-bound handler
+blocks the event loop longer than `stalledThreshold`. Each acquisition of a job gets its own lease:
+once the job is acquired again, the outcome of the earlier execution is ignored, and only the latest
+execution can complete, fail, or retry the job. The earlier execution still runs to the end, with
+its side effects and hooks, so keep handlers idempotent.
+
+A worker can take a job whose class it does not know, for example during a rolling deploy, when an
+old worker takes a job dispatched by new code. It puts the job back in the queue, to run again 30
+seconds later, and logs a warning. It does so while the job has fewer attempts than
+`unknownJobRetries` (10 by default), then the job fails for good. The limit counts all the
+attempts of the job: a new job gets up to 10 returns (about 5 minutes), a job that already retried
+gets fewer. Each return also counts as an attempt. Other errors while creating a job, such as a
+constructor or a `jobFactory` that throws, fail it right away.
 
 ## Logging
 

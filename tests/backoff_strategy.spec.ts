@@ -7,6 +7,7 @@ import {
   linearBackoff,
 } from '../src/strategies/backoff_strategy.js'
 import * as errors from '../src/exceptions.js'
+import type { JobOptions } from '../src/types/main.js'
 
 test.group('BackoffStrategy', () => {
   test('should validate negative baseDelay', ({ assert }) => {
@@ -205,24 +206,29 @@ test.group('BackoffStrategy | Fixed', () => {
     assert.equal(strategy.calculateDelay(10), 3000)
   })
 
-  test('should apply jitter when enabled', ({ assert }) => {
+  test('should apply jitter when enabled', ({ assert, cleanup }) => {
     const strategy = new BackoffStrategy({
       strategy: 'fixed',
       baseDelay: '1s',
       jitter: true,
     })
 
-    const delay1 = strategy.calculateDelay(1)
-    const delay2 = strategy.calculateDelay(1)
-    const delay3 = strategy.calculateDelay(1)
+    // Jitter moves the delay by up to ±25%. A random draw can land on the base
+    // delay itself, so the bounds and the middle are checked with fixed draws.
+    const random = Math.random
+    cleanup(() => {
+      Math.random = random
+    })
+    const delayFor = (draw: number) => {
+      Math.random = () => draw
+      return strategy.calculateDelay(1)
+    }
 
-    // All delays should be around 1000ms but with jitter (±25%)
-    assert.notEqual(delay1, 1000)
-    assert.notEqual(delay2, 1000)
-    assert.notEqual(delay3, 1000)
-    assert.isTrue(delay1 >= 750 && delay1 <= 1250)
-    assert.isTrue(delay2 >= 750 && delay2 <= 1250)
-    assert.isTrue(delay3 >= 750 && delay3 <= 1250)
+    assert.equal(delayFor(0), 750)
+    assert.equal(delayFor(0.25), 875)
+    assert.equal(delayFor(0.5), 1000)
+    assert.equal(delayFor(0.75), 1125)
+    assert.equal(delayFor(0.999), 1249)
   })
 
   test('should return next retry date correctly', ({ assert }) => {
@@ -238,5 +244,23 @@ test.group('BackoffStrategy | Fixed', () => {
 
     assert.isTrue(nextRetry.getTime() >= now + 1000)
     assert.isTrue(nextRetry.getTime() <= after + 1000)
+  })
+
+  test('README retry examples compile and produce retry dates', ({ assert }) => {
+    // Mirrors the "Retry & Backoff" section of the README.
+    const options: JobOptions = {
+      maxRetries: 5,
+      retry: {
+        backoff: exponentialBackoff({
+          baseDelay: '1s',
+          maxDelay: '1m',
+          multiplier: 2,
+          jitter: true,
+        }),
+      },
+    }
+
+    assert.instanceOf(options.retry!.backoff!().getNextRetryAt(1), Date)
+    assert.equal(fixedBackoff('5s')().calculateDelay(3), 5000)
   })
 })

@@ -1,6 +1,6 @@
 import { test } from '@japa/runner'
-import { parse, resolveRetention } from '../src/utils.js'
-import { E_INVALID_DURATION_EXPRESSION } from '../src/exceptions.js'
+import { parse, parseTimeout, resolveRetention } from '../src/utils.js'
+import { E_INVALID_DURATION_EXPRESSION, E_INVALID_TIMEOUT } from '../src/exceptions.js'
 
 test.group('Utils | parse', () => {
   test('parse should return number when input is number', ({ assert, expectTypeOf }) => {
@@ -25,6 +25,44 @@ test.group('Utils | parse', () => {
     } catch (error) {
       assert.instanceOf(error, E_INVALID_DURATION_EXPRESSION)
     }
+  })
+})
+
+test.group('Utils | parseTimeout', () => {
+  test('undefined and 0 mean no timeout', ({ assert }) => {
+    assert.isUndefined(parseTimeout(undefined))
+    assert.isUndefined(parseTimeout(0))
+  })
+
+  test('parses timeouts up to 2^31 - 1 ms', ({ assert }) => {
+    assert.equal(parseTimeout(1), 1)
+    assert.equal(parseTimeout('30s'), 30_000)
+    assert.equal(parseTimeout('24d'), 24 * 24 * 60 * 60 * 1000)
+    assert.equal(parseTimeout(2_147_483_647), 2_147_483_647)
+  })
+
+  test('rejects timeouts Node timers cannot hold', ({ assert }) => {
+    const timeouts = [
+      -1,
+      0.5,
+      1.5,
+      2_147_483_648,
+      '25d',
+      '30d',
+      Number.POSITIVE_INFINITY,
+      Number.NaN,
+    ]
+
+    for (const timeout of timeouts) {
+      assert.throws(() => parseTimeout(timeout), E_INVALID_TIMEOUT)
+    }
+  })
+
+  test('explains the valid range', ({ assert }) => {
+    assert.throws(
+      () => parseTimeout('30d'),
+      'Invalid timeout "30d": use 0 for no timeout, or a whole number of milliseconds from 1 to 2147483647 (about 24.8 days)'
+    )
   })
 })
 

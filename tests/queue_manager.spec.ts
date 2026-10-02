@@ -8,6 +8,43 @@ import SendEmailJob from '../examples/jobs/send_email_job.js'
 import type { Adapter } from '../src/contracts/adapter.js'
 
 test.group('QueueManager', () => {
+  test('should reject an invalid timeout in the config', async ({ assert }) => {
+    const base = { default: 'sync', adapters: { sync: sync() } }
+
+    await assert.rejects(
+      () => QueueManager.init({ ...base, worker: { timeout: '30d' } }),
+      errors.E_INVALID_TIMEOUT
+    )
+    await assert.rejects(
+      () => QueueManager.init({ ...base, defaultJobOptions: { timeout: -1 } }),
+      errors.E_INVALID_TIMEOUT
+    )
+    await assert.rejects(
+      () => QueueManager.init({ ...base, worker: { timeout: 0.5 } }),
+      errors.E_INVALID_TIMEOUT
+    )
+    await assert.rejects(
+      () => QueueManager.init({ ...base, defaultJobOptions: { timeout: 1.5 } }),
+      errors.E_INVALID_TIMEOUT
+    )
+    await assert.rejects(
+      () =>
+        QueueManager.init({
+          ...base,
+          queues: { reports: { defaultJobOptions: { timeout: 1.5 } } },
+        }),
+      errors.E_INVALID_TIMEOUT
+    )
+    await assert.rejects(
+      () =>
+        QueueManager.init({
+          ...base,
+          queues: { reports: { defaultJobOptions: { timeout: '60d' } } },
+        }),
+      errors.E_INVALID_TIMEOUT
+    )
+  })
+
   test('should validate adapter presence', async ({ assert }) => {
     assert.plan(2)
 
@@ -246,11 +283,11 @@ test.group('QueueManager', () => {
       setWorkerId() {},
       pop: async () => null,
       popFrom: async () => null,
-      recoverStalledJobs: async () => 0,
+      recoverStalledJobs: async () => ({ recovered: 0, exceeded: [] }),
       renewJobs: async () => 0,
-      completeJob: async () => {},
-      failJob: async () => {},
-      retryJob: async () => {},
+      completeJob: async () => true,
+      failJob: async () => true,
+      retryJob: async () => true,
       getJob: async () => null,
       push: async () => {},
       pushOn: async () => {},
@@ -263,6 +300,7 @@ test.group('QueueManager', () => {
       destroy: async () => {
         destroyedCount++
       },
+      migrate: async () => {},
       upsertSchedule: async () => 'schedule-id',
       createSchedule: async () => 'schedule-id',
       getSchedule: async () => null,
@@ -315,11 +353,11 @@ test.group('QueueManager', () => {
       setWorkerId() {},
       pop: async () => null,
       popFrom: async () => null,
-      recoverStalledJobs: async () => 0,
+      recoverStalledJobs: async () => ({ recovered: 0, exceeded: [] }),
       renewJobs: async () => 0,
-      completeJob: async () => {},
-      failJob: async () => {},
-      retryJob: async () => {},
+      completeJob: async () => true,
+      failJob: async () => true,
+      retryJob: async () => true,
       getJob: async () => null,
       push: async () => {},
       pushOn: async () => {},
@@ -330,6 +368,7 @@ test.group('QueueManager', () => {
       size: async () => 0,
       sizeOf: async () => 0,
       destroy: async () => {},
+      migrate: async () => {},
       upsertSchedule: async () => 'schedule-id',
       createSchedule: async () => 'schedule-id',
       getSchedule: async () => null,

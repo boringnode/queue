@@ -1,9 +1,26 @@
-import { sql, type Kysely } from 'kysely'
+import { sql, type AlterTableColumnAlteringBuilder, type Kysely, type Transaction } from 'kysely'
+import {
+  assertTimeZone,
+  epochColumn,
+  legacyScheduleRowToEpochs,
+  processTimeZone,
+  scheduleDatesMigrationState,
+  type ScheduleDateColumn,
+  type ScheduleDatesMigrationOptions,
+} from './schedule_dates.js'
+import { QUEUE_TEXT_COLUMNS, type TextColumnsMigrationOptions } from './text_columns.js'
 
 export type KyselyDialect = 'postgres' | 'mysql' | 'sqlite'
 
 export interface KyselyQueueSchemaOptions {
   dialect: KyselyDialect
+}
+
+interface MysqlTextColumn {
+  name: string
+  nullable: string
+  collation: string | null
+  comment: string
 }
 
 /**
@@ -26,13 +43,13 @@ export class KyselyQueueSchemaService<DB> {
       .addColumn('id', 'varchar(255)', (column) => column.notNull())
       .addColumn('queue', 'varchar(255)', (column) => column.notNull())
       .addColumn('status', 'varchar(20)', (column) => column.notNull())
-      .addColumn('data', 'text', (column) => column.notNull())
+      .addColumn('data', this.#textType(), (column) => column.notNull())
       .addColumn('score', 'bigint')
       .addColumn('worker_id', 'varchar(255)')
       .addColumn('acquired_at', 'bigint')
       .addColumn('execute_at', 'bigint')
       .addColumn('finished_at', 'bigint')
-      .addColumn('error', 'text')
+      .addColumn('error', this.#textType())
       .addColumn('dedup_id', 'varchar(510)')
       .addColumn('dedup_at', 'bigint')
       .addColumn('dedup_ttl', 'bigint')
@@ -90,19 +107,18 @@ export class KyselyQueueSchemaService<DB> {
       .addColumn('id', 'varchar(255)', (column) => column.primaryKey())
       .addColumn('status', 'varchar(50)', (column) => column.notNull().defaultTo('active'))
       .addColumn('name', 'varchar(255)', (column) => column.notNull())
-      .addColumn('payload', 'text', (column) => column.notNull())
+      .addColumn('payload', this.#textType(), (column) => column.notNull())
       .addColumn('cron_expression', 'varchar(255)')
       .addColumn('every_ms', 'bigint')
       .addColumn('timezone', 'varchar(100)', (column) => column.notNull().defaultTo('UTC'))
-      .addColumn('from_date', 'timestamp')
-      .addColumn('to_date', 'timestamp')
+      // Dates are epoch milliseconds, so they do not depend on any time zone.
+      .addColumn('from_date', 'bigint')
+      .addColumn('to_date', 'bigint')
       .addColumn('run_limit', 'integer')
       .addColumn('run_count', 'integer', (column) => column.notNull().defaultTo(0))
-      .addColumn('next_run_at', 'timestamp')
-      .addColumn('last_run_at', 'timestamp')
-      .addColumn('created_at', 'timestamp', (column) =>
-        column.notNull().defaultTo(sql`CURRENT_TIMESTAMP`)
-      )
+      .addColumn('next_run_at', 'bigint')
+      .addColumn('last_run_at', 'bigint')
+      .addColumn('created_at', 'bigint', (column) => column.notNull())
       .execute()
 
     await this.#connection.schema
@@ -110,6 +126,345 @@ export class KyselyQueueSchemaService<DB> {
       .on(tableName)
       .columns(['status', 'next_run_at'])
       .execute()
+  }
+
+  /**
+   * Migration for MySQL tables created before 0.8, whose TEXT columns stop at
+   * 64 KB: a larger payload or error message failed to insert, or was cut in
+   * non-strict mode. Converts `data`, `error` and `payload` to LONGTEXT and
+   * keeps their nullability. Does nothing on other databases, on columns
+   * already converted, or on a missing table.
+   */
+  async migrateTextColumns(options: TextColumnsMigrationOptions = {}): Promise<void> {
+    if (this.#dialect !== 'mysql') return
+
+    const tables = [
+      [options.jobsTable ?? 'queue_jobs', QUEUE_TEXT_COLUMNS.jobs],
+      [options.schedulesTable ?? 'queue_schedules', QUEUE_TEXT_COLUMNS.schedules],
+    ] as const
+
+    for (const [tableName, columns] of tables) {
+      const [schema, name] = this.#mysqlTable(tableName)
+      const { rows } = await sql<MysqlTextColumn>`
+        select column_name as ${sql.ref('name')}, is_nullable as ${sql.ref('nullable')},
+          collation_name as ${sql.ref('collation')}, column_comment as ${sql.ref('comment')}
+        from information_schema.columns
+        where table_schema = coalesce(${schema}, database()) and table_name = ${name}
+          and column_name in (${sql.join([...columns])})
+          and data_type <> 'longtext'
+      `.execute(this.#connection)
+
+      if (rows.length === 0) continue
+
+      // One ALTER: MySQL rebuilds the table for this change. MODIFY replaces the
+      // whole column definition, so carry over what it would reset.
+      let alter = this.#connection.schema.alterTable(
+        tableName
+      ) as unknown as AlterTableColumnAlteringBuilder
+      for (const row of rows) {
+        alter = alter.modifyColumn(row.name, sql`longtext`, (column) => {
+          const definition = row.nullable === 'YES' ? column : column.notNull()
+          return definition.modifyEnd(
+            sql.join(
+              [
+                ...(row.comment ? [sql`comment ${sql.lit(row.comment)}`] : []),
+                ...(row.collation ? [sql`collate ${sql.lit(row.collation)}`] : []),
+              ],
+              sql` `
+            )
+          )
+        })
+      }
+      await alter.execute()
+    }
+  }
+
+  /**
+   * Migration for schedules tables created before 0.8, which stored their
+   * dates in SQL date columns. Converts the dates to epoch milliseconds
+   * (`bigint`), the format of the columns created by `createSchedulesTable()`.
+   *
+   * On PostgreSQL and MySQL, dates were stored without a time zone, in the time
+   * zone the driver used: pass it as `options.timezone` (it defaults to the time
+   * zone of the current process). SQLite dates are converted exactly.
+   *
+   * Stop every process running the previous version first. The migration is
+   * idempotent. MySQL cannot change a schema inside a transaction: if a run
+   * fails there, run it again, it resumes where it stopped.
+   */
+  async migrateScheduleDates(
+    tableName: string = 'queue_schedules',
+    options: ScheduleDatesMigrationOptions = {}
+  ): Promise<void> {
+    const columnTypes = await this.#columnTypes(tableName)
+
+    if (!columnTypes) {
+      throw new Error(`Queue schedules table "${tableName}" does not exist`)
+    }
+
+    const state = scheduleDatesMigrationState(columnTypes)
+
+    if (state.migrated) {
+      await this.#createNextRunIndex(this.#connection, tableName)
+      return
+    }
+
+    const writerTimeZone = options.timezone ?? processTimeZone()
+    assertTimeZone(writerTimeZone)
+
+    const migrate = async (trx: Transaction<DB>) => {
+      // Convert every value before the first schema change, so an unreadable
+      // value fails the migration without leaving the table half migrated.
+      const rows = state.legacy.length
+        ? await this.#withDatabaseTimeZone(trx, options.databaseTimeZone, async () => {
+            // The query builder applies withSchema(), unlike raw SQL table references.
+            return (await (trx as unknown as Kysely<Record<string, Record<string, unknown>>>)
+              .selectFrom(tableName)
+              .select([
+                sql.ref<string>('id').as('id'),
+                ...state.legacy.map((name) => this.#legacyDateAsText(name).as(name)),
+              ])
+              .execute()) as Array<Record<string, string | number | null>>
+          })
+        : []
+      // SQLite has no time zone: its CURRENT_TIMESTAMP default is UTC.
+      const timeZone = this.#dialect === 'sqlite' ? 'UTC' : writerTimeZone
+      const updates = rows.map((row) => ({
+        id: row.id,
+        values: legacyScheduleRowToEpochs(row, state.legacy, timeZone),
+      }))
+
+      await this.#dropNextRunIndexes(trx, tableName)
+
+      for (const name of state.legacy) {
+        if (state.withEpochColumn.includes(name)) continue
+        await trx.schema
+          .alterTable(tableName)
+          .addColumn(epochColumn(name), 'bigint', (column) =>
+            // SQLite cannot add NOT NULL to an existing column, only to a new
+            // one with a default. Every row gets its value below.
+            name === 'created_at' && this.#dialect === 'sqlite'
+              ? column.notNull().defaultTo(0)
+              : column
+          )
+          .execute()
+      }
+
+      for (const { id, values } of updates) {
+        await (trx as unknown as Kysely<Record<string, Record<string, unknown>>>)
+          .updateTable(tableName)
+          .set(values)
+          .where('id', '=', id)
+          .execute()
+      }
+
+      // created_at is required, as in a new table. Before the legacy columns
+      // are dropped, so a failure on MySQL leaves a table the next run resumes.
+      const epochColumns = new Set([...state.legacy, ...state.withEpochColumn])
+      if (epochColumns.has('created_at') && this.#dialect !== 'sqlite') {
+        const alterTable = trx.schema.alterTable(tableName)
+        await (
+          this.#dialect === 'postgres'
+            ? alterTable.alterColumn(epochColumn('created_at'), (column) => column.setNotNull())
+            : alterTable.modifyColumn(epochColumn('created_at'), 'bigint', (column) =>
+                column.notNull()
+              )
+        ).execute()
+      }
+
+      for (const name of state.legacy) {
+        await trx.schema.alterTable(tableName).dropColumn(name).execute()
+      }
+
+      for (const name of epochColumns) {
+        await trx.schema.alterTable(tableName).renameColumn(epochColumn(name), name).execute()
+      }
+
+      await this.#createNextRunIndex(trx, tableName)
+    }
+
+    // Kysely's Migrator already runs each migration inside a transaction.
+    if (this.#connection.isTransaction) {
+      await migrate(this.#connection as Transaction<DB>)
+    } else {
+      await this.#connection.transaction().execute(migrate)
+    }
+  }
+
+  /** Whether the schedules table still uses the date columns of 0.7. */
+  async needsScheduleDatesMigration(tableName: string = 'queue_schedules'): Promise<boolean> {
+    const columnTypes = await this.#columnTypes(tableName)
+    return columnTypes !== undefined && !scheduleDatesMigrationState(columnTypes).migrated
+  }
+
+  /**
+   * Column types of the table the connection targets with `tableName`, or
+   * undefined when it does not exist. The table is resolved like the adapter's
+   * queries resolve it: with withSchema() and the PostgreSQL search_path.
+   */
+  async #columnTypes(tableName: string): Promise<Map<string, string> | undefined> {
+    const rows =
+      this.#dialect === 'postgres'
+        ? await this.#postgresColumns(tableName)
+        : this.#dialect === 'mysql'
+          ? await this.#mysqlColumns(tableName)
+          : await this.#sqliteColumns(tableName)
+
+    return rows.length > 0 ? new Map(rows.map(({ name, type }) => [name, type])) : undefined
+  }
+
+  /** The table reference as the connection renders it in a query, with withSchema() applied. */
+  #renderedTable(tableName: string): string {
+    const { sql: compiled } = (this.#connection as unknown as Kysely<any>)
+      .selectFrom(tableName)
+      .selectAll()
+      .compile()
+
+    return compiled.replace(/^select \* from /, '')
+  }
+
+  async #postgresColumns(tableName: string) {
+    // to_regclass resolves the reference like any query would, search_path included.
+    const result = await sql<{ name: string; type: string }>`
+      select a.attname as ${sql.ref('name')}, format_type(a.atttypid, a.atttypmod) as ${sql.ref('type')}
+      from pg_attribute a
+      where a.attrelid = to_regclass(${this.#renderedTable(tableName)})
+        and a.attnum > 0 and not a.attisdropped
+    `.execute(this.#connection)
+
+    return result.rows
+  }
+
+  /** Schema (null for the current database) and name of the table, with withSchema() applied. */
+  #mysqlTable(tableName: string): [string | null, string] {
+    const identifiers = [...this.#renderedTable(tableName).matchAll(/`((?:[^`]|``)*)`/g)].map(
+      ([, identifier]) => identifier.replaceAll('``', '`')
+    )
+    return identifiers.length > 1 ? [identifiers[0], identifiers[1]] : [null, identifiers[0]]
+  }
+
+  async #mysqlColumns(tableName: string) {
+    const [schema, name] = this.#mysqlTable(tableName)
+
+    const result = await sql<{ name: string; type: string }>`
+      select column_name as ${sql.ref('name')}, data_type as ${sql.ref('type')}
+      from information_schema.columns
+      where table_schema = coalesce(${schema}, database()) and table_name = ${name}
+    `.execute(this.#connection)
+
+    return result.rows
+  }
+
+  async #sqliteColumns(tableName: string) {
+    const table = (await this.#connection.introspection.getTables()).find(
+      ({ name }) => name === tableName
+    )
+
+    return table?.columns.map(({ name, dataType }) => ({ name, type: dataType })) ?? []
+  }
+
+  /**
+   * Run `callback` with the MySQL session time zone set to `timeZone`, then
+   * restore it. MySQL converts stored dates through the session time zone.
+   */
+  async #withDatabaseTimeZone<T>(
+    trx: Transaction<DB>,
+    timeZone: string | undefined,
+    callback: () => Promise<T>
+  ): Promise<T> {
+    if (this.#dialect !== 'mysql' || timeZone === undefined) return callback()
+
+    const current = await sql<{
+      timeZone: string
+    }>`select @@session.time_zone as ${sql.ref('timeZone')}`.execute(trx)
+    await sql`set time_zone = ${timeZone}`.execute(trx)
+
+    try {
+      return await callback()
+    } finally {
+      await sql`set time_zone = ${current.rows[0].timeZone}`.execute(trx)
+    }
+  }
+
+  /**
+   * Indexes of the resolved table on exactly (status, next_run_at), whatever
+   * their name. The name is not enough: an index with the same name can
+   * belong to a table of another schema.
+   */
+  async #nextRunIndexes(
+    connection: Kysely<DB>,
+    tableName: string
+  ): Promise<Array<{ schema: string | null; name: string }>> {
+    if (this.#dialect === 'postgres') {
+      const result = await sql<{ schema: string; name: string }>`
+        select n.nspname as ${sql.ref('schema')}, c.relname as ${sql.ref('name')}
+        from pg_index i
+        join pg_class c on c.oid = i.indexrelid
+        join pg_namespace n on n.oid = c.relnamespace
+        where i.indrelid = to_regclass(${this.#renderedTable(tableName)})
+          and array(
+            select a.attname::text
+            from unnest(i.indkey) with ordinality as k(attnum, position)
+            join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
+            order by k.position
+          ) = array['status', 'next_run_at']
+      `.execute(connection)
+      return result.rows
+    }
+
+    if (this.#dialect === 'mysql') {
+      const [schema, name] = this.#mysqlTable(tableName)
+      const result = await sql<{ name: string }>`
+        select index_name as ${sql.ref('name')}
+        from information_schema.statistics
+        where table_schema = coalesce(${schema}, database()) and table_name = ${name}
+        group by index_name
+        having group_concat(column_name order by seq_in_index) = 'status,next_run_at'
+      `.execute(connection)
+      return result.rows.map(({ name: indexName }) => ({ schema: null, name: indexName }))
+    }
+
+    const result = await sql<{ name: string }>`
+      select il.name as ${sql.ref('name')}
+      from pragma_index_list(${tableName}) il
+      where (
+        select group_concat(ii.name)
+        from (select name from pragma_index_info(il.name) order by seqno) ii
+      ) = 'status,next_run_at'
+    `.execute(connection)
+    return result.rows.map(({ name }) => ({ schema: null, name }))
+  }
+
+  async #dropNextRunIndexes(trx: Transaction<DB>, tableName: string): Promise<void> {
+    for (const index of await this.#nextRunIndexes(trx, tableName)) {
+      if (this.#dialect === 'postgres') {
+        await sql`drop index ${sql.id(index.schema!, index.name)}`.execute(trx)
+      } else if (this.#dialect === 'mysql') {
+        await trx.schema.dropIndex(index.name).on(tableName).execute()
+      } else {
+        await sql`drop index ${sql.id(index.name)}`.execute(trx)
+      }
+    }
+  }
+
+  async #createNextRunIndex(connection: Kysely<DB>, tableName: string): Promise<void> {
+    if ((await this.#nextRunIndexes(connection, tableName)).length > 0) return
+
+    // An index name cannot be schema-qualified: PostgreSQL creates the index in
+    // the schema of its table.
+    const bareTableName = tableName.split('.').at(-1)!
+    await connection.schema
+      .createIndex(`${bareTableName}_status_next_run_idx`)
+      .on(tableName)
+      .columns(['status', 'next_run_at'])
+      .execute()
+  }
+
+  /** Select a legacy date column in a form `legacyScheduleDateToEpoch` can read. */
+  #legacyDateAsText(name: ScheduleDateColumn) {
+    if (this.#dialect === 'postgres') return sql<string>`${sql.ref(name)}::text`
+    if (this.#dialect === 'mysql') return sql<string>`CAST(${sql.ref(name)} AS CHAR)`
+    return sql<string>`CAST(${sql.ref(name)} AS TEXT)`
   }
 
   async dropJobsTable(tableName: string = 'queue_jobs'): Promise<void> {
@@ -148,6 +503,11 @@ export class KyselyQueueSchemaService<DB> {
       .columns(['queue', 'dedup_id'])
       .where(sql<boolean>`dedup_id is not null and status in ('pending', 'delayed')`)
       .execute()
+  }
+
+  /** LONGTEXT on MySQL, whose TEXT stops at 64 KB; TEXT elsewhere. */
+  #textType() {
+    return this.#dialect === 'mysql' ? sql`longtext` : sql`text`
   }
 
   #isDuplicateIndexError(error: unknown): boolean {

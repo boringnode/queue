@@ -16,6 +16,7 @@ const acquiredJob = (overrides: Partial<AcquiredJob> = {}): AcquiredJob => ({
   priority: 2,
   stalledCount: 1,
   acquiredAt: Date.parse('2026-07-09T12:00:00.000Z'),
+  leaseToken: 'worker:lease',
   ...overrides,
 })
 
@@ -211,6 +212,219 @@ test.group('JobExecutionRuntime', () => {
     assert.isNumber(traceMessage?.duration)
   })
 
+  test('fails a stalled Job through failed() without executing or tracing it', async ({
+    assert,
+    cleanup,
+  }) => {
+    let executed = false
+    let traced = false
+    let hookError: Error | undefined
+    let hookPayload: unknown
+    let hookContext: Job['context'] | undefined
+    const captureTrace = () => {
+      traced = true
+    }
+
+    executeChannel.start.subscribe(captureTrace)
+    cleanup(() => executeChannel.start.unsubscribe(captureTrace))
+
+    class StalledJob extends Job {
+      static options = { removeOnFail: { count: 5 } }
+
+      async execute() {
+        executed = true
+      }
+
+      async failed(error: Error) {
+        hookError = error
+        hookPayload = this.payload
+        hookContext = this.context
+      }
+    }
+
+    const runtime = new JobExecutionRuntime({
+      resolveJob: async () => StalledJob,
+      configResolver: new QueueConfigResolver({ globalJobOptions: { removeOnFail: false } }),
+      executionWrapper: async () => {
+        throw new Error('the execution wrapper must not run')
+      },
+    })
+
+    const outcome = await runtime.failStalled(acquiredJob(), 'default', 1)
+
+    assert.isFalse(executed)
+    assert.isFalse(traced)
+    assert.equal(outcome.type, 'failed')
+    if (outcome.type !== 'failed') return
+
+    assert.equal(outcome.reason, 'stalled')
+    assert.instanceOf(outcome.error, errors.E_JOB_STALLED)
+    assert.equal(outcome.error.message, 'The job "TestJob" stalled more than the allowed 1 time(s)')
+    assert.deepEqual(outcome.removeOnFail, { count: 5 })
+    assert.isUndefined(outcome.failedHookError)
+    assert.strictEqual(hookError, outcome.error)
+    assert.deepEqual(hookPayload, { value: 42 })
+    assert.equal(hookContext?.jobId, 'job-1')
+    assert.equal(hookContext?.stalledCount, 1)
+  })
+
+  test('keeps the stalled failure when failed() throws', async ({ assert }) => {
+    const hookFailure = new Error('hook failed')
+
+    class StalledJob extends Job {
+      async execute() {}
+
+      async failed() {
+        throw hookFailure
+      }
+    }
+
+    const runtime = new JobExecutionRuntime({
+      resolveJob: async () => StalledJob,
+      configResolver: new QueueConfigResolver({}),
+    })
+
+    const outcome = await runtime.failStalled(acquiredJob(), 'default', 1)
+
+    assert.equal(outcome.type, 'failed')
+    if (outcome.type !== 'failed') return
+
+    assert.instanceOf(outcome.error, errors.E_JOB_STALLED)
+    assert.strictEqual(outcome.failedHookError, hookFailure)
+  })
+
+  test('flags a job name with no registered class', async ({ assert }) => {
+    const runtime = new JobExecutionRuntime({
+      resolveJob: async () => undefined,
+      configResolver: new QueueConfigResolver({}),
+    })
+
+    const outcome = await runtime.execute(acquiredJob(), 'default')
+
+    assert.equal(outcome.type, 'initialization-failed')
+    if (outcome.type !== 'initialization-failed') return
+    assert.isTrue(outcome.jobNotFound)
+    assert.instanceOf(outcome.error, errors.E_JOB_NOT_FOUND)
+    assert.equal(outcome.error.message, 'Requested job "TestJob" is not registered')
+  })
+
+  test('does not flag an E_JOB_NOT_FOUND thrown by a registered job', async ({ assert }) => {
+    class MissingDependencyJob extends Job {
+      constructor() {
+        super()
+        throw new errors.E_JOB_NOT_FOUND(['OtherJob'])
+      }
+
+      async execute() {}
+    }
+
+    const runtime = new JobExecutionRuntime({
+      resolveJob: async () => MissingDependencyJob,
+      configResolver: new QueueConfigResolver({}),
+    })
+
+    const outcome = await runtime.execute(acquiredJob(), 'default')
+
+    assert.equal(outcome.type, 'initialization-failed')
+    if (outcome.type !== 'initialization-failed') return
+    assert.instanceOf(outcome.error, errors.E_JOB_NOT_FOUND)
+    assert.notProperty(outcome, 'jobNotFound')
+  })
+
+  test('does not flag an unknown stalled job, which fails for good', async ({ assert }) => {
+    const runtime = new JobExecutionRuntime({
+      resolveJob: async () => undefined,
+      configResolver: new QueueConfigResolver({}),
+    })
+
+    const outcome = await runtime.failStalled(acquiredJob(), 'default', 1)
+
+    assert.equal(outcome.type, 'initialization-failed')
+    assert.notProperty(outcome, 'jobNotFound')
+  })
+
+  test('returns initialization-failed when a stalled Job cannot be instantiated', async ({
+    assert,
+  }) => {
+    const initializationError = new Error('unknown job')
+
+    const runtime = new JobExecutionRuntime({
+      resolveJob: async () => {
+        throw initializationError
+      },
+      configResolver: new QueueConfigResolver({ globalJobOptions: { removeOnFail: false } }),
+    })
+
+    const outcome = await runtime.failStalled(acquiredJob(), 'default', 1)
+
+    assert.deepEqual(outcome, {
+      type: 'initialization-failed',
+      error: initializationError,
+      removeOnFail: false,
+    })
+  })
+
+  test('fails a Job with an invalid timeout without running or retrying it', async ({ assert }) => {
+    for (const timeout of ['30d', 0.5, 1.5]) {
+      let executed = false
+
+      class InvalidTimeoutJob extends Job {
+        static options = { timeout, maxRetries: 3, removeOnFail: false }
+
+        async execute() {
+          executed = true
+        }
+      }
+
+      const runtime = new JobExecutionRuntime({
+        resolveJob: async () => InvalidTimeoutJob,
+        configResolver: new QueueConfigResolver({}),
+      })
+      const outcome = await runtime.execute(acquiredJob(), 'default')
+
+      assert.equal(outcome.type, 'initialization-failed', `timeout ${timeout}`)
+      if (outcome.type !== 'initialization-failed') return
+      assert.instanceOf(outcome.error, errors.E_INVALID_TIMEOUT)
+      assert.isFalse(outcome.removeOnFail)
+      assert.isFalse(executed)
+    }
+  })
+
+  test('handles a synchronous throw from a Job with a timeout', async ({ assert, cleanup }) => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    cleanup(() => {
+      process.off('unhandledRejection', onUnhandled)
+    })
+
+    const error = new Error('invalid payload')
+
+    class SyncThrowingJob extends Job {
+      static options = { timeout: 20 }
+
+      // A non-async implementation can throw before returning a promise.
+      execute(): Promise<void> {
+        throw error
+      }
+    }
+
+    const runtime = new JobExecutionRuntime({
+      resolveJob: async () => SyncThrowingJob,
+      configResolver: new QueueConfigResolver({}),
+    })
+    const outcome = await runtime.execute(acquiredJob(), 'default')
+
+    assert.equal(outcome.type, 'failed')
+    if (outcome.type !== 'failed') return
+    assert.strictEqual(outcome.error, error)
+    assert.notProperty(outcome, 'timedOutExecution')
+
+    // Wait past the timeout: its listener must be gone.
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    assert.deepEqual(unhandled, [])
+  })
+
   test('aborts timed out Jobs and removes the abort listener', async ({ assert, cleanup }) => {
     const controller = new AbortController()
     const originalTimeout = AbortSignal.timeout
@@ -252,7 +466,8 @@ test.group('JobExecutionRuntime', () => {
       configResolver: new QueueConfigResolver({}),
     })
     const execution = runtime.execute(acquiredJob(), 'default')
-    await Promise.resolve()
+    // Let the runtime resolve the Job and register its abort listener before aborting.
+    await new Promise((resolve) => setImmediate(resolve))
 
     controller.abort()
     const outcome = await execution

@@ -3,7 +3,7 @@ import { DEFAULT_PRIORITY } from './constants.js'
 import { executeChannel } from './tracing_channels.js'
 import type { Job } from './job.js'
 import type { AcquiredJob } from './contracts/adapter.js'
-import type { QueueConfigResolver } from './queue_config_resolver.js'
+import type { QueueConfigResolver, ResolvedJobOptions } from './queue_config_resolver.js'
 import type {
   JobClass,
   JobContext,
@@ -14,24 +14,41 @@ import type {
   RetryConfig,
 } from './types/main.js'
 import type { JobExecuteMessage } from './types/tracing_channels.js'
-import { parse } from './utils.js'
+import { parseTimeout } from './utils.js'
 
-type PermanentFailureReason = 'timeout' | 'no-retries' | 'max-attempts'
+type PermanentFailureReason = 'timeout' | 'no-retries' | 'max-attempts' | 'stalled'
+
+/**
+ * A timed out handler that had not settled when the timeout fired. The
+ * attempt is over, but the handler keeps running until it returns: callers
+ * wait for this promise before they run anything in its place.
+ */
+type TimedOutExecution = { timedOutExecution?: Promise<void> }
 
 export type JobExecutionOutcome =
   | { type: 'completed'; removeOnComplete?: JobRetention }
-  | { type: 'retry'; retryAt?: Date }
-  | {
+  | ({ type: 'retry'; retryAt?: Date } & TimedOutExecution)
+  | ({
       type: 'failed'
       reason: PermanentFailureReason
       error: Error
       removeOnFail?: JobRetention
       failedHookError?: Error
+    } & TimedOutExecution)
+  | {
+      type: 'initialization-failed'
+      error: Error
+      removeOnFail?: JobRetention
+      /**
+       * Set when no class is registered under the job name, as opposed to a
+       * registered job that failed to load, construct, or configure.
+       */
+      jobNotFound?: true
     }
-  | { type: 'initialization-failed'; error: Error; removeOnFail?: JobRetention }
 
 type JobExecutionRuntimeDependencies = {
-  resolveJob: (jobName: string) => JobClass | Promise<JobClass>
+  /** Returns undefined when no class is registered under the name. */
+  resolveJob: (jobName: string) => JobClass | undefined | Promise<JobClass | undefined>
   configResolver: QueueConfigResolver
   jobFactory?: JobFactory
   executionWrapper?: NonNullable<QueueManagerConfig['executionWrapper']>
@@ -44,6 +61,12 @@ type FailureDecision =
       reason: PermanentFailureReason
       hookError: Error
     }
+
+/**
+ * No class is registered under the job name. Only the runtime throws it, so
+ * it cannot be confused with an E_JOB_NOT_FOUND from the job's own code.
+ */
+class JobNotRegistered extends errors.E_JOB_NOT_FOUND {}
 
 const noopExecutionWrapper: NonNullable<QueueManagerConfig['executionWrapper']> = async (run) =>
   run()
@@ -92,21 +115,76 @@ export class JobExecutionRuntime {
     return this.#executionWrapper(run, job, queue)
   }
 
+  /**
+   * Fail a Job that stalled more than `maxStalledCount` times, without running it.
+   *
+   * The `failed()` hook receives `E_JOB_STALLED`, and the outcome carries the
+   * Job's own retention so the caller finalizes it like any permanent failure.
+   * The attempt is not traced, since the Job does not execute.
+   */
+  async failStalled(
+    job: AcquiredJob,
+    queue: string,
+    maxStalledCount: number
+  ): Promise<JobExecutionOutcome> {
+    let instance: Job
+    let options: JobOptions
+
+    try {
+      ;({ instance, options } = await this.#instantiate(job))
+    } catch (error) {
+      return {
+        type: 'initialization-failed',
+        error: error as Error,
+        removeOnFail: this.#configResolver.resolveJobOptions(queue).removeOnFail,
+      }
+    }
+
+    const error = new errors.E_JOB_STALLED([job.name, maxStalledCount])
+    const retention = this.#configResolver.resolveJobOptions(queue, options)
+    instance.$hydrate(job.payload, this.#createContext(job, queue))
+
+    let failedHookError: Error | undefined
+    try {
+      await instance.failed?.(error)
+    } catch (hookError) {
+      failedHookError = hookError as Error
+    }
+
+    return {
+      type: 'failed',
+      reason: 'stalled',
+      error,
+      removeOnFail: retention.removeOnFail,
+      failedHookError,
+    }
+  }
+
+  async #instantiate(job: AcquiredJob): Promise<{ instance: Job; options: JobOptions }> {
+    const JobClass = await this.#resolveJob(job.name)
+    if (!JobClass) throw new JobNotRegistered([job.name])
+
+    const instance = this.#jobFactory ? await this.#jobFactory(JobClass) : new JobClass()
+
+    return { instance, options: JobClass.options || {} }
+  }
+
   async #executeAttempt(
     job: AcquiredJob,
     queue: string,
     executeMessage: JobExecuteMessage
   ): Promise<JobExecutionOutcome> {
     let instance: Job
-    let options: JobOptions
+    let options: JobOptions | undefined
+    let timeout: number | undefined
 
     try {
-      const JobClass = await this.#resolveJob(job.name)
-      options = JobClass.options || {}
-      instance = this.#jobFactory ? await this.#jobFactory(JobClass) : new JobClass()
+      ;({ instance, options } = await this.#instantiate(job))
+      // An invalid Job.options.timeout fails the Job without retrying it.
+      timeout = parseTimeout(this.#configResolver.resolveJobOptions(queue, options).timeout)
     } catch (error) {
       const initializationError = error as Error
-      const retention = this.#configResolver.resolveJobOptions(queue)
+      const retention = this.#configResolver.resolveJobOptions(queue, options)
 
       executeMessage.status = 'failed'
       executeMessage.error = initializationError
@@ -115,23 +193,27 @@ export class JobExecutionRuntime {
         type: 'initialization-failed',
         error: initializationError,
         removeOnFail: retention.removeOnFail,
+        // An E_JOB_NOT_FOUND thrown while loading or constructing a registered
+        // job, for another name, is an initialization error like any other.
+        ...(error instanceof JobNotRegistered ? { jobNotFound: true as const } : {}),
       }
     }
 
     const context = this.#createContext(job, queue)
-    const retention = this.#configResolver.resolveJobOptions(queue, options)
+    const resolvedOptions = this.#configResolver.resolveJobOptions(queue, options)
     const retryConfig = this.#configResolver.resolveRetryConfig(queue, options)
+    const timedOut: TimedOutExecution = {}
 
     try {
-      await this.#executeJob(instance, job.payload, context, options)
+      await this.#executeJob(instance, job.payload, context, timeout, timedOut)
       executeMessage.status = 'completed'
 
-      return { type: 'completed', removeOnComplete: retention.removeOnComplete }
+      return { type: 'completed', removeOnComplete: resolvedOptions.removeOnComplete }
     } catch (error) {
       const executionError = error as Error
       const decision = this.#resolveFailure(
         job.name,
-        options,
+        resolvedOptions,
         retryConfig,
         executionError,
         job.attempts
@@ -142,7 +224,7 @@ export class JobExecutionRuntime {
       if (decision.type === 'retry') {
         executeMessage.status = 'retrying'
         executeMessage.nextRetryAt = decision.retryAt
-        return decision
+        return { ...decision, ...timedOut }
       }
 
       executeMessage.status = 'failed'
@@ -158,8 +240,9 @@ export class JobExecutionRuntime {
         type: 'failed',
         reason: decision.reason,
         error: executionError,
-        removeOnFail: retention.removeOnFail,
+        removeOnFail: resolvedOptions.removeOnFail,
         failedHookError,
+        ...timedOut,
       }
     }
   }
@@ -181,16 +264,14 @@ export class JobExecutionRuntime {
     instance: Job,
     payload: unknown,
     context: JobContext,
-    options: JobOptions
+    timeout: number | undefined,
+    timedOut: TimedOutExecution
   ): Promise<void> {
-    const configuredTimeout = options.timeout ?? this.#configResolver.getWorkerTimeout()
-
-    if (configuredTimeout === undefined) {
+    if (timeout === undefined) {
       instance.$hydrate(payload, context)
       return instance.execute()
     }
 
-    const timeout = parse(configuredTimeout)
     const signal = AbortSignal.timeout(timeout)
     instance.$hydrate(payload, context, signal)
 
@@ -200,8 +281,22 @@ export class JobExecutionRuntime {
       timeout
     )
 
+    // Unset when execute() throws synchronously: nothing keeps running then.
+    let execution: Promise<void> | undefined
+
     try {
-      await Promise.race([instance.execute(), abortPromise])
+      execution = instance.execute()
+      await Promise.race([execution, abortPromise])
+    } catch (error) {
+      // Cancellation is cooperative: a handler that has not settled yet keeps
+      // running, so the caller must keep its slot until it returns.
+      if (execution && error instanceof errors.E_JOB_TIMEOUT) {
+        timedOut.timedOutExecution = Promise.resolve(execution).then(
+          () => {},
+          () => {}
+        )
+      }
+      throw error
     } finally {
       cleanupAbortListener()
     }
@@ -209,7 +304,7 @@ export class JobExecutionRuntime {
 
   #resolveFailure(
     jobName: string,
-    options: JobOptions,
+    options: ResolvedJobOptions,
     retryConfig: RetryConfig,
     error: Error,
     attempts: number

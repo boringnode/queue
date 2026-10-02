@@ -4,8 +4,8 @@ export { QueueManager } from './src/queue_manager.js'
 export { Locator } from './src/locator.js'
 export { Schedule } from './src/schedule.js'
 export { ScheduleBuilder } from './src/schedule_builder.js'
+export { JobDispatcher } from './src/job_dispatcher.js'
 export { JobBatchDispatcher } from './src/job_batch_dispatcher.js'
-export { QueueSchemaService } from './src/services/queue_schema.js'
 export {
   customBackoff,
   linearBackoff,

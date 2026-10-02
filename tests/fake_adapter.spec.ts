@@ -1,6 +1,7 @@
 import { test } from '@japa/runner'
 import { Job } from '../src/job.js'
-import { fake } from '../src/drivers/fake_adapter.js'
+import { fake, type FakeAdapter } from '../src/drivers/fake_adapter.js'
+import { registerDriverTestSuite } from './_utils/register_driver_test_suite.js'
 
 test.group('FakeAdapter', () => {
   test('should record pushes and support assertions', async ({ assert }) => {
@@ -185,5 +186,41 @@ test.group('FakeAdapter', () => {
     assert.throws(() => adapter.assertPushed(MissingJob))
 
     await adapter.destroy()
+  })
+
+  test('should store an undefined schedule payload as an empty object', async ({ assert }) => {
+    const adapter = fake()()
+    const config = { id: 'fake-schedule', name: 'TestJob', everyMs: 60_000, timezone: 'UTC' }
+
+    await adapter.upsertSchedule({ ...config, payload: undefined })
+    assert.deepEqual((await adapter.getSchedule('fake-schedule'))!.payload, {})
+
+    await adapter.upsertSchedule({ ...config, payload: { version: 1 } })
+    await adapter.upsertSchedule({ ...config, payload: undefined })
+    assert.deepEqual((await adapter.getSchedule('fake-schedule'))!.payload, {})
+
+    await adapter.destroy()
+  })
+})
+
+test.group('FakeAdapter | driver suite', (group) => {
+  let adapters: FakeAdapter[] = []
+
+  // Delayed pushes keep a timer each: destroy() clears them so Node can exit.
+  group.each.teardown(async () => {
+    await Promise.all(adapters.map((adapter) => adapter.destroy()))
+    adapters = []
+  })
+
+  registerDriverTestSuite({
+    test,
+    createAdapter: () => {
+      const adapter = fake()()
+      adapters.push(adapter)
+      return adapter
+    },
+    supportsConcurrency: false,
+    // Concurrent dedup pushes all win on the Fake adapter: tracked in .todo.
+    supportsAtomicDedup: false,
   })
 })

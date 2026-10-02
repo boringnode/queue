@@ -2,7 +2,13 @@ import { randomUUID } from 'node:crypto'
 import { Redis, type RedisOptions } from 'ioredis'
 import { DEFAULT_PRIORITY } from '../constants.js'
 import { calculateScore } from '../utils.js'
-import type { Adapter, AcquiredJob, PushResult } from '../contracts/adapter.js'
+import type {
+  Adapter,
+  AcquiredJob,
+  JobLease,
+  PushResult,
+  StalledJobsRecovery,
+} from '../contracts/adapter.js'
 import type { DedupOutcome } from '../types/main.js'
 import type {
   JobData,
@@ -12,13 +18,15 @@ import type {
   ScheduleData,
   ScheduleListOptions,
 } from '../types/main.js'
-import { resolveRetention } from '../utils.js'
+import { createLeaseToken, resolveRetention, resolveSchedulePayload } from '../utils.js'
 import { encodeRedisJobPayloadOverlay, hydrateRedisJob } from './redis_job_storage.js'
 import {
   ACQUIRE_JOB_SCRIPT,
   CLAIM_SCHEDULE_SCRIPT,
   FINALIZE_JOB_SCRIPT,
+  FINALIZE_CRON_SCHEDULE_SCRIPT,
   GET_JOB_SCRIPT,
+  MIGRATE_SCHEDULES_SCRIPT,
   PUSH_DEDUP_JOB_SCRIPT,
   PUSH_DELAYED_JOB_SCRIPT,
   PUSH_JOB_SCRIPT,
@@ -26,12 +34,21 @@ import {
   REMOVE_JOB_SCRIPT,
   RENEW_JOBS_SCRIPT,
   RETRY_JOB_SCRIPT,
+  UPDATE_SCHEDULE_SCRIPT,
+  UPSERT_SCHEDULE_SCRIPT,
 } from './redis_scripts.js'
 
 const redisKey = 'jobs'
-const schedulesKey = 'schedules'
 const schedulesIndexKey = 'schedules::index'
-type RedisConfig = Redis | RedisOptions
+const schedulesDueKey = 'schedules::due'
+// Schedule hashes live one level below the index keys so no schedule id can collide with them.
+const scheduleDataPrefix = 'schedules::data::'
+const legacyScheduleDataPrefix = 'schedules::'
+
+/**
+ * An ioredis connection, or the options to create one.
+ */
+export type RedisConfig = Redis | RedisOptions
 
 function isRedisConnection(config?: RedisConfig): config is Redis {
   return !!config && 'defineCommand' in config && typeof config.defineCommand === 'function'
@@ -70,7 +87,6 @@ export class RedisAdapter implements Adapter {
   readonly #connection: Redis
   readonly #ownsConnection: boolean
   #workerId: string = ''
-
   constructor(connection: Redis, ownsConnection: boolean = false) {
     this.#connection = connection
     this.#ownsConnection = ownsConnection
@@ -94,6 +110,10 @@ export class RedisAdapter implements Adapter {
     return `${this.#getDedupPrefix(queue)}${dedupId}`
   }
 
+  /**
+   * Scripts that build dedup keys from this prefix must receive it in KEYS so
+   * ioredis applies the connection key prefix to it.
+   */
   #getDedupPrefix(queue: string): string {
     return `${redisKey}::${queue}::dedup::`
   }
@@ -115,6 +135,7 @@ export class RedisAdapter implements Adapter {
   async popFrom(queue: string): Promise<AcquiredJob | null> {
     const keys = this.#getKeys(queue)
     const now = Date.now()
+    const leaseToken = createLeaseToken(this.#workerId)
 
     const result = await this.#connection.eval(
       ACQUIRE_JOB_SCRIPT,
@@ -125,7 +146,8 @@ export class RedisAdapter implements Adapter {
       keys.delayed,
       keys.overlay,
       this.#workerId,
-      now.toString()
+      now.toString(),
+      leaseToken
     )
 
     if (!result) {
@@ -138,89 +160,99 @@ export class RedisAdapter implements Adapter {
       acquiredAt: number
     }
 
-    return { ...hydrateRedisJob(data, overlay), acquiredAt }
+    return { ...hydrateRedisJob(data, overlay), acquiredAt, leaseToken }
   }
 
-  async completeJob(jobId: string, queue: string, removeOnComplete?: JobRetention): Promise<void> {
+  async completeJob(
+    job: JobLease,
+    queue: string,
+    removeOnComplete?: JobRetention
+  ): Promise<boolean> {
     const keys = this.#getKeys(queue)
     const dedupPrefix = this.#getDedupPrefix(queue)
     const { keep, maxAge, maxCount } = resolveRetention(removeOnComplete)
 
     if (!keep) {
-      await this.#connection.eval(
+      const removed = await this.#connection.eval(
         REMOVE_JOB_SCRIPT,
-        3,
+        4,
         keys.data,
         keys.active,
         keys.overlay,
-        jobId,
-        dedupPrefix
+        dedupPrefix,
+        job.id,
+        job.leaseToken
       )
-      return
+      return removed === 1
     }
 
-    await this.#connection.eval(
+    const finalized = await this.#connection.eval(
       FINALIZE_JOB_SCRIPT,
-      5,
+      6,
       keys.data,
       keys.active,
       keys.completed,
       keys.completedIndex,
       keys.overlay,
-      jobId,
+      dedupPrefix,
+      job.id,
       Date.now().toString(),
       maxAge.toString(),
       maxCount.toString(),
       '',
-      dedupPrefix
+      job.leaseToken
     )
+    return finalized === 1
   }
 
   async failJob(
-    jobId: string,
+    job: JobLease,
     queue: string,
     error?: Error,
     removeOnFail?: JobRetention
-  ): Promise<void> {
+  ): Promise<boolean> {
     const keys = this.#getKeys(queue)
     const dedupPrefix = this.#getDedupPrefix(queue)
     const { keep, maxAge, maxCount } = resolveRetention(removeOnFail)
 
     if (!keep) {
-      await this.#connection.eval(
+      const removed = await this.#connection.eval(
         REMOVE_JOB_SCRIPT,
-        3,
+        4,
         keys.data,
         keys.active,
         keys.overlay,
-        jobId,
-        dedupPrefix
+        dedupPrefix,
+        job.id,
+        job.leaseToken
       )
-      return
+      return removed === 1
     }
 
-    await this.#connection.eval(
+    const finalized = await this.#connection.eval(
       FINALIZE_JOB_SCRIPT,
-      5,
+      6,
       keys.data,
       keys.active,
       keys.failed,
       keys.failedIndex,
       keys.overlay,
-      jobId,
+      dedupPrefix,
+      job.id,
       Date.now().toString(),
       maxAge.toString(),
       maxCount.toString(),
       error?.message || '',
-      dedupPrefix
+      job.leaseToken
     )
+    return finalized === 1
   }
 
-  async retryJob(jobId: string, queue: string, retryAt?: Date): Promise<void> {
+  async retryJob(job: JobLease, queue: string, retryAt?: Date): Promise<boolean> {
     const keys = this.#getKeys(queue)
     const now = Date.now()
 
-    await this.#connection.eval(
+    const retried = await this.#connection.eval(
       RETRY_JOB_SCRIPT,
       5,
       keys.data,
@@ -228,10 +260,12 @@ export class RedisAdapter implements Adapter {
       keys.pending,
       keys.delayed,
       keys.overlay,
-      jobId,
+      job.id,
       retryAt ? retryAt.getTime().toString() : '0',
-      now.toString()
+      now.toString(),
+      job.leaseToken
     )
+    return retried === 1
   }
 
   async getJob(jobId: string, queue: string): Promise<JobRecord | null> {
@@ -388,12 +422,15 @@ export class RedisAdapter implements Adapter {
   async recoverStalledJobs(
     queue: string,
     stalledThreshold: number,
-    maxStalledCount: number
-  ): Promise<number> {
+    maxStalledCount: number,
+    maxExceeded: number
+  ): Promise<StalledJobsRecovery> {
     const keys = this.#getKeys(queue)
     const now = Date.now()
+    // The script appends the job id to get one token per reacquired job.
+    const leaseTokenPrefix = createLeaseToken(this.#workerId)
 
-    const recovered = await this.#connection.eval(
+    const [recovered, ...exceeded] = (await this.#connection.eval(
       RECOVER_STALLED_JOBS_SCRIPT,
       4,
       keys.data,
@@ -403,14 +440,28 @@ export class RedisAdapter implements Adapter {
       now.toString(),
       stalledThreshold.toString(),
       maxStalledCount.toString(),
-      this.#getDedupPrefix(queue)
-    )
+      this.#workerId,
+      maxExceeded.toString(),
+      leaseTokenPrefix
+    )) as [number, ...string[]]
 
-    return recovered as number
+    return {
+      recovered,
+      exceeded: exceeded.map((result) => {
+        const { data, overlay, acquiredAt, leaseToken } = JSON.parse(result) as {
+          data: string
+          overlay?: string
+          acquiredAt: number
+          leaseToken: string
+        }
+
+        return { ...hydrateRedisJob(data, overlay), acquiredAt, leaseToken }
+      }),
+    }
   }
 
-  async renewJobs(queue: string, jobIds: string[]): Promise<number> {
-    if (jobIds.length === 0) {
+  async renewJobs(queue: string, jobs: JobLease[]): Promise<number> {
+    if (jobs.length === 0) {
       return 0
     }
 
@@ -422,8 +473,7 @@ export class RedisAdapter implements Adapter {
       1,
       keys.active,
       now.toString(),
-      this.#workerId,
-      ...jobIds
+      ...jobs.flatMap((job) => [job.id, job.leaseToken])
     )
 
     return renewed as number
@@ -432,21 +482,13 @@ export class RedisAdapter implements Adapter {
   async upsertSchedule(config: ScheduleConfig): Promise<string> {
     const id = config.id ?? randomUUID()
     const now = Date.now()
-    const scheduleKey = `${schedulesKey}::${id}`
-    const [existingRunCount, existingCreatedAt] = await this.#connection.hmget(
-      scheduleKey,
-      'run_count',
-      'created_at'
-    )
+    const scheduleKey = `${scheduleDataPrefix}${id}`
 
     const scheduleData: Record<string, string> = {
       id,
       name: config.name,
-      payload: JSON.stringify(config.payload),
+      payload: JSON.stringify(resolveSchedulePayload(config.payload)),
       timezone: config.timezone,
-      status: 'active',
-      run_count: existingRunCount ?? '0',
-      created_at: existingCreatedAt ?? now.toString(),
     }
 
     if (config.cronExpression !== undefined) scheduleData.cron_expression = config.cronExpression
@@ -455,13 +497,34 @@ export class RedisAdapter implements Adapter {
     if (config.to !== undefined) scheduleData.to_date = config.to.getTime().toString()
     if (config.limit !== undefined) scheduleData.run_limit = config.limit.toString()
 
-    // Upsert schedule and clear stale optional fields from previous config.
-    await this.#connection
-      .multi()
-      .hdel(scheduleKey, 'cron_expression', 'every_ms', 'from_date', 'to_date', 'run_limit')
-      .hset(scheduleKey, scheduleData)
-      .sadd(schedulesIndexKey, id)
-      .exec()
+    const unfinalizedClaim = (await this.#connection.eval(
+      UPSERT_SCHEDULE_SCRIPT,
+      4,
+      scheduleKey,
+      schedulesIndexKey,
+      schedulesDueKey,
+      `${legacyScheduleDataPrefix}${id}`,
+      id,
+      now.toString(),
+      JSON.stringify(scheduleData),
+      config.nextRunAt?.getTime().toString() ?? ''
+    )) as [string, string, string] | null
+
+    // Finalize it as its worker would have, from the time of the claim. The
+    // given next run was computed before, so it may be the claimed occurrence.
+    if (unfinalizedClaim && config.cronExpression !== undefined) {
+      const [claimToken, configRevision, claimedAt] = unfinalizedClaim
+      if (claimedAt !== '') {
+        await this.#finalizeCronClaim({
+          id,
+          cronExpression: config.cronExpression,
+          timezone: config.timezone,
+          configRevision,
+          claimToken,
+          claimedAt: Number(claimedAt),
+        })
+      }
+    }
 
     return id
   }
@@ -474,7 +537,7 @@ export class RedisAdapter implements Adapter {
   }
 
   async getSchedule(id: string): Promise<ScheduleData | null> {
-    const scheduleKey = `${schedulesKey}::${id}`
+    const scheduleKey = `${scheduleDataPrefix}${id}`
     const data = await this.#connection.hgetall(scheduleKey)
 
     if (!data || Object.keys(data).length === 0) {
@@ -493,7 +556,7 @@ export class RedisAdapter implements Adapter {
     const pipeline = this.#connection.pipeline()
 
     for (const id of ids) {
-      pipeline.hgetall(`${schedulesKey}::${id}`)
+      pipeline.hgetall(`${scheduleDataPrefix}${id}`)
     }
 
     const results = await pipeline.exec()
@@ -525,7 +588,7 @@ export class RedisAdapter implements Adapter {
     id: string,
     updates: Partial<Pick<ScheduleData, 'status' | 'nextRunAt' | 'lastRunAt' | 'runCount'>>
   ): Promise<void> {
-    const scheduleKey = `${schedulesKey}::${id}`
+    const scheduleKey = `${scheduleDataPrefix}${id}`
     const data: Record<string, string> = {}
 
     if (updates.status !== undefined) data.status = updates.status
@@ -537,24 +600,49 @@ export class RedisAdapter implements Adapter {
     }
     if (updates.runCount !== undefined) data.run_count = updates.runCount.toString()
 
-    if (Object.keys(data).length > 0) {
-      await this.#connection.hset(scheduleKey, data)
-    }
+    if (Object.keys(data).length === 0) return
+
+    await this.#connection.eval(
+      UPDATE_SCHEDULE_SCRIPT,
+      2,
+      scheduleKey,
+      schedulesDueKey,
+      id,
+      JSON.stringify(data)
+    )
   }
 
   async deleteSchedule(id: string): Promise<void> {
-    const scheduleKey = `${schedulesKey}::${id}`
-    await this.#connection.multi().del(scheduleKey).srem(schedulesIndexKey, id).exec()
+    const scheduleKey = `${scheduleDataPrefix}${id}`
+    await this.#connection
+      .multi()
+      .del(scheduleKey)
+      .srem(schedulesIndexKey, id)
+      .zrem(schedulesDueKey, id)
+      .exec()
+  }
+
+  async migrate(): Promise<void> {
+    await this.#connection.eval(
+      MIGRATE_SCHEDULES_SCRIPT,
+      4,
+      schedulesIndexKey,
+      schedulesDueKey,
+      scheduleDataPrefix,
+      legacyScheduleDataPrefix
+    )
   }
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
     const now = Date.now()
+    const claimToken = randomUUID()
     const result = await this.#connection.eval(
       CLAIM_SCHEDULE_SCRIPT,
       2,
-      schedulesIndexKey,
-      `${schedulesKey}::`,
-      now.toString()
+      schedulesDueKey,
+      scheduleDataPrefix,
+      now.toString(),
+      claimToken
     )
 
     if (!result) {
@@ -567,34 +655,52 @@ export class RedisAdapter implements Adapter {
     // The Lua script only handles simple interval; cron needs JS cron-parser.
     // This is safe because the schedule is already claimed (run_count incremented).
     if (data.cron_expression) {
-      const { CronExpressionParser } = await import('cron-parser')
-      const cron = CronExpressionParser.parse(data.cron_expression, {
-        currentDate: new Date(now),
-        tz: data.timezone || 'UTC',
+      await this.#finalizeCronClaim({
+        id: data.id,
+        cronExpression: data.cron_expression,
+        timezone: data.timezone,
+        configRevision: data.config_revision || '',
+        claimToken,
+        claimedAt: now,
       })
-      const nextRun = cron.next().toDate().getTime()
-
-      // Check limits before updating
-      const runCount = Number.parseInt(data.run_count || '0', 10) + 1
-      const runLimit = data.run_limit ? Number.parseInt(data.run_limit, 10) : null
-      const toDate = data.to_date ? Number.parseInt(data.to_date, 10) : null
-
-      let newNextRunAt: number | string = nextRun
-
-      if (runLimit !== null && runCount >= runLimit) {
-        newNextRunAt = ''
-      } else if (toDate && nextRun > toDate) {
-        newNextRunAt = ''
-      }
-
-      await this.#connection.hset(
-        `${schedulesKey}::${data.id}`,
-        'next_run_at',
-        newNextRunAt.toString()
-      )
     }
 
     return this.#hashToScheduleData(data)
+  }
+
+  /**
+   * Writes the next run of a cron claim, the first occurrence after the
+   * claim. The script applies it only while the same claim still owns the
+   * schedule, and clears it when the run limit or end date is reached.
+   */
+  async #finalizeCronClaim(claim: {
+    id: string
+    cronExpression: string
+    timezone: string
+    configRevision: string
+    claimToken: string
+    claimedAt: number
+  }): Promise<void> {
+    const { CronExpressionParser } = await import('cron-parser')
+    const nextRunAt = CronExpressionParser.parse(claim.cronExpression, {
+      currentDate: new Date(claim.claimedAt),
+      tz: claim.timezone || 'UTC',
+    })
+      .next()
+      .toDate()
+      .getTime()
+
+    await this.#connection.eval(
+      FINALIZE_CRON_SCHEDULE_SCRIPT,
+      2,
+      `${scheduleDataPrefix}${claim.id}`,
+      schedulesDueKey,
+      claim.id,
+      claim.cronExpression,
+      claim.configRevision,
+      claim.claimToken,
+      nextRunAt.toString()
+    )
   }
 
   #hashToScheduleData(data: Record<string, string>): ScheduleData {
