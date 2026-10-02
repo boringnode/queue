@@ -831,7 +831,19 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
   test('renewJobs should keep an active job from being recovered as stalled', async ({
     assert,
+    cleanup,
   }) => {
+    const stalledThreshold = 60_000
+    const realNow = Date.now
+    let clockOffset = 0
+    Date.now = () => realNow() + clockOffset
+    cleanup(() => {
+      Date.now = realNow
+    })
+    const advancePastStalledThreshold = () => {
+      clockOffset += stalledThreshold + 1
+    }
+
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')
 
@@ -844,25 +856,22 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const job = acquired.find((candidate) => candidate?.id === 'long-running')
     assert.isDefined(job)
 
-    // Both jobs run longer than the 200ms stalled threshold; only one is renewed.
-    // A slow run only makes the control job more stalled, and the renewed job
-    // has a 200ms margin between each renewal and the next recovery.
-    await new Promise((resolve) => setTimeout(resolve, 300))
+    advancePastStalledThreshold()
     assert.equal(await adapter.renewJobs('test-queue', [job!]), 1)
 
-    const first = await adapter.recoverStalledJobs('test-queue', 200, 1, 100)
+    const first = await adapter.recoverStalledJobs('test-queue', stalledThreshold, 1, 100)
 
     // The control job proves the threshold had passed; the renewed job stays active.
     assert.equal(first.recovered, 1)
     assert.equal((await adapter.getJob('long-running', 'test-queue'))!.status, 'active')
     assert.equal((await adapter.getJob('not-renewed', 'test-queue'))!.status, 'pending')
 
-    // 300ms after the first renewal, the job would be stalled again: only the
-    // second renewal, with the same lease, keeps it active.
-    await new Promise((resolve) => setTimeout(resolve, 300))
+    // Past the threshold since the first renewal, only the second renewal,
+    // with the same lease, keeps the job active.
+    advancePastStalledThreshold()
     assert.equal(await adapter.renewJobs('test-queue', [job!]), 1)
 
-    const second = await adapter.recoverStalledJobs('test-queue', 200, 1, 100)
+    const second = await adapter.recoverStalledJobs('test-queue', stalledThreshold, 1, 100)
     assert.equal(second.recovered, 0)
     assert.equal((await adapter.getJob('long-running', 'test-queue'))!.status, 'active')
   })
