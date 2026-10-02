@@ -976,10 +976,10 @@ test.group('Adapter | Redis', (group) => {
       .exec()
 
     await adapter.migrate()
-    const firstMembers = await connection.zrange('schedules::due', 0, -1, 'WITHSCORES')
+    const firstMembers = await connection.zrange('schedules::due', 0, '-1', 'WITHSCORES')
 
     await adapter.migrate()
-    const secondMembers = await connection.zrange('schedules::due', 0, -1, 'WITHSCORES')
+    const secondMembers = await connection.zrange('schedules::due', 0, '-1', 'WITHSCORES')
 
     assert.deepEqual(firstMembers, ['idempotent-schedule', nextRunAt.toString()])
     assert.deepEqual(secondMembers, firstMembers)
