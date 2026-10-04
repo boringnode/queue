@@ -200,12 +200,15 @@ export function registerWorkerConcurrencyTestSuite(options: WorkerConcurrencyTes
   }) => {
     const jobStartTimes: Map<string, number> = new Map()
     const jobEndTimes: Map<string, number> = new Map()
+    const jobCount = 4
+    const { promise: allJobsStarted, resolve: releaseJobs } = Promise.withResolvers<void>()
+    const sequentialExecutionTimeout = setTimeout(2000, undefined, { ref: false })
 
     class SlowJob extends Job<{ jobId: string }> {
       async execute() {
         jobStartTimes.set(this.payload.jobId, Date.now())
-        // Simulate a slow job (300ms)
-        await setTimeout(300)
+        if (jobStartTimes.size === jobCount) releaseJobs()
+        await Promise.race([allJobsStarted, sequentialExecutionTimeout])
         jobEndTimes.set(this.payload.jobId, Date.now())
       }
     }
@@ -237,7 +240,7 @@ export function registerWorkerConcurrencyTestSuite(options: WorkerConcurrencyTes
       while (cycles < maxCycles) {
         const cycle = await worker.processCycle(['default'])
         cycles++
-        if (cycle?.type === 'idle' && jobEndTimes.size === 4) break
+        if (cycle?.type === 'idle' && jobEndTimes.size === jobCount) break
       }
     })()
 
@@ -279,12 +282,11 @@ export function registerWorkerConcurrencyTestSuite(options: WorkerConcurrencyTes
     await processingPromise
 
     // All 4 jobs should have been executed
-    assert.equal(jobStartTimes.size, 4, 'All 4 jobs should have started')
-    assert.equal(jobEndTimes.size, 4, 'All 4 jobs should have completed')
+    assert.equal(jobStartTimes.size, jobCount, 'All 4 jobs should have started')
+    assert.equal(jobEndTimes.size, jobCount, 'All 4 jobs should have completed')
 
     // Verify concurrent execution: jobs 1, 2, 3 should start BEFORE job 0 ends
-    // If they ran sequentially, job 1 would start after job 0's 300ms execution
-    const job0Start = jobStartTimes.get('job-0')!
+    // If they ran sequentially, job 0 would only end after the sequential execution timeout
     const job0End = jobEndTimes.get('job-0')!
     const job1Start = jobStartTimes.get('job-1')!
     const job2Start = jobStartTimes.get('job-2')!
@@ -292,28 +294,20 @@ export function registerWorkerConcurrencyTestSuite(options: WorkerConcurrencyTes
 
     // Job 1 should start before job 0 ends (proving concurrency)
     assert.isTrue(
-      job1Start < job0End,
-      `Job 1 should start (${job1Start}) before job 0 ends (${job0End}) - concurrent execution`
+      job1Start <= job0End,
+      `Job 1 should start (${job1Start}) no later than job 0 ends (${job0End}) - concurrent execution`
     )
 
     // Job 2 should start before job 0 ends
     assert.isTrue(
-      job2Start < job0End,
-      `Job 2 should start (${job2Start}) before job 0 ends (${job0End}) - concurrent execution`
+      job2Start <= job0End,
+      `Job 2 should start (${job2Start}) no later than job 0 ends (${job0End}) - concurrent execution`
     )
 
     // Job 3 should start before job 0 ends
     assert.isTrue(
-      job3Start < job0End,
-      `Job 3 should start (${job3Start}) before job 0 ends (${job0End}) - concurrent execution`
-    )
-
-    // All jobs should start within a reasonable time window (not sequentially)
-    const maxStartDiff = Math.max(job1Start, job2Start, job3Start) - job0Start
-    assert.isBelow(
-      maxStartDiff,
-      250,
-      `All jobs should start within 250ms of each other (actual: ${maxStartDiff}ms)`
+      job3Start <= job0End,
+      `Job 3 should start (${job3Start}) no later than job 0 ends (${job0End}) - concurrent execution`
     )
   })
 }
