@@ -285,6 +285,55 @@ for (const dialect of ['sqlite', 'postgres', 'mysql'] as const) {
         assert.equal(legacy!.nextRunAt!.toISOString(), NEXT_RUN_AT)
         assert.equal(legacy!.lastRunAt!.toISOString(), LAST_RUN_AT)
       })
+
+      test('reads the MySQL zero date as no date', async ({ assert }) => {
+        // Non-strict mode stores the zero date for a date it cannot store.
+        await connection.transaction(async (trx) => {
+          const [[current]] = await trx.raw('select @@session.sql_mode as sql_mode')
+          await trx.raw("set session sql_mode = ''")
+          await trx(TABLE).insert({
+            id: 'legacy',
+            name: 'LegacyJob',
+            payload: '{}',
+            every_ms: 60_000,
+            next_run_at: '0000-00-00 00:00:00',
+            last_run_at: 'not a date',
+          })
+          await trx.raw('set session sql_mode = ?', [current.sql_mode])
+        })
+
+        await new KnexQueueSchemaService(connection).migrateScheduleDates(TABLE, {
+          timezone: WRITER_TIME_ZONE,
+        })
+
+        const legacy = await adapter().getSchedule('legacy')
+        assert.isNull(legacy!.nextRunAt)
+        assert.isNull(legacy!.lastRunAt)
+      })
+
+      test('rejects a zero created_at before changing the table', async ({ assert }) => {
+        await connection.transaction(async (trx) => {
+          const [[current]] = await trx.raw('select @@session.sql_mode as sql_mode')
+          await trx.raw("set session sql_mode = ''")
+          await trx(TABLE).insert({
+            id: 'legacy',
+            name: 'LegacyJob',
+            payload: '{}',
+            every_ms: 60_000,
+            created_at: '0000-00-00 00:00:00',
+          })
+          await trx.raw('set session sql_mode = ?', [current.sql_mode])
+        })
+
+        await assert.rejects(
+          () =>
+            new KnexQueueSchemaService(connection).migrateScheduleDates(TABLE, {
+              timezone: WRITER_TIME_ZONE,
+            }),
+          /Cannot migrate schedule "legacy": its created_at is empty/
+        )
+        assert.match((await connection(TABLE).columnInfo('created_at')).type, /timestamp/i)
+      })
     }
 
     if (dialect === 'postgres') {
@@ -589,6 +638,84 @@ for (const dialect of ['sqlite', 'postgres', 'mysql'] as const) {
         })
 
         await assertMigratedSchedules(assert, adapter(), { exact: CREATED_AT })
+      })
+
+      test('reads the MySQL zero date as no date', async ({ assert }) => {
+        // Non-strict mode stores the zero date for a date it cannot store.
+        await connection.connection().execute(async (db) => {
+          const current = await sql<{
+            sqlMode: string
+          }>`select @@session.sql_mode as ${sql.ref('sqlMode')}`.execute(db)
+          await sql`set session sql_mode = ''`.execute(db)
+          await db
+            .insertInto(TABLE)
+            .values({
+              id: 'legacy',
+              name: 'LegacyJob',
+              payload: '{}',
+              every_ms: 60_000,
+              next_run_at: '0000-00-00 00:00:00',
+              last_run_at: 'not a date',
+            })
+            .execute()
+          await sql`set session sql_mode = ${current.rows[0].sqlMode}`.execute(db)
+        })
+
+        await new KyselyQueueSchemaService(connection, { dialect }).migrateScheduleDates(TABLE, {
+          timezone: WRITER_TIME_ZONE,
+        })
+
+        const legacy = await adapter().getSchedule('legacy')
+        assert.isNull(legacy!.nextRunAt)
+        assert.isNull(legacy!.lastRunAt)
+      })
+
+      test('rejects a zero created_at before changing the table', async ({ assert }) => {
+        await connection.connection().execute(async (db) => {
+          const current = await sql<{
+            sqlMode: string
+          }>`select @@session.sql_mode as ${sql.ref('sqlMode')}`.execute(db)
+          await sql`set session sql_mode = ''`.execute(db)
+          await db
+            .insertInto(TABLE)
+            .values({
+              id: 'legacy',
+              name: 'LegacyJob',
+              payload: '{}',
+              every_ms: 60_000,
+              created_at: '0000-00-00 00:00:00',
+            })
+            .execute()
+          await sql`set session sql_mode = ${current.rows[0].sqlMode}`.execute(db)
+        })
+
+        await assert.rejects(
+          () =>
+            new KyselyQueueSchemaService(connection, { dialect }).migrateScheduleDates(TABLE, {
+              timezone: WRITER_TIME_ZONE,
+            }),
+          /Cannot migrate schedule "legacy": its created_at is empty/
+        )
+        assert.match((await columnTypes()).get('created_at')!, /timestamp/i)
+      })
+    }
+
+    if (dialect === 'sqlite') {
+      test('keeps a date in the year 0', async ({ assert }) => {
+        // SQLite stores the text it is given; the migration reads it as UTC.
+        await insertLegacySchedule()
+        await connection
+          .updateTable(TABLE)
+          .set({ next_run_at: '0000-06-01 12:00:00' })
+          .where('id', '=', 'legacy')
+          .execute()
+
+        await new KyselyQueueSchemaService(connection, { dialect }).migrateScheduleDates(TABLE, {
+          timezone: WRITER_TIME_ZONE,
+        })
+
+        const legacy = await adapter().getSchedule('legacy')
+        assert.equal(legacy!.nextRunAt!.toISOString(), '0000-06-01T12:00:00.000Z')
       })
     }
 

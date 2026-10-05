@@ -78,6 +78,8 @@ const WALL_CLOCK = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{
  * - Digits only: already epoch milliseconds.
  * - A date with `Z` or an offset: an exact instant.
  * - A date without a time zone: a wall-clock time in `wallClockTimeZone`.
+ * - The MySQL zero date, which non-strict mode stores for a date it cannot
+ *   store: no date.
  */
 export function legacyScheduleDateToEpoch(
   value: string | number | null | undefined,
@@ -92,11 +94,16 @@ export function legacyScheduleDateToEpoch(
   const wallClock = WALL_CLOCK.exec(text)
   if (wallClock) {
     const [, year, month, day, hour, minute, second, fraction = '0'] = wallClock
-    return wallClockToEpoch(
-      [year, month, day, hour, minute, second].map(Number) as WallClockParts,
-      Math.round(Number(`0.${fraction}`) * 1000),
-      wallClockTimeZone
-    )
+    const parts = [year, month, day, hour, minute, second].map(Number) as WallClockParts
+
+    if (parts.every((part) => part === 0) && Number(fraction) === 0) return null
+
+    // Date.UTC() moves an impossible date, such as February 31, to a later one.
+    if (!isWallClock(parts)) {
+      throw new Error(`Cannot convert the schedule date "${value}" to epoch milliseconds`)
+    }
+
+    return wallClockToEpoch(parts, Math.round(Number(`0.${fraction}`) * 1000), wallClockTimeZone)
   }
 
   // PostgreSQL prints offsets as `+00` or `+05:30`; normalize to `+00:00`.
@@ -155,8 +162,7 @@ type WallClockParts = [
  * change, which moves it forward by the size of the gap.
  */
 function wallClockToEpoch(parts: WallClockParts, milliseconds: number, timeZone: string): number {
-  const [year, month, day, hour, minute, second] = parts
-  const asUtc = Date.UTC(year, month - 1, day, hour, minute, second, milliseconds)
+  const asUtc = utcEpoch(parts, milliseconds)
   const DAY = 24 * 60 * 60 * 1000
 
   // The offsets in effect a day before and a day after cover any DST change.
@@ -175,6 +181,7 @@ function timeZoneOffset(epoch: number, timeZone: string): number {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone,
     hourCycle: 'h23',
+    era: 'short',
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
@@ -184,17 +191,42 @@ function timeZoneOffset(epoch: number, timeZone: string): number {
   }).formatToParts(new Date(epoch))
 
   const value = (type: string) => Number(parts.find((part) => part.type === type)!.value)
-  const wallClockAsUtc = Date.UTC(
-    value('year'),
-    value('month') - 1,
-    value('day'),
-    value('hour'),
-    value('minute'),
-    value('second'),
+  // Intl counts years before 1 AD from 1 BC; the year 0 is 1 BC.
+  const era = parts.find((part) => part.type === 'era')!.value
+  const year = era === 'BC' ? 1 - value('year') : value('year')
+  const wallClockAsUtc = utcEpoch(
+    [year, value('month'), value('day'), value('hour'), value('minute'), value('second')],
     new Date(epoch).getUTCMilliseconds()
   )
 
   return wallClockAsUtc - epoch
+}
+
+/**
+ * Epoch milliseconds of a wall-clock time read as UTC. Unlike Date.UTC(), it
+ * keeps the years 0 to 99 instead of reading them as 1900 to 1999.
+ */
+function utcEpoch(parts: WallClockParts, milliseconds: number): number {
+  const [year, month, day, hour, minute, second] = parts
+  const date = new Date(0)
+  date.setUTCFullYear(year, month - 1, day)
+  date.setUTCHours(hour, minute, second, milliseconds)
+  return date.getTime()
+}
+
+/** Whether the parts name a time that exists, as UTC: no month 13 or February 31. */
+function isWallClock(parts: WallClockParts): boolean {
+  const date = new Date(utcEpoch(parts, 0))
+  const [year, month, day, hour, minute, second] = parts
+
+  return (
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day &&
+    date.getUTCHours() === hour &&
+    date.getUTCMinutes() === minute &&
+    date.getUTCSeconds() === second
+  )
 }
 
 /** Time zone of the current process. */
