@@ -17,9 +17,11 @@ timezone, `from`, `to`, or `limit`. A payload change alone does not move the nex
 schedule is created active, as before. Workers that boot together and define the same schedule
 end with one definition and the next run that goes with it.
 
-On Redis, a cron claim writes its next run in a second step. If the process dies between the two,
-the schedule is left without a next run. Defining it again repairs it, as in 0.7: it writes the
-first occurrence after the claim, or none when the run limit or end date is reached.
+A next run that passed while the application was stopped is kept too, so the schedule runs once
+when a worker starts, provided it is active and has not reached its run limit or end date. 0.7
+skipped to the first occurrence after the restart. On Redis, this includes a cron schedule whose
+claim a crash interrupted: it runs the occurrence after the interrupted one, under the same
+conditions.
 
 ## Breaking Changes
 
