@@ -224,7 +224,7 @@ export class KnexQueueSchemaService {
       // Convert every value before the first schema change, so an unreadable
       // value fails the migration without leaving the table half migrated.
       const rows = state.legacy.length
-        ? await this.#withDatabaseTimeZone(trx, dialect, options.databaseTimeZone, async () => {
+        ? await this.#withLegacyDateSession(trx, dialect, options.databaseTimeZone, async () => {
             return (await trx(tableName).select(
               'id',
               ...state.legacy.map((name) => this.#legacyDateAsText(dialect, name))
@@ -321,15 +321,42 @@ export class KnexQueueSchemaService {
   }
 
   /**
-   * Run `callback` with the MySQL session time zone set to `timeZone`, then
-   * restore it. MySQL converts stored dates through the session time zone.
+   * Run `callback`, which reads the legacy dates as text, with the session
+   * settings that text depends on, then restore them.
+   *
+   * - PostgreSQL: the DateStyle sets the format, and the TimeZone the offset
+   *   of timestamptz values, which has seconds before standard time (Paris
+   *   was +00:09:21 in 1900). ISO and UTC give text the conversion reads.
+   * - MySQL: stored dates are converted through the session time zone, set
+   *   to `timeZone` when given.
    */
-  async #withDatabaseTimeZone<T>(
+  async #withLegacyDateSession<T>(
     trx: Knex.Transaction,
     dialect: 'pg' | 'mysql' | 'sqlite',
     timeZone: string | undefined,
     callback: () => Promise<T>
   ): Promise<T> {
+    if (dialect === 'pg') {
+      const {
+        rows: [current],
+      } = await trx.raw(
+        "select current_setting('DateStyle') as date_style, current_setting('TimeZone') as time_zone"
+      )
+      await trx.raw(
+        "select set_config('DateStyle', 'ISO', true), set_config('TimeZone', 'UTC', true)"
+      )
+
+      // Only after a success: a failed statement aborts the transaction, so a
+      // restore would fail and hide the error, and the rollback undoes these
+      // transaction-local settings anyway.
+      const result = await callback()
+      await trx.raw("select set_config('DateStyle', ?, true), set_config('TimeZone', ?, true)", [
+        current.date_style,
+        current.time_zone,
+      ])
+      return result
+    }
+
     if (dialect !== 'mysql' || timeZone === undefined) return callback()
 
     const [[current]] = await trx.raw('select @@session.time_zone as time_zone')

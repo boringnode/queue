@@ -288,6 +288,39 @@ for (const dialect of ['sqlite', 'postgres', 'mysql'] as const) {
     }
 
     if (dialect === 'postgres') {
+      test('reads dates whatever the DateStyle and TimeZone of the session', async ({
+        assert,
+        cleanup,
+      }) => {
+        const sessionConnection = Knex({
+          client: 'pg',
+          connection: { ...pgConfig(), options: '-c DateStyle=SQL,DMY -c TimeZone=Europe/Paris' },
+        })
+        cleanup(() => sessionConnection.destroy())
+        const createdAt = await insertLegacySchedule()
+        // Paris used a local mean time offset of +00:09:21 in 1900.
+        await connection(TABLE).update({ from_date: new Date('1900-01-01T00:00:00.000Z') })
+
+        // Inside an outer transaction, as in an AdonisJS migration, which keeps
+        // the settings the migration changes until it ends.
+        const settings = await sessionConnection.transaction(async (trx) => {
+          await new KnexQueueSchemaService(trx).migrateScheduleDates(TABLE, {
+            timezone: WRITER_TIME_ZONE,
+          })
+          const { rows } = await trx.raw(
+            "select current_setting('DateStyle') as date_style, current_setting('TimeZone') as time_zone"
+          )
+          return rows[0]
+        })
+        assert.deepEqual(settings, { date_style: 'SQL, DMY', time_zone: 'Europe/Paris' })
+        const legacy = await adapter().getSchedule('legacy')
+        assert.equal(legacy!.from!.toISOString(), '1900-01-01T00:00:00.000Z')
+        await connection(TABLE).update({ from_date: null })
+        await assertMigratedSchedules(assert, adapter(), createdAt)
+      })
+    }
+
+    if (dialect === 'postgres') {
       test('migrates a schema-qualified table', async ({ assert, cleanup }) => {
         await connection.raw('create schema if not exists review_tenant')
         cleanup(async () => {
@@ -576,6 +609,35 @@ for (const dialect of ['sqlite', 'postgres', 'mysql'] as const) {
 
         await schema.migrateScheduleDates(TABLE, { timezone: WRITER_TIME_ZONE })
 
+        await assertMigratedSchedules(assert, adapter(), createdAt)
+      })
+    }
+
+    if (dialect === 'postgres') {
+      test('reads dates whatever the DateStyle of the session', async ({ assert, cleanup }) => {
+        const sessionConnection = new Kysely<any>({
+          dialect: new PostgresDialect({
+            pool: new Pool({
+              ...pgConfig(),
+              options: '-c DateStyle=SQL,DMY -c TimeZone=Europe/Paris',
+            }),
+          }),
+        })
+        cleanup(() => sessionConnection.destroy())
+        const createdAt = await insertLegacySchedule()
+
+        // Inside an outer transaction, as in the Kysely Migrator, which keeps
+        // the settings the migration changes until it ends.
+        const settings = await sessionConnection.transaction().execute(async (trx) => {
+          await new KyselyQueueSchemaService(trx, { dialect }).migrateScheduleDates(TABLE, {
+            timezone: WRITER_TIME_ZONE,
+          })
+          const { rows } = await sql<{ date_style: string; time_zone: string }>`
+            select current_setting('DateStyle') as date_style, current_setting('TimeZone') as time_zone
+          `.execute(trx)
+          return rows[0]
+        })
+        assert.deepEqual(settings, { date_style: 'SQL, DMY', time_zone: 'Europe/Paris' })
         await assertMigratedSchedules(assert, adapter(), createdAt)
       })
     }

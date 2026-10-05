@@ -216,7 +216,7 @@ export class KyselyQueueSchemaService<DB> {
       // Convert every value before the first schema change, so an unreadable
       // value fails the migration without leaving the table half migrated.
       const rows = state.legacy.length
-        ? await this.#withDatabaseTimeZone(trx, options.databaseTimeZone, async () => {
+        ? await this.#withLegacyDateSession(trx, options.databaseTimeZone, async () => {
             // The query builder applies withSchema(), unlike raw SQL table references.
             return (await (trx as unknown as Kysely<Record<string, Record<string, unknown>>>)
               .selectFrom(tableName)
@@ -364,14 +364,40 @@ export class KyselyQueueSchemaService<DB> {
   }
 
   /**
-   * Run `callback` with the MySQL session time zone set to `timeZone`, then
-   * restore it. MySQL converts stored dates through the session time zone.
+   * Run `callback`, which reads the legacy dates as text, with the session
+   * settings that text depends on, then restore them.
+   *
+   * - PostgreSQL: the DateStyle sets the format, and the TimeZone the offset
+   *   of timestamptz values, which has seconds before standard time (Paris
+   *   was +00:09:21 in 1900). ISO and UTC give text the conversion reads.
+   * - MySQL: stored dates are converted through the session time zone, set
+   *   to `timeZone` when given.
    */
-  async #withDatabaseTimeZone<T>(
+  async #withLegacyDateSession<T>(
     trx: Transaction<DB>,
     timeZone: string | undefined,
     callback: () => Promise<T>
   ): Promise<T> {
+    if (this.#dialect === 'postgres') {
+      const current = await sql<{ dateStyle: string; timeZone: string }>`
+        select current_setting('DateStyle') as ${sql.ref('dateStyle')},
+          current_setting('TimeZone') as ${sql.ref('timeZone')}
+      `.execute(trx)
+      await sql`select set_config('DateStyle', 'ISO', true), set_config('TimeZone', 'UTC', true)`.execute(
+        trx
+      )
+
+      // Only after a success: a failed statement aborts the transaction, so a
+      // restore would fail and hide the error, and the rollback undoes these
+      // transaction-local settings anyway.
+      const result = await callback()
+      const { dateStyle, timeZone: sessionTimeZone } = current.rows[0]
+      await sql`select set_config('DateStyle', ${dateStyle}, true), set_config('TimeZone', ${sessionTimeZone}, true)`.execute(
+        trx
+      )
+      return result
+    }
+
     if (this.#dialect !== 'mysql' || timeZone === undefined) return callback()
 
     const current = await sql<{
