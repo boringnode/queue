@@ -831,7 +831,19 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
   test('renewJobs should keep an active job from being recovered as stalled', async ({
     assert,
+    cleanup,
   }) => {
+    const stalledThreshold = 60_000
+    const realNow = Date.now
+    let clockOffset = 0
+    Date.now = () => realNow() + clockOffset
+    cleanup(() => {
+      Date.now = realNow
+    })
+    const advancePastStalledThreshold = () => {
+      clockOffset += stalledThreshold + 1
+    }
+
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')
 
@@ -844,25 +856,22 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const job = acquired.find((candidate) => candidate?.id === 'long-running')
     assert.isDefined(job)
 
-    // Both jobs run longer than the 200ms stalled threshold; only one is renewed.
-    // A slow run only makes the control job more stalled, and the renewed job
-    // has a 200ms margin between each renewal and the next recovery.
-    await new Promise((resolve) => setTimeout(resolve, 300))
+    advancePastStalledThreshold()
     assert.equal(await adapter.renewJobs('test-queue', [job!]), 1)
 
-    const first = await adapter.recoverStalledJobs('test-queue', 200, 1, 100)
+    const first = await adapter.recoverStalledJobs('test-queue', stalledThreshold, 1, 100)
 
     // The control job proves the threshold had passed; the renewed job stays active.
     assert.equal(first.recovered, 1)
     assert.equal((await adapter.getJob('long-running', 'test-queue'))!.status, 'active')
     assert.equal((await adapter.getJob('not-renewed', 'test-queue'))!.status, 'pending')
 
-    // 300ms after the first renewal, the job would be stalled again: only the
-    // second renewal, with the same lease, keeps it active.
-    await new Promise((resolve) => setTimeout(resolve, 300))
+    // Past the threshold since the first renewal, only the second renewal,
+    // with the same lease, keeps the job active.
+    advancePastStalledThreshold()
     assert.equal(await adapter.renewJobs('test-queue', [job!]), 1)
 
-    const second = await adapter.recoverStalledJobs('test-queue', 200, 1, 100)
+    const second = await adapter.recoverStalledJobs('test-queue', stalledThreshold, 1, 100)
     assert.equal(second.recovered, 0)
     assert.equal((await adapter.getJob('long-running', 'test-queue'))!.status, 'active')
   })
@@ -2690,30 +2699,30 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { n: 1 },
       attempts: 0,
-      dedup: { id: 'TestJob::ext-1', ttl: 400, extend: true },
+      dedup: { id: 'TestJob::ext-1', ttl: 1000, extend: true },
     })
 
-    await new Promise((r) => setTimeout(r, 250))
+    await new Promise((r) => setTimeout(r, 550))
 
     const second = await adapter.pushOn('ext-queue', {
       id: 'ext-uuid-2',
       name: 'TestJob',
       payload: { n: 2 },
       attempts: 0,
-      dedup: { id: 'TestJob::ext-1', ttl: 400, extend: true },
+      dedup: { id: 'TestJob::ext-1', ttl: 1000, extend: true },
     })
     assert.equal(second && typeof second === 'object' && second.outcome, 'extended')
 
-    await new Promise((r) => setTimeout(r, 250))
+    await new Promise((r) => setTimeout(r, 550))
 
-    // Without the extend at T=250, the window would have expired at T=400. With it,
-    // only 250ms of the new 400ms window have passed.
+    // Without the extend at T=550, the window would have expired at T=1000. With it,
+    // only 550ms of the new 1000ms window have passed.
     const third = await adapter.pushOn('ext-queue', {
       id: 'ext-uuid-3',
       name: 'TestJob',
       payload: { n: 3 },
       attempts: 0,
-      dedup: { id: 'TestJob::ext-1', ttl: 400, extend: true },
+      dedup: { id: 'TestJob::ext-1', ttl: 1000, extend: true },
     })
     assert.equal(third && typeof third === 'object' && third.outcome, 'extended')
   })
@@ -2972,17 +2981,17 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { version: 1 },
       attempts: 0,
-      dedup: { id: 'TestJob::debounce-1', ttl: 400, extend: true, replace: true },
+      dedup: { id: 'TestJob::debounce-1', ttl: 1000, extend: true, replace: true },
     })
 
-    await new Promise((r) => setTimeout(r, 250))
+    await new Promise((r) => setTimeout(r, 550))
 
     const second = await adapter.pushOn('debounce-queue', {
       id: 'debounce-uuid-2',
       name: 'TestJob',
       payload: { version: 2 },
       attempts: 0,
-      dedup: { id: 'TestJob::debounce-1', ttl: 400, extend: true, replace: true },
+      dedup: { id: 'TestJob::debounce-1', ttl: 1000, extend: true, replace: true },
     })
     assert.equal(second && typeof second === 'object' && second.outcome, 'replaced')
     assert.equal(second && typeof second === 'object' && second.jobId, 'debounce-uuid-1')
@@ -2990,16 +2999,16 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     const midRecord = await adapter.getJob('debounce-uuid-1', 'debounce-queue')
     assert.deepEqual(midRecord!.data.payload, { version: 2 })
 
-    // 500ms total elapsed > original 400ms TTL, but the second dispatch reset
-    // the window at T=250. Only 250ms into the new window → still alive.
-    await new Promise((r) => setTimeout(r, 250))
+    // 1100ms total elapsed > original 1000ms TTL, but the second dispatch reset
+    // the window at T=550. Only 550ms into the new window → still alive.
+    await new Promise((r) => setTimeout(r, 550))
 
     const third = await adapter.pushOn('debounce-queue', {
       id: 'debounce-uuid-3',
       name: 'TestJob',
       payload: { version: 3 },
       attempts: 0,
-      dedup: { id: 'TestJob::debounce-1', ttl: 400, extend: true, replace: true },
+      dedup: { id: 'TestJob::debounce-1', ttl: 1000, extend: true, replace: true },
     })
     assert.equal(third && typeof third === 'object' && third.outcome, 'replaced')
     assert.equal(third && typeof third === 'object' && third.jobId, 'debounce-uuid-1')
@@ -3052,11 +3061,11 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { n: 1 },
       attempts: 0,
-      dedup: { id: 'TestJob::active-ext-1', ttl: 400, extend: true },
+      dedup: { id: 'TestJob::active-ext-1', ttl: 1000, extend: true },
     })
 
     // Move to active mid-window.
-    await new Promise((r) => setTimeout(r, 250))
+    await new Promise((r) => setTimeout(r, 550))
     const popped = await adapter.popFrom('active-ext-queue')
     assert.equal(popped!.id, 'active-ext-uuid-1')
 
@@ -3067,22 +3076,22 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       name: 'TestJob',
       payload: { n: 2 },
       attempts: 0,
-      dedup: { id: 'TestJob::active-ext-1', ttl: 400, extend: true },
+      dedup: { id: 'TestJob::active-ext-1', ttl: 1000, extend: true },
     })
     assert.equal(second && typeof second === 'object' && second.outcome, 'extended')
     assert.equal(second && typeof second === 'object' && second.jobId, 'active-ext-uuid-1')
 
-    // Without the extend, the slot would have expired by now (250 + 250 > 400).
-    // With the extend at T=250, the window restarted; at T=500 only 250ms into
+    // Without the extend, the slot would have expired by now (550 + 550 > 1000).
+    // With the extend at T=550, the window restarted; at T=1100 only 550ms into
     // new window → still blocking.
-    await new Promise((r) => setTimeout(r, 250))
+    await new Promise((r) => setTimeout(r, 550))
 
     const third = await adapter.pushOn('active-ext-queue', {
       id: 'active-ext-uuid-3',
       name: 'TestJob',
       payload: { n: 3 },
       attempts: 0,
-      dedup: { id: 'TestJob::active-ext-1', ttl: 400, extend: true },
+      dedup: { id: 'TestJob::active-ext-1', ttl: 1000, extend: true },
     })
     assert.equal(third && typeof third === 'object' && third.outcome, 'extended')
     assert.equal(third && typeof third === 'object' && third.jobId, 'active-ext-uuid-1')
