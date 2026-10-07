@@ -465,29 +465,49 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     await this.#jobs(this.#connection).insertInto(this.#jobsTable).values(row).execute()
   }
 
+  /**
+   * A single job owns a dedup slot, whatever its status: the unique
+   * (queue, dedup_id) index rejects a second owner. An existing owner is
+   * locked for the transaction. When there is none to lock and a concurrent
+   * dispatch inserts first, the transaction runs again and locks that owner.
+   */
   async #pushWithDedup(
     connection: Kysely<DB>,
     queue: string,
     jobData: JobData,
     insertRow: Partial<JobRow> & Pick<JobRow, 'id' | 'queue' | 'status' | 'data'>
   ): Promise<PushResult> {
-    try {
-      return await this.#withTransaction(connection, async (trx) => {
-        const now = Date.now()
-        const dedup = jobData.dedup!
-        const existingResult = await this.#resolveExistingDedup(trx, queue, jobData, dedup, now)
-        if (existingResult) return existingResult
+    const dedup = jobData.dedup!
 
-        return this.#insertDedup(trx, queue, jobData.id, insertRow, dedup, now)
-      })
-    } catch (error) {
-      if (this.#isMissingDedupColumn(error)) {
-        throw new Error(
-          `Dedup columns missing on "${this.#jobsTable}". Run KyselyQueueSchemaService.addDedupColumns() before dispatching jobs with .dedup().`,
-          { cause: error }
-        )
+    while (true) {
+      try {
+        return await this.#withTransaction(connection, async (trx) => {
+          const now = Date.now()
+          const existingResult = await this.#resolveExistingDedup(trx, queue, jobData, dedup, now)
+          if (existingResult) return existingResult
+
+          await this.#jobs(trx)
+            .insertInto(this.#jobsTable)
+            .values({
+              ...insertRow,
+              dedup_id: dedup.id,
+              dedup_at: now,
+              dedup_ttl: dedup.ttl ?? null,
+            })
+            .execute()
+          return { outcome: 'added', jobId: jobData.id }
+        })
+      } catch (error) {
+        if (this.#isMissingDedupColumn(error)) {
+          throw new Error(
+            `Dedup columns missing on "${this.#jobsTable}". Run KyselyQueueSchemaService.addDedupColumns() before dispatching jobs with .dedup().`,
+            { cause: error }
+          )
+        }
+        if (!this.#isUniqueViolation(error) && !this.#isDeadlock(error)) throw error
+        // The job id itself is the duplicate
+        if (await this.getJob(jobData.id, queue)) throw error
       }
-      throw error
     }
   }
 
@@ -498,18 +518,31 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     dedup: NonNullable<JobData['dedup']>,
     now: number
   ): Promise<PushResult | null> {
-    let existingQuery = this.#jobs(trx)
+    const owner = await this.#jobs(trx)
       .selectFrom(this.#jobsTable)
-      .selectAll()
+      .select('id')
       .where('queue', '=', queue)
       .where('dedup_id', '=', dedup.id)
       .orderBy('dedup_at', 'desc')
       .limit(1)
+      .executeTakeFirst()
+
+    if (!owner) return null
+
+    // The owner is locked through its primary key, as workers lock a job.
+    // Locking it through the dedup index deadlocks with them on MySQL.
+    let existingQuery = this.#jobs(trx)
+      .selectFrom(this.#jobsTable)
+      .selectAll()
+      .where('id', '=', owner.id)
+      .where('queue', '=', queue)
 
     if (this.#supportsSkipLocked()) existingQuery = existingQuery.forUpdate()
 
     const existing = await existingQuery.executeTakeFirst()
-    if (!existing) return null
+
+    // Removed or released in the meantime: the insert tells whether the slot is free
+    if (existing?.dedup_id !== dedup.id) return null
 
     const dedupAt = existing.dedup_at == null ? null : Number(existing.dedup_at)
     const dedupTtl = existing.dedup_ttl == null ? null : Number(existing.dedup_ttl)
@@ -547,62 +580,15 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
       return { outcome: 'skipped', jobId: existing.id }
     }
 
-    if (
-      existing.status === 'pending' ||
-      existing.status === 'delayed' ||
-      existing.status === 'active'
-    ) {
-      await this.#jobs(trx)
-        .updateTable(this.#jobsTable)
-        .set({ dedup_id: null, dedup_at: null, dedup_ttl: null })
-        .where('id', '=', existing.id)
-        .where('queue', '=', queue)
-        .execute()
-    }
+    // Release the expired dedup slot. The old job keeps running to completion.
+    await this.#jobs(trx)
+      .updateTable(this.#jobsTable)
+      .set({ dedup_id: null, dedup_at: null, dedup_ttl: null })
+      .where('id', '=', existing.id)
+      .where('queue', '=', queue)
+      .execute()
 
     return null
-  }
-
-  async #insertDedup(
-    trx: Transaction<DB>,
-    queue: string,
-    jobId: string,
-    insertRow: Partial<JobRow> & Pick<JobRow, 'id' | 'queue' | 'status' | 'data'>,
-    dedup: NonNullable<JobData['dedup']>,
-    now: number
-  ): Promise<PushResult> {
-    const savepoint = `queue_dedup_${randomUUID().replaceAll('-', '')}`
-    await sql`savepoint ${sql.id(savepoint)}`.execute(trx)
-
-    try {
-      await this.#jobs(trx)
-        .insertInto(this.#jobsTable)
-        .values({
-          ...insertRow,
-          dedup_id: dedup.id,
-          dedup_at: now,
-          dedup_ttl: dedup.ttl ?? null,
-        })
-        .execute()
-      await sql`release savepoint ${sql.id(savepoint)}`.execute(trx)
-      return { outcome: 'added', jobId }
-    } catch (error) {
-      await sql`rollback to savepoint ${sql.id(savepoint)}`.execute(trx)
-      await sql`release savepoint ${sql.id(savepoint)}`.execute(trx)
-      if (!this.#isUniqueViolation(error)) throw error
-    }
-
-    const winner = await this.#jobs(trx)
-      .selectFrom(this.#jobsTable)
-      .select('id')
-      .where('queue', '=', queue)
-      .where('dedup_id', '=', dedup.id)
-      .where('status', 'in', ['pending', 'delayed'])
-      .orderBy('dedup_at', 'desc')
-      .executeTakeFirst()
-
-    if (!winner) throw new Error(`Unable to resolve concurrent dedup dispatch for "${dedup.id}"`)
-    return { outcome: 'skipped', jobId: winner.id }
   }
 
   async pushMany(jobs: JobData[]): Promise<void> {
@@ -960,6 +946,13 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
       candidate.code === 'ER_DUP_ENTRY' ||
       /unique constraint/i.test(candidate.message ?? '')
     )
+  }
+
+  /**
+   * InnoDB picks a victim among dispatches inserting the same dedup id.
+   */
+  #isDeadlock(error: unknown): boolean {
+    return (error as { code?: string } | null)?.code === 'ER_LOCK_DEADLOCK'
   }
 
   #isMissingDedupColumn(error: unknown): boolean {
