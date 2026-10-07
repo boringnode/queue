@@ -10,6 +10,7 @@ import {
   KyselyAdapter,
   KyselyQueueSchemaService,
   type QueueDatabase,
+  type QueueJobTable,
 } from '../src/drivers/kysely_adapter.js'
 import { registerDriverTestSuite } from './_utils/register_driver_test_suite.js'
 
@@ -174,7 +175,6 @@ test.group('Adapter | Kysely (MySQL)', (group) => {
 
   registerDriverTestSuite({
     test,
-    supportsAtomicDedup: false,
     createAdapter: () => {
       adapter = new KyselyAdapter({
         connection,
@@ -189,6 +189,49 @@ test.group('Adapter | Kysely (MySQL)', (group) => {
   test('addDedupColumns should be idempotent', async () => {
     await schema.addDedupColumns(tableName)
     await schema.addDedupColumns(tableName)
+  })
+
+  test('addDedupColumns should leave a dedup slot to its latest job', async ({ assert }) => {
+    const jobs = connection.withTables<Record<typeof tableName, QueueJobTable>>()
+    const job = (id: string, dedupId: string, dedupAt: number) => ({
+      id,
+      queue: 'default',
+      status: 'completed' as const,
+      data: '{}',
+      dedup_id: dedupId,
+      dedup_at: dedupAt,
+      dedup_ttl: 10,
+    })
+
+    // A jobs table as the previous versions left it: no unique index, and
+    // expired owners that still hold their dedup id.
+    await connection.schema.dropIndex(`${tableName}_dedup_uidx`).on(tableName).execute()
+    await connection.schema
+      .createIndex(`${tableName}_queue_dedup_idx`)
+      .on(tableName)
+      .columns(['queue', 'dedup_id'])
+      .execute()
+    await jobs
+      .insertInto(tableName)
+      .values([job('older', 'shared', 1_000), job('newer', 'shared', 2_000)])
+      .execute()
+
+    await schema.addDedupColumns(tableName)
+    await schema.addDedupColumns(tableName)
+
+    assert.deepEqual(
+      await jobs.selectFrom(tableName).select(['id', 'dedup_id']).orderBy('id').execute(),
+      [
+        { id: 'newer', dedup_id: 'shared' },
+        { id: 'older', dedup_id: null },
+      ]
+    )
+    await assert.rejects(() =>
+      jobs
+        .insertInto(tableName)
+        .values(job('duplicate', 'shared', 3_000))
+        .execute()
+    )
   })
 })
 

@@ -1,5 +1,5 @@
 import { test as JapaTest } from '@japa/runner'
-import type { AcquiredJob, Adapter, JobLease } from '../../src/contracts/adapter.js'
+import type { AcquiredJob, Adapter, JobLease, PushResult } from '../../src/contracts/adapter.js'
 
 interface DriverTestSuiteOptions {
   test: typeof JapaTest
@@ -12,7 +12,7 @@ interface DriverTestSuiteOptions {
   supportsConcurrency?: boolean
   /**
    * Whether concurrent dispatches have an atomic dedup constraint.
-   * MySQL has no partial unique indexes, matching the documented Knex limitation.
+   * Some in-memory adapters do not serialize concurrent deduplicated dispatches.
    * @default true
    */
   supportsAtomicDedup?: boolean
@@ -3089,6 +3089,86 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
   })
 
   if (options.supportsAtomicDedup !== false) {
+    test('dedup: concurrent dispatches stay deduplicated while jobs are acquired', async ({
+      assert,
+    }) => {
+      const adapter = await options.createAdapter()
+      adapter.setWorkerId('worker-1')
+
+      let dispatching = true
+      const acquiring = (async () => {
+        while (dispatching) await adapter.popFrom('concurrent-dedup-queue')
+      })()
+
+      const results = await Promise.all(
+        Array.from({ length: 4 }, async (_, dispatcher) => {
+          const dispatches = []
+          for (let index = 0; index < 500; index++) {
+            dispatches.push(
+              await adapter.pushOn('concurrent-dedup-queue', {
+                id: `${dispatcher}-${index}`,
+                name: 'TestJob',
+                payload: {},
+                attempts: 0,
+                dedup: { id: String(index % 200), ttl: 60_000 },
+              })
+            )
+          }
+          return dispatches
+        })
+      ).finally(() => (dispatching = false))
+      await acquiring
+
+      const dispatches = results.flat().map((result) => result as PushResult)
+      assert.lengthOf(
+        dispatches.filter(({ outcome }) => outcome === 'added'),
+        200
+      )
+
+      // Every dispatch points at a job that was stored
+      for (const jobId of new Set(dispatches.map((result) => result.jobId))) {
+        assert.isNotNull(await adapter.getJob(jobId, 'concurrent-dedup-queue'))
+      }
+    }).timeout(20_000)
+
+    test('dedup: concurrent dispatches do not fail while jobs are completed', async ({
+      assert,
+    }) => {
+      const adapter = await options.createAdapter()
+      adapter.setWorkerId('worker-1')
+
+      let dispatching = true
+      let completed = 0
+      const workers = Array.from({ length: 2 }, async () => {
+        while (dispatching || (await adapter.sizeOf('concurrent-dedup-queue')) > 0) {
+          const job = await adapter.popFrom('concurrent-dedup-queue')
+          if (job && (await adapter.completeJob(job, 'concurrent-dedup-queue'))) completed++
+        }
+      })
+
+      const results = await Promise.all(
+        Array.from({ length: 4 }, async (_, dispatcher) => {
+          const dispatches = []
+          for (let index = 0; index < 200; index++) {
+            dispatches.push(
+              await adapter.pushOn('concurrent-dedup-queue', {
+                id: `${dispatcher}-${index}`,
+                name: 'TestJob',
+                payload: {},
+                attempts: 0,
+                dedup: { id: String(index % 3) },
+              })
+            )
+          }
+          return dispatches
+        })
+      ).finally(() => (dispatching = false))
+      await Promise.all(workers)
+
+      const added = results.flat().filter((result) => (result as PushResult).outcome === 'added')
+      assert.equal(completed, added.length)
+    }).timeout(20_000)
+
     test('dedup: concurrent pushOn with same id - only one wins, rest skipped', async ({
       assert,
     }) => {

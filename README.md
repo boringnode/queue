@@ -267,7 +267,7 @@ const { jobId, deduped } = await SaveDraftJob.dispatch({ content: '...' })
 - `retryJob` does not touch the dedup entry — a retried job continues to occupy the dedup slot. TTL runs on wall-clock time, so long-running retries may outlive the TTL window. Use a generous TTL or no TTL if retries must stay deduped.
 - Atomicity:
   - **Redis**: a single Lua script per dispatch performs the dedup-key lookup, state check (pending/delayed ZSCORE), payload swap, and TTL refresh atomically.
-  - **Knex/Kysely**: transactional `SELECT ... FOR UPDATE` + insert/update inside a transaction. On PostgreSQL and SQLite, a partial unique index makes concurrent first dispatches race-free: a savepoint catches the unique-constraint violation and returns `{ deduped: 'skipped' }` pointing at the winner. MySQL has no partial unique index, see the caveat below.
+  - **Knex/Kysely**: a unique index on `(queue, dedup_id)` lets a single job own a dedup id, whatever its status. Concurrent first dispatches race on that index: one inserts the job, the others read it and return `{ deduped: 'skipped' }` pointing at the winner. Payload swaps, TTL refreshes and the release of an expired id are single conditional `UPDATE` statements, so no transaction or row lock is held. Works the same on PostgreSQL, MySQL and SQLite.
   - **SyncAdapter**: executes inline, no dedup support.
 
 ### Caveats
@@ -278,7 +278,6 @@ const { jobId, deduped } = await SaveDraftJob.dispatch({ content: '...' })
 - Scheduled jobs (`.schedule()`) do not support dedup — each cron/interval fire is an independent dispatch.
 - With no `ttl`, dedup persists until the job is removed (completed/failed without retention). When retention keeps the record, re-dispatch stays blocked until the record is pruned.
 - With `ttl`, dedup expires after the window — a new job (new UUID) is created. The old job still runs.
-- Knex/Kysely MySQL concurrent race: MySQL does not support partial unique indexes, so two `pushOn` calls with the same dedup id firing at the exact same instant can both succeed. Serialize at the app layer if strict guarantees are required, or use Postgres / SQLite / Redis (all of which serialize correctly via the partial unique index or Lua atomicity).
 
 ## Job History & Retention
 
@@ -472,6 +471,23 @@ await schema.dropJobsTable()
 ```
 
 </details>
+
+#### Migrating SQL deduplication after an upgrade
+
+Jobs tables created by earlier versions have no unique index on `(queue, dedup_id)`, and dispatches racing
+with a worker could enqueue a job twice. Run `addDedupColumns()` once from a migration to create it:
+
+```typescript
+// Knex
+await new KnexQueueSchemaService(connection).addDedupColumns('queue_jobs')
+
+// Kysely
+await new KyselyQueueSchemaService(db, { dialect: 'postgres' }).addDedupColumns('queue_jobs')
+```
+
+The migration is idempotent. When several jobs share a dedup id, the latest one keeps it and the
+others only lose their dedup id: no job is removed. The previous dedup indexes are dropped. Stop
+dispatching jobs with `.dedup()` while it runs.
 
 #### Migrating SQL schedules after an upgrade
 
