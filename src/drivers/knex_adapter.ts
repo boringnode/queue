@@ -471,12 +471,6 @@ export class KnexAdapter implements Adapter {
     })
   }
 
-  /**
-   * A single job owns a dedup slot, whatever its status: the unique
-   * (queue, dedup_id) index rejects a second owner. No lock is held between
-   * the statements. Each write carries the state it relies on in its WHERE
-   * clause, and a dispatch that loses the slot looks at its owner again.
-   */
   async #pushWithDedup(
     queue: string,
     jobData: JobData,
@@ -485,13 +479,7 @@ export class KnexAdapter implements Adapter {
     const dedup = jobData.dedup!
 
     try {
-      while (true) {
-        const now = Date.now()
-        const result =
-          (await this.#resolveExistingDedup(queue, jobData, dedup, now)) ??
-          (await this.#insertDedup(queue, jobData.id, insertRow, dedup, now))
-        if (result) return result
-      }
+      return await this.#pushWithDedupTxn(queue, jobData, insertRow, dedup)
     } catch (err) {
       if (this.#isMissingDedupColumn(err)) {
         throw new Error(
@@ -516,24 +504,62 @@ export class KnexAdapter implements Adapter {
   }
 
   /**
-   * Returns null when the slot has no owner, or when its owner expired.
+   * A single job owns a dedup slot, whatever its status: the unique
+   * (queue, dedup_id) index rejects a second owner. An existing owner is
+   * locked for the transaction. When there is none to lock and a concurrent
+   * dispatch inserts first, the transaction runs again and locks that owner.
    */
+  async #pushWithDedupTxn(
+    queue: string,
+    jobData: JobData,
+    insertRow: Record<string, unknown>,
+    dedup: NonNullable<JobData['dedup']>
+  ): Promise<PushResult> {
+    while (true) {
+      try {
+        return await this.#connection.transaction(async (trx) => {
+          const now = Date.now()
+          const existingResult = await this.#resolveExistingDedup(trx, queue, jobData, dedup, now)
+          if (existingResult) return existingResult
+
+          await trx(this.#jobsTable).insert({
+            ...insertRow,
+            dedup_id: dedup.id,
+            dedup_at: now,
+            dedup_ttl: dedup.ttl ?? null,
+          })
+          return { outcome: 'added' as DedupOutcome, jobId: jobData.id }
+        })
+      } catch (err) {
+        if (!this.#isUniqueViolation(err) && !this.#isDeadlock(err)) throw err
+        // The job id itself is the duplicate
+        if (await this.getJob(jobData.id, queue)) throw err
+      }
+    }
+  }
+
   async #resolveExistingDedup(
+    trx: Knex.Transaction,
     queue: string,
     jobData: JobData,
     dedup: NonNullable<JobData['dedup']>,
     now: number
   ): Promise<PushResult | null> {
-    const existing = await this.#connection(this.#jobsTable)
+    const owner = await trx(this.#jobsTable)
       .where('queue', queue)
       .where('dedup_id', dedup.id)
       .orderBy('dedup_at', 'desc')
-      .first()
+      .first('id')
 
-    if (!existing) return null
+    if (!owner) return null
 
-    const owner = () =>
-      this.#connection(this.#jobsTable).where({ id: existing.id, queue, dedup_id: dedup.id })
+    // The owner is locked through its primary key, as workers lock a job.
+    // Locking it through the dedup index deadlocks with them on MySQL.
+    const existing = await trx(this.#jobsTable).where({ id: owner.id, queue }).forUpdate().first()
+
+    // Removed or released in the meantime: the insert tells whether the slot is free
+    if (existing?.dedup_id !== dedup.id) return null
+
     const dedupAt = existing.dedup_at != null ? Number(existing.dedup_at) : null
     const dedupTtl = existing.dedup_ttl != null ? Number(existing.dedup_ttl) : null
     const withinTtl = dedupTtl === null || (dedupAt !== null && now - dedupAt < dedupTtl)
@@ -550,56 +576,24 @@ export class KnexAdapter implements Adapter {
         if (dedup.extend && dedupTtl) {
           updates.dedup_at = now
         }
-        // Not replaced when a worker acquired the job in the meantime
-        const replaced = await owner().whereIn('status', ['pending', 'delayed']).update(updates)
-        if (replaced > 0) {
-          return { outcome: 'replaced' as DedupOutcome, jobId: existing.id as string }
-        }
+        await trx(this.#jobsTable).where({ id: existing.id, queue }).update(updates)
+        return { outcome: 'replaced' as DedupOutcome, jobId: existing.id as string }
       }
 
       if (dedup.extend && dedupTtl) {
-        await owner().update({ dedup_at: now })
+        await trx(this.#jobsTable).where({ id: existing.id, queue }).update({ dedup_at: now })
         return { outcome: 'extended' as DedupOutcome, jobId: existing.id as string }
       }
 
       return { outcome: 'skipped' as DedupOutcome, jobId: existing.id as string }
     }
 
-    // Release the expired dedup slot, unless it was extended in the meantime.
-    // The old job keeps running to completion.
-    await owner()
-      .where('dedup_at', existing.dedup_at)
+    // Release the expired dedup slot. The old job keeps running to completion.
+    await trx(this.#jobsTable)
+      .where({ id: existing.id, queue })
       .update({ dedup_id: null, dedup_at: null, dedup_ttl: null })
 
     return null
-  }
-
-  /**
-   * Returns null when a concurrent dispatch took the slot first.
-   */
-  async #insertDedup(
-    queue: string,
-    jobId: string,
-    insertRow: Record<string, unknown>,
-    dedup: NonNullable<JobData['dedup']>,
-    now: number
-  ): Promise<PushResult | null> {
-    try {
-      await this.#connection(this.#jobsTable).insert({
-        ...insertRow,
-        dedup_id: dedup.id,
-        dedup_at: now,
-        dedup_ttl: dedup.ttl ?? null,
-      })
-    } catch (err) {
-      if (this.#isDeadlock(err)) return null
-      if (!this.#isUniqueViolation(err)) throw err
-      // The job id itself is the duplicate
-      if (await this.getJob(jobId, queue)) throw err
-      return null
-    }
-
-    return { outcome: 'added' as DedupOutcome, jobId }
   }
 
   #isUniqueViolation(err: unknown): boolean {
@@ -614,8 +608,7 @@ export class KnexAdapter implements Adapter {
   }
 
   /**
-   * InnoDB picks a victim among dispatches inserting the same dedup id right
-   * after its owner was removed.
+   * InnoDB picks a victim among dispatches inserting the same dedup id.
    */
   #isDeadlock(err: unknown): boolean {
     return (err as { code?: string } | null)?.code === 'ER_LOCK_DEADLOCK'

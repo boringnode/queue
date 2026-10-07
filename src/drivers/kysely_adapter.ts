@@ -467,9 +467,9 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
 
   /**
    * A single job owns a dedup slot, whatever its status: the unique
-   * (queue, dedup_id) index rejects a second owner. No lock is held between
-   * the statements. Each write carries the state it relies on in its WHERE
-   * clause, and a dispatch that loses the slot looks at its owner again.
+   * (queue, dedup_id) index rejects a second owner. An existing owner is
+   * locked for the transaction. When there is none to lock and a concurrent
+   * dispatch inserts first, the transaction runs again and locks that owner.
    */
   async #pushWithDedup(
     connection: Kysely<DB>,
@@ -479,51 +479,71 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   ): Promise<PushResult> {
     const dedup = jobData.dedup!
 
-    try {
-      while (true) {
-        const now = Date.now()
-        const result =
-          (await this.#resolveExistingDedup(connection, queue, jobData, dedup, now)) ??
-          (await this.#insertDedup(connection, queue, jobData.id, insertRow, dedup, now))
-        if (result) return result
+    while (true) {
+      try {
+        return await this.#withTransaction(connection, async (trx) => {
+          const now = Date.now()
+          const existingResult = await this.#resolveExistingDedup(trx, queue, jobData, dedup, now)
+          if (existingResult) return existingResult
+
+          await this.#jobs(trx)
+            .insertInto(this.#jobsTable)
+            .values({
+              ...insertRow,
+              dedup_id: dedup.id,
+              dedup_at: now,
+              dedup_ttl: dedup.ttl ?? null,
+            })
+            .execute()
+          return { outcome: 'added', jobId: jobData.id }
+        })
+      } catch (error) {
+        if (this.#isMissingDedupColumn(error)) {
+          throw new Error(
+            `Dedup columns missing on "${this.#jobsTable}". Run KyselyQueueSchemaService.addDedupColumns() before dispatching jobs with .dedup().`,
+            { cause: error }
+          )
+        }
+        if (!this.#isUniqueViolation(error) && !this.#isDeadlock(error)) throw error
+        // The job id itself is the duplicate
+        if (await this.getJob(jobData.id, queue)) throw error
       }
-    } catch (error) {
-      if (this.#isMissingDedupColumn(error)) {
-        throw new Error(
-          `Dedup columns missing on "${this.#jobsTable}". Run KyselyQueueSchemaService.addDedupColumns() before dispatching jobs with .dedup().`,
-          { cause: error }
-        )
-      }
-      throw error
     }
   }
 
-  /**
-   * Returns null when the slot has no owner, or when its owner expired.
-   */
   async #resolveExistingDedup(
-    connection: Kysely<DB>,
+    trx: Transaction<DB>,
     queue: string,
     jobData: JobData,
     dedup: NonNullable<JobData['dedup']>,
     now: number
   ): Promise<PushResult | null> {
-    const existing = await this.#jobs(connection)
+    const owner = await this.#jobs(trx)
       .selectFrom(this.#jobsTable)
-      .selectAll()
+      .select('id')
       .where('queue', '=', queue)
       .where('dedup_id', '=', dedup.id)
       .orderBy('dedup_at', 'desc')
       .limit(1)
       .executeTakeFirst()
 
-    if (!existing) return null
+    if (!owner) return null
 
-    const owner = this.#jobs(connection)
-      .updateTable(this.#jobsTable)
-      .where('id', '=', existing.id)
+    // The owner is locked through its primary key, as workers lock a job.
+    // Locking it through the dedup index deadlocks with them on MySQL.
+    let existingQuery = this.#jobs(trx)
+      .selectFrom(this.#jobsTable)
+      .selectAll()
+      .where('id', '=', owner.id)
       .where('queue', '=', queue)
-      .where('dedup_id', '=', dedup.id)
+
+    if (this.#supportsSkipLocked()) existingQuery = existingQuery.forUpdate()
+
+    const existing = await existingQuery.executeTakeFirst()
+
+    // Removed or released in the meantime: the insert tells whether the slot is free
+    if (existing?.dedup_id !== dedup.id) return null
+
     const dedupAt = existing.dedup_at == null ? null : Number(existing.dedup_at)
     const dedupTtl = existing.dedup_ttl == null ? null : Number(existing.dedup_ttl)
     const withinTtl = dedupTtl === null || (dedupAt !== null && now - dedupAt < dedupTtl)
@@ -538,62 +558,37 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
         }
         if (dedup.extend && dedupTtl) updates.dedup_at = now
 
-        // Not replaced when a worker acquired the job in the meantime
-        const replaced = await owner
+        await this.#jobs(trx)
+          .updateTable(this.#jobsTable)
           .set(updates)
-          .where('status', 'in', ['pending', 'delayed'])
-          .executeTakeFirst()
-        if (replaced.numUpdatedRows > 0n) return { outcome: 'replaced', jobId: existing.id }
+          .where('id', '=', existing.id)
+          .where('queue', '=', queue)
+          .execute()
+        return { outcome: 'replaced', jobId: existing.id }
       }
 
       if (dedup.extend && dedupTtl) {
-        await owner.set({ dedup_at: now }).execute()
+        await this.#jobs(trx)
+          .updateTable(this.#jobsTable)
+          .set({ dedup_at: now })
+          .where('id', '=', existing.id)
+          .where('queue', '=', queue)
+          .execute()
         return { outcome: 'extended', jobId: existing.id }
       }
 
       return { outcome: 'skipped', jobId: existing.id }
     }
 
-    // Release the expired dedup slot, unless it was extended in the meantime.
-    // The old job keeps running to completion.
-    await owner
+    // Release the expired dedup slot. The old job keeps running to completion.
+    await this.#jobs(trx)
+      .updateTable(this.#jobsTable)
       .set({ dedup_id: null, dedup_at: null, dedup_ttl: null })
-      .where('dedup_at', existing.dedup_at == null ? 'is' : '=', existing.dedup_at ?? null)
+      .where('id', '=', existing.id)
+      .where('queue', '=', queue)
       .execute()
 
     return null
-  }
-
-  /**
-   * Returns null when a concurrent dispatch took the slot first.
-   */
-  async #insertDedup(
-    connection: Kysely<DB>,
-    queue: string,
-    jobId: string,
-    insertRow: Partial<JobRow> & Pick<JobRow, 'id' | 'queue' | 'status' | 'data'>,
-    dedup: NonNullable<JobData['dedup']>,
-    now: number
-  ): Promise<PushResult | null> {
-    try {
-      await this.#jobs(connection)
-        .insertInto(this.#jobsTable)
-        .values({
-          ...insertRow,
-          dedup_id: dedup.id,
-          dedup_at: now,
-          dedup_ttl: dedup.ttl ?? null,
-        })
-        .execute()
-    } catch (error) {
-      if (this.#isDeadlock(error)) return null
-      if (!this.#isUniqueViolation(error)) throw error
-      // The job id itself is the duplicate
-      if (await this.getJob(jobId, queue)) throw error
-      return null
-    }
-
-    return { outcome: 'added', jobId }
   }
 
   async pushMany(jobs: JobData[]): Promise<void> {
@@ -954,8 +949,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   }
 
   /**
-   * InnoDB picks a victim among dispatches inserting the same dedup id right
-   * after its owner was removed.
+   * InnoDB picks a victim among dispatches inserting the same dedup id.
    */
   #isDeadlock(error: unknown): boolean {
     return (error as { code?: string } | null)?.code === 'ER_LOCK_DEADLOCK'

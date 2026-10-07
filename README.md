@@ -267,7 +267,7 @@ const { jobId, deduped } = await SaveDraftJob.dispatch({ content: '...' })
 - `retryJob` does not touch the dedup entry — a retried job continues to occupy the dedup slot. TTL runs on wall-clock time, so long-running retries may outlive the TTL window. Use a generous TTL or no TTL if retries must stay deduped.
 - Atomicity:
   - **Redis**: a single Lua script per dispatch performs the dedup-key lookup, state check (pending/delayed ZSCORE), payload swap, and TTL refresh atomically.
-  - **Knex/Kysely**: a unique index on `(queue, dedup_id)` lets a single job own a dedup id, whatever its status. Concurrent first dispatches race on that index: one inserts the job, the others read it and return `{ deduped: 'skipped' }` pointing at the winner. Payload swaps, TTL refreshes and the release of an expired id are single conditional `UPDATE` statements, so no transaction or row lock is held. Works the same on PostgreSQL, MySQL and SQLite.
+  - **Knex/Kysely**: a unique index on `(queue, dedup_id)` lets a single job own a dedup id, whatever its status. Each dispatch runs in a transaction: an existing owner is locked with `SELECT ... FOR UPDATE`, then skipped, extended or replaced under that lock. When there is no owner to lock, concurrent first dispatches race on the unique index: one inserts the job, the others run again, lock the winner and return `{ deduped: 'skipped' }` pointing at it. Works the same on PostgreSQL, MySQL and SQLite.
   - **SyncAdapter**: executes inline, no dedup support.
 
 ### Caveats
