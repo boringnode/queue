@@ -153,7 +153,7 @@ export class KnexAdapter implements Adapter {
     await this.#processDelayedJobs(queue, now)
 
     // Use a transaction to atomically pop a job
-    return this.#connection.transaction(async (trx) => {
+    return this.#claimTransaction(async (trx) => {
       // Build the query for highest priority job (lowest score)
       let query = trx(this.#jobsTable)
         .where('queue', queue)
@@ -216,6 +216,22 @@ export class KnexAdapter implements Adapter {
     return client === 'mysql' || client === 'mysql2' || client === 'mariadb'
   }
 
+  /**
+   * Transaction for a SELECT ... FOR UPDATE SKIP LOCKED claim followed by an
+   * UPDATE of the claimed rows.
+   *
+   * Under the MySQL default, REPEATABLE READ, the locking read also locks the
+   * gap before every index entry it scans, skipped rows included. The claim
+   * UPDATE then moves the row to another status, which inserts its new index
+   * entry into a gap that a concurrent claim holds: two workers acquiring jobs
+   * wait on each other and InnoDB aborts one with ER_LOCK_DEADLOCK. READ
+   * COMMITTED only locks the claimed rows, as PostgreSQL does by default.
+   */
+  #claimTransaction<T>(callback: (trx: Knex.Transaction) => Promise<T>): Promise<T> {
+    if (!this.#isMysql()) return this.#connection.transaction(callback)
+    return this.#connection.transaction(callback, { isolationLevel: 'read committed' })
+  }
+
   #isSqlite(): boolean {
     const client = String(this.#connection.client.config.client)
     return client.includes('sqlite')
@@ -223,7 +239,7 @@ export class KnexAdapter implements Adapter {
 
   async #processDelayedJobs(queue: string, now: number): Promise<void> {
     // Use a transaction with row locking to prevent race conditions
-    await this.#connection.transaction(async (trx) => {
+    await this.#claimTransaction(async (trx) => {
       let query = trx(this.#jobsTable)
         .where('queue', queue)
         .where('status', 'delayed')
@@ -361,11 +377,18 @@ export class KnexAdapter implements Adapter {
     }
 
     if (maxCount > 0) {
-      const toKeep = this.#connection(this.#jobsTable)
-        .where('queue', queue)
-        .where('status', status)
-        .orderBy('finished_at', 'desc')
-        .limit(maxCount)
+      // One statement, so that a concurrent pruning cannot delete a job kept here.
+      // MySQL rejects LIMIT in an IN subquery, but accepts it in a derived table.
+      const toKeep = this.#connection
+        .from(
+          this.#connection(this.#jobsTable)
+            .where('queue', queue)
+            .where('status', status)
+            .orderBy('finished_at', 'desc')
+            .limit(maxCount)
+            .select('id')
+            .as('keep')
+        )
         .select('id')
 
       await this.#connection(this.#jobsTable)
@@ -671,7 +694,7 @@ export class KnexAdapter implements Adapter {
     const stalledCutoff = now - stalledThreshold
 
     // Use a transaction with row locking to prevent race conditions
-    return this.#connection.transaction(async (trx) => {
+    return this.#claimTransaction(async (trx) => {
       let recovered = 0
       const exceeded: AcquiredJob[] = []
 
@@ -870,7 +893,7 @@ export class KnexAdapter implements Adapter {
 
     const now = Date.now()
 
-    return this.#connection.transaction(async (trx) => {
+    return this.#claimTransaction(async (trx) => {
       // Find one due schedule with row locking
       let query = trx(this.#schedulesTable)
         .where('status', 'active')

@@ -12,6 +12,8 @@ import {
   type QueueDatabase,
 } from '../src/drivers/kysely_adapter.js'
 import { registerDriverTestSuite } from './_utils/register_driver_test_suite.js'
+import { pauseKyselyDeletes } from './_utils/pause_deletes.js'
+import { registerRetentionRaceSuite } from './_utils/register_retention_race_suite.js'
 
 test.group('Adapter | Kysely (SQLite)', (group) => {
   let connection: Kysely<QueueDatabase>
@@ -145,18 +147,19 @@ test.group('Adapter | Kysely (MySQL)', (group) => {
   let adapter: KyselyAdapter<QueueDatabase>
   let schema: KyselyQueueSchemaService<QueueDatabase>
 
-  group.each.setup(async () => {
-    connection = new Kysely<QueueDatabase>({
-      dialect: new MysqlDialect({
-        pool: createPool({
-          host: process.env.MYSQL_HOST || 'localhost',
-          port: Number.parseInt(process.env.MYSQL_PORT || '3307', 10),
-          user: process.env.MYSQL_USER || 'root',
-          password: process.env.MYSQL_PASSWORD || 'mysql',
-          database: process.env.MYSQL_DATABASE || 'queue_test',
-        }),
+  const createDialect = () =>
+    new MysqlDialect({
+      pool: createPool({
+        host: process.env.MYSQL_HOST || 'localhost',
+        port: Number.parseInt(process.env.MYSQL_PORT || '3307', 10),
+        user: process.env.MYSQL_USER || 'root',
+        password: process.env.MYSQL_PASSWORD || 'mysql',
+        database: process.env.MYSQL_DATABASE || 'queue_test',
       }),
     })
+
+  group.each.setup(async () => {
+    connection = new Kysely<QueueDatabase>({ dialect: createDialect() })
     schema = new KyselyQueueSchemaService(connection, { dialect: 'mysql' })
 
     await schema.dropJobsTable(tableName)
@@ -190,23 +193,64 @@ test.group('Adapter | Kysely (MySQL)', (group) => {
     await schema.addDedupColumns(tableName)
     await schema.addDedupColumns(tableName)
   })
+
+  registerRetentionRaceSuite({
+    test,
+    createAdapters: async (beforeDelete, cleanup) => {
+      const first = new Kysely<QueueDatabase>({
+        dialect: pauseKyselyDeletes(createDialect(), beforeDelete),
+      })
+      const second = new Kysely<QueueDatabase>({ dialect: createDialect() })
+      cleanup(async () => {
+        await first.destroy()
+        await second.destroy()
+      })
+      return [
+        new KyselyAdapter({ connection: first, dialect: 'mysql', tableName }),
+        new KyselyAdapter({ connection: second, dialect: 'mysql', tableName }),
+      ]
+    },
+  })
 })
 
 test.group('KyselyAdapter | SQLite file, two connections', () => {
-  test('concurrent upserts from two connections all succeed', async ({ assert, cleanup }) => {
+  const connectTwice = async (
+    cleanup: (handler: () => Promise<void>) => void,
+    beforeDelete?: () => Promise<void>
+  ) => {
     const directory = await mkdtemp(join(tmpdir(), 'queue-sqlite-'))
-    const connect = () => {
+    const connect = (pause?: () => Promise<void>) => {
       const database = new Database(join(directory, 'queue.sqlite'))
       database.pragma('journal_mode = WAL')
-      return new Kysely<QueueDatabase>({ dialect: new SqliteDialect({ database }) })
+      const dialect = new SqliteDialect({ database })
+      return new Kysely<QueueDatabase>({
+        dialect: pause ? pauseKyselyDeletes(dialect, pause) : dialect,
+      })
     }
-    const first = connect()
+    const first = connect(beforeDelete)
     const second = connect()
     cleanup(async () => {
       await first.destroy()
       await second.destroy()
       await rm(directory, { recursive: true, force: true })
     })
+    return [first, second] as const
+  }
+
+  registerRetentionRaceSuite({
+    test,
+    createAdapters: async (beforeDelete, cleanup) => {
+      const [first, second] = await connectTwice(cleanup, beforeDelete)
+      await new KyselyQueueSchemaService(first, { dialect: 'sqlite' }).createJobsTable()
+      return [
+        new KyselyAdapter({ connection: first, dialect: 'sqlite' }),
+        new KyselyAdapter({ connection: second, dialect: 'sqlite' }),
+      ]
+    },
+  })
+
+  test('concurrent upserts from two connections all succeed', async ({ assert, cleanup }) => {
+    const [first, second] = await connectTwice(cleanup)
 
     const schedulesTableName = 'queue_schedules'
     await new KyselyQueueSchemaService(first, { dialect: 'sqlite' }).createSchedulesTable(
