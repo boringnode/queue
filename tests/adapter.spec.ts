@@ -2047,6 +2047,20 @@ test.group('Adapter | Knex (SQLite)', (group) => {
     await assertDedupMigration(assert, connection, 'queue_jobs')
   })
 
+  test('dedup should reject a job id that is already stored', async ({ assert }) => {
+    adapter = new KnexAdapter({ connection })
+    const job = { id: 'same-id', name: 'TestJob', payload: {}, attempts: 0 }
+
+    await adapter.pushOn('default', { ...job, dedup: { id: 'first' } })
+    // The primary key violation itself, not a retry of the dispatch
+    const error = await adapter.pushOn('default', { ...job, dedup: { id: 'second' } }).then(
+      () => null,
+      (rejection: { code?: string }) => rejection
+    )
+    assert.equal(error?.code, 'SQLITE_CONSTRAINT_PRIMARYKEY')
+    assert.equal(await adapter.sizeOf('default'), 1)
+  })
+
   test('dedup should respect a case-insensitive column collation', async ({ assert }) => {
     await connection.raw('DROP INDEX queue_jobs_dedup_uidx')
     await connection.raw('ALTER TABLE queue_jobs DROP COLUMN dedup_id')

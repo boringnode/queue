@@ -41,6 +41,20 @@ test.group('Adapter | Kysely (SQLite)', (group) => {
     },
   })
 
+  test('dedup should reject a job id that is already stored', async ({ assert }) => {
+    adapter = new KyselyAdapter({ connection, dialect: 'sqlite' })
+    const job = { id: 'same-id', name: 'TestJob', payload: {}, attempts: 0 }
+
+    await adapter.pushOn('default', { ...job, dedup: { id: 'first' } })
+    // The primary key violation itself, not a retry of the dispatch
+    const error = await adapter.pushOn('default', { ...job, dedup: { id: 'second' } }).then(
+      () => null,
+      (rejection: { code?: string }) => rejection
+    )
+    assert.equal(error?.code, 'SQLITE_CONSTRAINT_PRIMARYKEY')
+    assert.equal(await adapter.sizeOf('default'), 1)
+  })
+
   test('dedup should respect a case-insensitive column collation', async ({ assert }) => {
     await sql`DROP INDEX queue_jobs_dedup_uidx`.execute(connection)
     await sql`ALTER TABLE queue_jobs DROP COLUMN dedup_id`.execute(connection)
