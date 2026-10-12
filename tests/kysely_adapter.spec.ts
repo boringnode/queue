@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
-import { Kysely, MysqlDialect, PostgresDialect, SqliteDialect } from 'kysely'
+import { Kysely, MysqlDialect, PostgresDialect, SqliteDialect, sql } from 'kysely'
 import { createPool } from 'mysql2'
 import { Pool } from 'pg'
 import { test } from '@japa/runner'
@@ -39,6 +39,35 @@ test.group('Adapter | Kysely (SQLite)', (group) => {
       adapter = new KyselyAdapter({ connection, dialect: 'sqlite' })
       return adapter
     },
+  })
+
+  test('dedup should respect a case-insensitive column collation', async ({ assert }) => {
+    await sql`DROP INDEX queue_jobs_dedup_uidx`.execute(connection)
+    await sql`ALTER TABLE queue_jobs DROP COLUMN dedup_id`.execute(connection)
+    await sql`ALTER TABLE queue_jobs ADD COLUMN dedup_id TEXT COLLATE NOCASE`.execute(connection)
+    await sql`CREATE UNIQUE INDEX queue_jobs_dedup_uidx ON queue_jobs (queue, dedup_id)`.execute(
+      connection
+    )
+    adapter = new KyselyAdapter({ connection, dialect: 'sqlite' })
+
+    const owner = await adapter.pushOn('default', {
+      id: 'owner',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      dedup: { id: 'Order-A' },
+    })
+    const duplicate = await adapter.pushOn('default', {
+      id: 'duplicate',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      dedup: { id: 'order-a' },
+    })
+
+    assert.deepEqual(owner, { outcome: 'added', jobId: 'owner' })
+    assert.deepEqual(duplicate, { outcome: 'skipped', jobId: 'owner' })
+    assert.equal(await adapter.sizeOf('default'), 1)
   })
 
   test('concurrent workers should not acquire the same job', async ({ assert }) => {

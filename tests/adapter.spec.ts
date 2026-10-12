@@ -2047,6 +2047,35 @@ test.group('Adapter | Knex (SQLite)', (group) => {
     await assertDedupMigration(assert, connection, 'queue_jobs')
   })
 
+  test('dedup should respect a case-insensitive column collation', async ({ assert }) => {
+    await connection.raw('DROP INDEX queue_jobs_dedup_uidx')
+    await connection.raw('ALTER TABLE queue_jobs DROP COLUMN dedup_id')
+    await connection.raw('ALTER TABLE queue_jobs ADD COLUMN dedup_id TEXT COLLATE NOCASE')
+    await connection.raw(
+      'CREATE UNIQUE INDEX queue_jobs_dedup_uidx ON queue_jobs (queue, dedup_id)'
+    )
+    adapter = new KnexAdapter({ connection })
+
+    const owner = await adapter.pushOn('default', {
+      id: 'owner',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      dedup: { id: 'Order-A' },
+    })
+    const duplicate = await adapter.pushOn('default', {
+      id: 'duplicate',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      dedup: { id: 'order-a' },
+    })
+
+    assert.deepEqual(owner, { outcome: 'added', jobId: 'owner' })
+    assert.deepEqual(duplicate, { outcome: 'skipped', jobId: 'owner' })
+    assert.equal(await adapter.sizeOf('default'), 1)
+  })
+
   test('listSchedules should execute a single SQL query in Knex adapter', async ({ assert }) => {
     const knexAdapter = new KnexAdapter({ connection })
 

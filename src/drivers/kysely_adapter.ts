@@ -520,7 +520,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   ): Promise<PushResult | null> {
     const owner = await this.#jobs(trx)
       .selectFrom(this.#jobsTable)
-      .select('id')
+      .select(['id', 'dedup_id'])
       .where('queue', '=', queue)
       .where('dedup_id', '=', dedup.id)
       .orderBy('dedup_at', 'desc')
@@ -541,8 +541,9 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
 
     const existing = await existingQuery.executeTakeFirst()
 
-    // Removed or released in the meantime: the insert tells whether the slot is free
-    if (existing?.dedup_id !== dedup.id) return null
+    // Compare stored values: SQL collation may equate different input strings.
+    // Removed or released in the meantime: the insert tells whether the slot is free.
+    if (!existing || existing.dedup_id !== owner.dedup_id) return null
 
     const dedupAt = existing.dedup_at == null ? null : Number(existing.dedup_at)
     const dedupTtl = existing.dedup_ttl == null ? null : Number(existing.dedup_ttl)

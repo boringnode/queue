@@ -549,7 +549,7 @@ export class KnexAdapter implements Adapter {
       .where('queue', queue)
       .where('dedup_id', dedup.id)
       .orderBy('dedup_at', 'desc')
-      .first('id')
+      .first('id', 'dedup_id')
 
     if (!owner) return null
 
@@ -557,8 +557,9 @@ export class KnexAdapter implements Adapter {
     // Locking it through the dedup index deadlocks with them on MySQL.
     const existing = await trx(this.#jobsTable).where({ id: owner.id, queue }).forUpdate().first()
 
-    // Removed or released in the meantime: the insert tells whether the slot is free
-    if (existing?.dedup_id !== dedup.id) return null
+    // Compare stored values: SQL collation may equate different input strings.
+    // Removed or released in the meantime: the insert tells whether the slot is free.
+    if (!existing || existing.dedup_id !== owner.dedup_id) return null
 
     const dedupAt = existing.dedup_at != null ? Number(existing.dedup_at) : null
     const dedupTtl = existing.dedup_ttl != null ? Number(existing.dedup_ttl) : null
