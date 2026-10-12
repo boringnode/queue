@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import Knex from 'knex'
 import type { Knex as KnexTypes } from 'knex'
 import { test } from '@japa/runner'
+import type { Assert } from '@japa/assert'
 import { Redis } from 'ioredis'
 import { CronExpressionParser } from 'cron-parser'
 import { MemoryAdapter } from './_mocks/memory_adapter.js'
@@ -1973,6 +1974,45 @@ test.group('Adapter | Redis', (group) => {
   })
 })
 
+/**
+ * A jobs table as the previous versions left it: no unique index, and expired
+ * owners that still hold their dedup id.
+ */
+async function assertDedupMigration(
+  assert: Assert,
+  connection: ReturnType<typeof Knex>,
+  tableName: string
+) {
+  const schemaService = new KnexQueueSchemaService(connection)
+  const job = (id: string, dedupId: string, dedupAt: number) => ({
+    id,
+    queue: 'default',
+    status: 'completed',
+    data: '{}',
+    dedup_id: dedupId,
+    dedup_at: dedupAt,
+    dedup_ttl: 10,
+  })
+
+  await connection.raw('DROP INDEX ??', [`${tableName}_dedup_uidx`])
+  await connection.schema.alterTable(tableName, (table) => table.index(['queue', 'dedup_id']))
+  await connection(tableName).insert([
+    job('older', 'shared', 1_000),
+    job('newer', 'shared', 2_000),
+    job('alone', 'alone', 1_000),
+  ])
+
+  await schemaService.addDedupColumns(tableName)
+  await schemaService.addDedupColumns(tableName)
+
+  assert.deepEqual(await connection(tableName).select('id', 'dedup_id').orderBy('id'), [
+    { id: 'alone', dedup_id: 'alone' },
+    { id: 'newer', dedup_id: 'shared' },
+    { id: 'older', dedup_id: null },
+  ])
+  await assert.rejects(() => connection(tableName).insert(job('duplicate', 'shared', 3_000)))
+}
+
 test.group('Adapter | Knex (SQLite)', (group) => {
   let connection: ReturnType<typeof Knex>
   let adapter: KnexAdapter
@@ -2004,6 +2044,53 @@ test.group('Adapter | Knex (SQLite)', (group) => {
       adapter = new KnexAdapter({ connection })
       return adapter
     },
+  })
+
+  test('addDedupColumns should leave a dedup slot to its latest job', async ({ assert }) => {
+    await assertDedupMigration(assert, connection, 'queue_jobs')
+  })
+
+  test('dedup should reject a job id that is already stored', async ({ assert }) => {
+    adapter = new KnexAdapter({ connection })
+    const job = { id: 'same-id', name: 'TestJob', payload: {}, attempts: 0 }
+
+    await adapter.pushOn('default', { ...job, dedup: { id: 'first' } })
+    // The primary key violation itself, rather than a dispatch that runs again
+    const error = await adapter.pushOn('default', { ...job, dedup: { id: 'second' } }).then(
+      () => null,
+      (rejection: { code?: string }) => rejection
+    )
+    assert.equal(error?.code, 'SQLITE_CONSTRAINT_PRIMARYKEY')
+    assert.equal(await adapter.sizeOf('default'), 1)
+  })
+
+  test('dedup should respect a case-insensitive column collation', async ({ assert }) => {
+    await connection.raw('DROP INDEX queue_jobs_dedup_uidx')
+    await connection.raw('ALTER TABLE queue_jobs DROP COLUMN dedup_id')
+    await connection.raw('ALTER TABLE queue_jobs ADD COLUMN dedup_id TEXT COLLATE NOCASE')
+    await connection.raw(
+      'CREATE UNIQUE INDEX queue_jobs_dedup_uidx ON queue_jobs (queue, dedup_id)'
+    )
+    adapter = new KnexAdapter({ connection })
+
+    const owner = await adapter.pushOn('default', {
+      id: 'owner',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      dedup: { id: 'Order-A' },
+    })
+    const duplicate = await adapter.pushOn('default', {
+      id: 'duplicate',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      dedup: { id: 'order-a' },
+    })
+
+    assert.deepEqual(owner, { outcome: 'added', jobId: 'owner' })
+    assert.deepEqual(duplicate, { outcome: 'skipped', jobId: 'owner' })
+    assert.equal(await adapter.sizeOf('default'), 1)
   })
 
   test('listSchedules should execute a single SQL query in Knex adapter', async ({ assert }) => {
@@ -2111,6 +2198,10 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       adapter = new KnexAdapter({ connection, tableName, schedulesTableName })
       return adapter
     },
+  })
+
+  test('addDedupColumns should leave a dedup slot to its latest job', async ({ assert }) => {
+    await assertDedupMigration(assert, connection, tableName)
   })
 
   test('listSchedules should execute a single SQL query in Knex PostgreSQL adapter', async ({

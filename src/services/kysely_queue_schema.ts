@@ -57,7 +57,7 @@ export class KyselyQueueSchemaService<DB> {
       .execute()
 
     await this.#createJobsIndexes(tableName)
-    await this.#createDedupActiveUniqueIndex(tableName)
+    await this.#createDedupUniqueIndex(tableName)
   }
 
   async addDedupColumns(tableName: string = 'queue_jobs'): Promise<void> {
@@ -84,21 +84,23 @@ export class KyselyQueueSchemaService<DB> {
       await this.#connection.schema.alterTable(tableName).addColumn('dedup_ttl', 'bigint').execute()
     }
 
-    const index = this.#connection.schema
-      .createIndex(`${tableName}_queue_dedup_idx`)
-      .on(tableName)
-      .columns(['queue', 'dedup_id'])
+    // The derived table is what allows MySQL to read the table it updates.
+    await sql`
+      update ${sql.table(tableName)} set dedup_id = null, dedup_at = null, dedup_ttl = null
+      where (id, queue) in (
+        select id, queue from (
+          select distinct older.id, older.queue
+          from ${sql.table(tableName)} as older
+          join ${sql.table(tableName)} as newer
+            on newer.queue = older.queue and newer.dedup_id = older.dedup_id
+          where newer.dedup_at > older.dedup_at
+             or (newer.dedup_at = older.dedup_at and newer.id > older.id)
+        ) as stale
+      )
+    `.execute(this.#connection)
 
-    if (this.#dialect === 'mysql') {
-      try {
-        await index.execute()
-      } catch (error) {
-        if (!this.#isDuplicateIndexError(error)) throw error
-      }
-    } else {
-      await index.ifNotExists().execute()
-    }
-    await this.#createDedupActiveUniqueIndex(tableName)
+    await this.#createDedupUniqueIndex(tableName)
+    await this.#dropLegacyDedupIndexes(tableName)
   }
 
   async createSchedulesTable(tableName: string = 'queue_schedules'): Promise<void> {
@@ -506,7 +508,6 @@ export class KyselyQueueSchemaService<DB> {
       ['status_score', ['queue', 'status', 'score']],
       ['status_execute', ['queue', 'status', 'execute_at']],
       ['status_finished', ['queue', 'status', 'finished_at']],
-      ['queue_dedup', ['queue', 'dedup_id']],
     ]
 
     for (const [suffix, columns] of indexes) {
@@ -518,17 +519,47 @@ export class KyselyQueueSchemaService<DB> {
     }
   }
 
-  async #createDedupActiveUniqueIndex(tableName: string): Promise<void> {
-    if (this.#dialect === 'mysql') return
-
-    await this.#connection.schema
-      .createIndex(`${tableName}_dedup_active_uidx`)
-      .ifNotExists()
+  /**
+   * Unique index on (queue, dedup_id): a single job owns a dedup slot, whatever
+   * its status. Jobs without dedup hold NULL, which is never a duplicate.
+   */
+  async #createDedupUniqueIndex(tableName: string): Promise<void> {
+    const index = this.#connection.schema
+      .createIndex(`${tableName}_dedup_uidx`)
       .unique()
       .on(tableName)
       .columns(['queue', 'dedup_id'])
-      .where(sql<boolean>`dedup_id is not null and status in ('pending', 'delayed')`)
-      .execute()
+
+    // MySQL has no CREATE INDEX IF NOT EXISTS
+    if (this.#dialect === 'mysql') {
+      try {
+        await index.execute()
+      } catch (error) {
+        if (!this.#isDuplicateIndexError(error)) throw error
+      }
+    } else {
+      await index.ifNotExists().execute()
+    }
+  }
+
+  /**
+   * Drops the indexes the unique index replaces: the non-unique one, and the
+   * partial unique one PostgreSQL and SQLite had on pending and delayed jobs.
+   */
+  async #dropLegacyDedupIndexes(tableName: string): Promise<void> {
+    const legacyIndex = this.#connection.schema.dropIndex(`${tableName}_queue_dedup_idx`)
+
+    if (this.#dialect === 'mysql') {
+      try {
+        await legacyIndex.on(tableName).execute()
+      } catch (error) {
+        if ((error as { code?: string }).code !== 'ER_CANT_DROP_FIELD_OR_KEY') throw error
+      }
+      return
+    }
+
+    await legacyIndex.ifExists().execute()
+    await this.#connection.schema.dropIndex(`${tableName}_dedup_active_uidx`).ifExists().execute()
   }
 
   /** LONGTEXT on MySQL, whose TEXT stops at 64 KB; TEXT elsewhere. */

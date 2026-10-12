@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
-import { Kysely, MysqlDialect, PostgresDialect, SqliteDialect } from 'kysely'
+import { Kysely, MysqlDialect, PostgresDialect, SqliteDialect, sql } from 'kysely'
 import { createPool } from 'mysql2'
 import { Pool } from 'pg'
 import { test } from '@japa/runner'
@@ -10,6 +10,7 @@ import {
   KyselyAdapter,
   KyselyQueueSchemaService,
   type QueueDatabase,
+  type QueueJobTable,
 } from '../src/drivers/kysely_adapter.js'
 import { registerDriverTestSuite } from './_utils/register_driver_test_suite.js'
 import { pauseKyselyDeletes } from './_utils/pause_deletes.js'
@@ -40,6 +41,49 @@ test.group('Adapter | Kysely (SQLite)', (group) => {
       adapter = new KyselyAdapter({ connection, dialect: 'sqlite' })
       return adapter
     },
+  })
+
+  test('dedup should reject a job id that is already stored', async ({ assert }) => {
+    adapter = new KyselyAdapter({ connection, dialect: 'sqlite' })
+    const job = { id: 'same-id', name: 'TestJob', payload: {}, attempts: 0 }
+
+    await adapter.pushOn('default', { ...job, dedup: { id: 'first' } })
+    // The primary key violation itself, rather than a dispatch that runs again
+    const error = await adapter.pushOn('default', { ...job, dedup: { id: 'second' } }).then(
+      () => null,
+      (rejection: { code?: string }) => rejection
+    )
+    assert.equal(error?.code, 'SQLITE_CONSTRAINT_PRIMARYKEY')
+    assert.equal(await adapter.sizeOf('default'), 1)
+  })
+
+  test('dedup should respect a case-insensitive column collation', async ({ assert }) => {
+    await sql`DROP INDEX queue_jobs_dedup_uidx`.execute(connection)
+    await sql`ALTER TABLE queue_jobs DROP COLUMN dedup_id`.execute(connection)
+    await sql`ALTER TABLE queue_jobs ADD COLUMN dedup_id TEXT COLLATE NOCASE`.execute(connection)
+    await sql`CREATE UNIQUE INDEX queue_jobs_dedup_uidx ON queue_jobs (queue, dedup_id)`.execute(
+      connection
+    )
+    adapter = new KyselyAdapter({ connection, dialect: 'sqlite' })
+
+    const owner = await adapter.pushOn('default', {
+      id: 'owner',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      dedup: { id: 'Order-A' },
+    })
+    const duplicate = await adapter.pushOn('default', {
+      id: 'duplicate',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      dedup: { id: 'order-a' },
+    })
+
+    assert.deepEqual(owner, { outcome: 'added', jobId: 'owner' })
+    assert.deepEqual(duplicate, { outcome: 'skipped', jobId: 'owner' })
+    assert.equal(await adapter.sizeOf('default'), 1)
   })
 
   test('concurrent workers should not acquire the same job', async ({ assert }) => {
@@ -177,7 +221,6 @@ test.group('Adapter | Kysely (MySQL)', (group) => {
 
   registerDriverTestSuite({
     test,
-    supportsAtomicDedup: false,
     createAdapter: () => {
       adapter = new KyselyAdapter({
         connection,
@@ -192,6 +235,49 @@ test.group('Adapter | Kysely (MySQL)', (group) => {
   test('addDedupColumns should be idempotent', async () => {
     await schema.addDedupColumns(tableName)
     await schema.addDedupColumns(tableName)
+  })
+
+  test('addDedupColumns should leave a dedup slot to its latest job', async ({ assert }) => {
+    const jobs = connection.withTables<Record<typeof tableName, QueueJobTable>>()
+    const job = (id: string, dedupId: string, dedupAt: number) => ({
+      id,
+      queue: 'default',
+      status: 'completed' as const,
+      data: '{}',
+      dedup_id: dedupId,
+      dedup_at: dedupAt,
+      dedup_ttl: 10,
+    })
+
+    // A jobs table as the previous versions left it: no unique index, and
+    // expired owners that still hold their dedup id.
+    await connection.schema.dropIndex(`${tableName}_dedup_uidx`).on(tableName).execute()
+    await connection.schema
+      .createIndex(`${tableName}_queue_dedup_idx`)
+      .on(tableName)
+      .columns(['queue', 'dedup_id'])
+      .execute()
+    await jobs
+      .insertInto(tableName)
+      .values([job('older', 'shared', 1_000), job('newer', 'shared', 2_000)])
+      .execute()
+
+    await schema.addDedupColumns(tableName)
+    await schema.addDedupColumns(tableName)
+
+    assert.deepEqual(
+      await jobs.selectFrom(tableName).select(['id', 'dedup_id']).orderBy('id').execute(),
+      [
+        { id: 'newer', dedup_id: 'shared' },
+        { id: 'older', dedup_id: null },
+      ]
+    )
+    await assert.rejects(() =>
+      jobs
+        .insertInto(tableName)
+        .values(job('duplicate', 'shared', 3_000))
+        .execute()
+    )
   })
 
   registerRetentionRaceSuite({

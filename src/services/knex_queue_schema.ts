@@ -51,20 +51,22 @@ export class KnexQueueSchemaService {
       table.index(['queue', 'status', 'score'])
       table.index(['queue', 'status', 'execute_at'])
       table.index(['queue', 'status', 'finished_at'])
-      table.index(['queue', 'dedup_id'])
 
       extend?.(table)
     })
 
-    await this.#createDedupActiveUniqueIndex(tableName)
+    await this.#createDedupUniqueIndex(tableName)
   }
 
   /**
    * Idempotent migration: adds dedup columns (dedup_id, dedup_at, dedup_ttl)
-   * and a (queue, dedup_id) index to an existing jobs table.
+   * and a unique (queue, dedup_id) index to an existing jobs table.
    *
-   * Safe to run multiple times. Uses hasColumn checks so it won't fail on re-runs.
-   * For large Postgres tables, consider pausing workers during the run.
+   * Safe to run multiple times. Run it again when upgrading from a version
+   * that created a non-unique index: jobs sharing a dedup id keep running, and
+   * only the latest one keeps the dedup slot.
+   *
+   * Stop dispatching jobs with .dedup() during the run.
    */
   async addDedupColumns(tableName: string = 'queue_jobs'): Promise<void> {
     const hasDedupId = await this.#connection.schema.hasColumn(tableName, 'dedup_id')
@@ -79,30 +81,74 @@ export class KnexQueueSchemaService {
       })
     }
 
-    if (!hasDedupId) {
-      await this.#connection.schema.alterTable(tableName, (table) => {
-        table.index(['queue', 'dedup_id'])
-      })
-    }
+    // The derived table is what allows MySQL to read the table it updates.
+    await this.#connection.raw(
+      `UPDATE ?? SET dedup_id = NULL, dedup_at = NULL, dedup_ttl = NULL
+       WHERE (id, queue) IN (
+         SELECT id, queue FROM (
+           SELECT DISTINCT older.id, older.queue
+           FROM ?? AS older
+           JOIN ?? AS newer ON newer.queue = older.queue AND newer.dedup_id = older.dedup_id
+           WHERE newer.dedup_at > older.dedup_at
+              OR (newer.dedup_at = older.dedup_at AND newer.id > older.id)
+         ) AS stale
+       )`,
+      [tableName, tableName, tableName]
+    )
 
-    await this.#createDedupActiveUniqueIndex(tableName)
+    await this.#createDedupUniqueIndex(tableName)
+    await this.#dropLegacyDedupIndexes(tableName)
   }
 
   /**
-   * Partial unique index on (queue, dedup_id) for active dedup slots.
-   * Prevents two concurrent inserts with the same dedup_id from both succeeding.
-   * Only PG and SQLite support partial unique indexes; MySQL is skipped.
+   * Unique index on (queue, dedup_id): a single job owns a dedup slot, whatever
+   * its status. Jobs without dedup hold NULL, which is never a duplicate.
    */
-  async #createDedupActiveUniqueIndex(tableName: string): Promise<void> {
-    const client = this.#connection.client.config.client
-    if (client !== 'pg' && client !== 'better-sqlite3' && client !== 'sqlite3') return
+  async #createDedupUniqueIndex(tableName: string): Promise<void> {
+    const indexName = `${tableName}_dedup_uidx`
 
-    const indexName = `${tableName}_dedup_active_uidx`
-    await this.#connection.raw(
-      `CREATE UNIQUE INDEX IF NOT EXISTS ?? ON ?? ("queue", "dedup_id") ` +
-        `WHERE "dedup_id" IS NOT NULL AND "status" IN ('pending', 'delayed')`,
-      [indexName, tableName]
-    )
+    if (this.#dialect() !== 'mysql') {
+      await this.#connection.raw('CREATE UNIQUE INDEX IF NOT EXISTS ?? ON ?? (??, ??)', [
+        indexName,
+        tableName,
+        'queue',
+        'dedup_id',
+      ])
+      return
+    }
+
+    // MySQL has no CREATE INDEX IF NOT EXISTS
+    try {
+      await this.#connection.raw('CREATE UNIQUE INDEX ?? ON ?? (??, ??)', [
+        indexName,
+        tableName,
+        'queue',
+        'dedup_id',
+      ])
+    } catch (error) {
+      if ((error as { code?: string }).code !== 'ER_DUP_KEYNAME') throw error
+    }
+  }
+
+  /**
+   * Drops the indexes the unique index replaces: the non-unique one, and the
+   * partial unique one PostgreSQL and SQLite had on pending and delayed jobs.
+   */
+  async #dropLegacyDedupIndexes(tableName: string): Promise<void> {
+    if (this.#dialect() !== 'mysql') {
+      await this.#connection.raw('DROP INDEX IF EXISTS ??', [`${tableName}_queue_dedup_id_index`])
+      await this.#connection.raw('DROP INDEX IF EXISTS ??', [`${tableName}_dedup_active_uidx`])
+      return
+    }
+
+    try {
+      await this.#connection.raw('DROP INDEX ?? ON ??', [
+        `${tableName}_queue_dedup_id_index`,
+        tableName,
+      ])
+    } catch (error) {
+      if ((error as { code?: string }).code !== 'ER_CANT_DROP_FIELD_OR_KEY') throw error
+    }
   }
 
   /**
