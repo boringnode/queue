@@ -1483,6 +1483,57 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       assert.notEqual(job1!.id, job2!.id, 'Workers should acquire different jobs')
     })
 
+    // Under REPEATABLE READ, this load made the MySQL claims deadlock on every run.
+    test('concurrent popFrom does not fail while jobs are dispatched', async ({ assert }) => {
+      const dispatchers = 6
+      const jobsPerDispatcher = 400
+      const total = dispatchers * jobsPerDispatcher
+      const acquired: string[] = []
+      let stopped = false
+
+      // Any error, a deadlock included, stops every task and fails the test.
+      const stopOnError = (task: Promise<void>) =>
+        task.catch((error) => {
+          stopped = true
+          throw error
+        })
+
+      const results = await Promise.allSettled(
+        [
+          ...Array.from({ length: dispatchers }, async (_, dispatcher) => {
+            const adapter = await options.createAdapter()
+            for (let index = 0; index < jobsPerDispatcher && !stopped; index++) {
+              const job = {
+                id: `${dispatcher}-${index}`,
+                name: 'TestJob',
+                payload: {},
+                attempts: 0,
+              }
+              if (index % 2) await adapter.pushLaterOn('test-queue', job, 1)
+              else await adapter.pushOn('test-queue', job)
+            }
+          }),
+          ...Array.from({ length: 4 }, async (_, worker) => {
+            const adapter = await options.createAdapter()
+            adapter.setWorkerId(`worker-${worker}`)
+            while (!stopped && acquired.length < total) {
+              const job = await adapter.popFrom('test-queue')
+              if (!job) continue
+              acquired.push(job.id)
+              await adapter.completeJob(job, 'test-queue')
+            }
+          }),
+        ].map(stopOnError)
+      )
+
+      const failure = results.find(
+        (result): result is PromiseRejectedResult => result.status === 'rejected'
+      )
+      if (failure) throw failure.reason
+      assert.equal(new Set(acquired).size, total)
+      assert.lengthOf(acquired, total)
+    }).timeout(30_000)
+
     test('a worker cannot finalize a job acquired again by another worker', async ({ assert }) => {
       const adapter1 = await options.createAdapter()
       const adapter2 = await options.createAdapter()
