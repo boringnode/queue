@@ -18,20 +18,6 @@ interface DriverTestSuiteOptions {
   supportsAtomicDedup?: boolean
 }
 
-/**
- * Acquire a job, treating a MySQL deadlock victim as an empty poll. popFrom
- * can deadlock with concurrent acquisitions on MySQL, which these dedup tests
- * do not cover.
- */
-async function popIgnoringDeadlock(adapter: Adapter, queue: string): Promise<AcquiredJob | null> {
-  try {
-    return await adapter.popFrom(queue)
-  } catch (error) {
-    if ((error as { code?: string } | null)?.code === 'ER_LOCK_DEADLOCK') return null
-    throw error
-  }
-}
-
 /** A lease on a job that was never acquired. */
 function unleased(id: string): JobLease {
   return { id, leaseToken: 'worker-1:never-acquired' }
@@ -3111,7 +3097,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
       let dispatching = true
       const acquiring = (async () => {
-        while (dispatching) await popIgnoringDeadlock(adapter, 'concurrent-dedup-queue')
+        while (dispatching) await adapter.popFrom('concurrent-dedup-queue')
       })()
 
       const results = await Promise.all(
@@ -3155,7 +3141,7 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       let completed = 0
       const workers = Array.from({ length: 2 }, async () => {
         while (dispatching || (await adapter.sizeOf('concurrent-dedup-queue')) > 0) {
-          const job = await popIgnoringDeadlock(adapter, 'concurrent-dedup-queue')
+          const job = await adapter.popFrom('concurrent-dedup-queue')
           if (job && (await adapter.completeJob(job, 'concurrent-dedup-queue'))) completed++
         }
       })
