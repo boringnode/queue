@@ -489,6 +489,13 @@ The migration is idempotent. When several jobs share a dedup id, the latest one 
 others only lose their dedup id: no job is removed. The previous dedup indexes are dropped. Stop
 dispatching jobs with `.dedup()` while it runs.
 
+#### MySQL binary log format
+
+On MySQL, the Knex and Kysely adapters acquire jobs and schedules in READ COMMITTED transactions,
+which avoids deadlocks between workers under REPEATABLE READ. With `binlog_format=STATEMENT`, InnoDB
+rejects writes in READ COMMITTED, so jobs cannot be acquired. `ROW`, the MySQL 8 default, and
+`MIXED`, the MariaDB default, both work.
+
 #### Migrating SQL schedules after an upgrade
 
 The schedules table stores its dates as epoch milliseconds (`bigint`), so they do not depend on the

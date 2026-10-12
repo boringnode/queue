@@ -2,6 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Knex from 'knex'
+import type { Knex as KnexTypes } from 'knex'
 import { test } from '@japa/runner'
 import type { Assert } from '@japa/assert'
 import { Redis } from 'ioredis'
@@ -13,6 +14,8 @@ import { KnexQueueSchemaService } from '../src/services/knex_queue_schema.js'
 import { registerDriverTestSuite } from './_utils/register_driver_test_suite.js'
 import { withRedisWriteSpy } from './_utils/with_redis_write_spy.js'
 import { withKnexQuerySpy } from './_utils/with_knex_query_spy.js'
+import { pauseKnexDeletes } from './_utils/pause_deletes.js'
+import { registerRetentionRaceSuite } from './_utils/register_retention_race_suite.js'
 
 const KEY_PREFIX = 'boringnode::queue::test::'
 
@@ -2454,8 +2457,68 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
   })
 })
 
+test.group('Adapter | Knex (MySQL)', (group) => {
+  let connection: ReturnType<typeof Knex>
+  let adapter: KnexAdapter
+  let schemaService: KnexQueueSchemaService
+  const tableName = 'knex_mysql_queue_jobs_test'
+  const schedulesTableName = 'knex_mysql_queue_schedules_test'
+  const config: KnexTypes.Config = {
+    client: 'mysql2',
+    connection: {
+      host: process.env.MYSQL_HOST || 'localhost',
+      port: Number.parseInt(process.env.MYSQL_PORT || '3307', 10),
+      user: process.env.MYSQL_USER || 'root',
+      password: process.env.MYSQL_PASSWORD || 'mysql',
+      database: process.env.MYSQL_DATABASE || 'queue_test',
+    },
+  }
+
+  group.each.setup(async () => {
+    connection = Knex(config)
+    schemaService = new KnexQueueSchemaService(connection)
+
+    await schemaService.dropJobsTable(tableName)
+    await schemaService.dropSchedulesTable(schedulesTableName)
+    await schemaService.createJobsTable(tableName)
+    await schemaService.createSchedulesTable(schedulesTableName)
+
+    return async () => {
+      await adapter?.destroy()
+      await schemaService.dropJobsTable(tableName)
+      await schemaService.dropSchedulesTable(schedulesTableName)
+      await connection.destroy()
+    }
+  })
+
+  registerDriverTestSuite({
+    test,
+    supportsAtomicDedup: false,
+    createAdapter: () => {
+      adapter = new KnexAdapter({ connection, tableName, schedulesTableName })
+      return adapter
+    },
+  })
+
+  registerRetentionRaceSuite({
+    test,
+    createAdapters: async (beforeDelete, cleanup) => {
+      const first = pauseKnexDeletes(Knex(config), beforeDelete)
+      const second = Knex(config)
+      cleanup(async () => {
+        await first.destroy()
+        await second.destroy()
+      })
+      return [
+        new KnexAdapter({ connection: first, tableName }),
+        new KnexAdapter({ connection: second, tableName }),
+      ]
+    },
+  })
+})
+
 test.group('Adapter | Knex (SQLite file, two connections)', () => {
-  test('concurrent upserts from two connections all succeed', async ({ assert, cleanup }) => {
+  const connectTwice = async (cleanup: (handler: () => Promise<void>) => void) => {
     const directory = await mkdtemp(join(tmpdir(), 'queue-sqlite-'))
     const connect = () =>
       Knex({
@@ -2471,6 +2534,23 @@ test.group('Adapter | Knex (SQLite file, two connections)', () => {
       await second.destroy()
       await rm(directory, { recursive: true, force: true })
     })
+    return [first, second] as const
+  }
+
+  registerRetentionRaceSuite({
+    test,
+    createAdapters: async (beforeDelete, cleanup) => {
+      const [first, second] = await connectTwice(cleanup)
+      await new KnexQueueSchemaService(first).createJobsTable()
+      return [
+        new KnexAdapter({ connection: pauseKnexDeletes(first, beforeDelete) }),
+        new KnexAdapter({ connection: second }),
+      ]
+    },
+  })
+
+  test('concurrent upserts from two connections all succeed', async ({ assert, cleanup }) => {
+    const [first, second] = await connectTwice(cleanup)
 
     const schedulesTableName = 'queue_schedules'
     await new KnexQueueSchemaService(first).createSchedulesTable(schedulesTableName)

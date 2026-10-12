@@ -178,7 +178,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
 
     await this.#processDelayedJobs(this.#connection, queue, now)
 
-    return this.#withTransaction(this.#connection, async (trx) => {
+    return this.#withClaimTransaction(this.#connection, async (trx) => {
       let query = this.#jobs(trx)
         .selectFrom(this.#jobsTable)
         .selectAll()
@@ -214,7 +214,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   }
 
   async #processDelayedJobs(connection: Kysely<DB>, queue: string, now: number): Promise<void> {
-    await this.#withTransaction(connection, async (trx) => {
+    await this.#withClaimTransaction(connection, async (trx) => {
       let query = this.#jobs(trx)
         .selectFrom(this.#jobsTable)
         .select(['id', 'data'])
@@ -360,23 +360,25 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     }
 
     if (maxCount > 0) {
-      const toKeep = await this.#jobs(connection)
-        .selectFrom(this.#jobsTable)
-        .select('id')
-        .where('queue', '=', queue)
-        .where('status', '=', status)
-        .orderBy('finished_at', 'desc')
-        .limit(maxCount)
-        .execute()
-
+      // One statement, so that a concurrent pruning cannot delete a job kept here.
+      // MySQL rejects LIMIT in an IN subquery, but accepts it in a derived table.
       await this.#jobs(connection)
         .deleteFrom(this.#jobsTable)
         .where('queue', '=', queue)
         .where('status', '=', status)
-        .where(
-          'id',
-          'not in',
-          toKeep.map((row) => row.id)
+        .where('id', 'not in', (expression) =>
+          expression
+            .selectFrom((subquery) =>
+              subquery
+                .selectFrom(this.#jobsTable)
+                .select('id')
+                .where('queue', '=', queue)
+                .where('status', '=', status)
+                .orderBy('finished_at', 'desc')
+                .limit(maxCount)
+                .as('keep')
+            )
+            .select('keep.id')
         )
         .execute()
     }
@@ -640,7 +642,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   ): Promise<StalledJobsRecovery> {
     const now = Date.now()
 
-    return this.#withTransaction(this.#connection, async (trx) => {
+    return this.#withClaimTransaction(this.#connection, async (trx) => {
       let query = this.#jobs(trx)
         .selectFrom(this.#jobsTable)
         .select(['id', 'data'])
@@ -844,7 +846,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
 
     const now = Date.now()
 
-    return this.#withTransaction(this.#connection, async (trx) => {
+    return this.#withClaimTransaction(this.#connection, async (trx) => {
       let query = this.#schedules(trx)
         .selectFrom(this.#schedulesTable)
         .selectAll()
@@ -905,6 +907,25 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     callback: (trx: Transaction<DB>) => Promise<T>
   ): Promise<T> {
     return connection.transaction().execute(callback)
+  }
+
+  /**
+   * Transaction for a SELECT ... FOR UPDATE SKIP LOCKED claim followed by an
+   * UPDATE of the claimed rows.
+   *
+   * Under the MySQL default, REPEATABLE READ, the locking read also locks the
+   * gap before every index entry it scans, skipped rows included. The claim
+   * UPDATE then moves the row to another status, which inserts its new index
+   * entry into a gap that a concurrent claim holds: two workers acquiring jobs
+   * wait on each other and InnoDB aborts one with ER_LOCK_DEADLOCK. READ
+   * COMMITTED only locks the claimed rows, as PostgreSQL does by default.
+   */
+  #withClaimTransaction<T>(
+    connection: Kysely<DB>,
+    callback: (trx: Transaction<DB>) => Promise<T>
+  ): Promise<T> {
+    if (this.#dialect !== 'mysql') return this.#withTransaction(connection, callback)
+    return connection.transaction().setIsolationLevel('read committed').execute(callback)
   }
 
   #jobs(connection: InternalKyselyConnection<DB>): Kysely<JobsDatabase> {
