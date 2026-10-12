@@ -2363,6 +2363,49 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
   })
 })
 
+test.group('Adapter | Knex (MySQL)', (group) => {
+  let connection: ReturnType<typeof Knex>
+  let adapter: KnexAdapter
+  let schemaService: KnexQueueSchemaService
+  const tableName = 'knex_mysql_queue_jobs_test'
+  const schedulesTableName = 'knex_mysql_queue_schedules_test'
+
+  group.each.setup(async () => {
+    connection = Knex({
+      client: 'mysql2',
+      connection: {
+        host: process.env.MYSQL_HOST || 'localhost',
+        port: Number.parseInt(process.env.MYSQL_PORT || '3307', 10),
+        user: process.env.MYSQL_USER || 'root',
+        password: process.env.MYSQL_PASSWORD || 'mysql',
+        database: process.env.MYSQL_DATABASE || 'queue_test',
+      },
+    })
+    schemaService = new KnexQueueSchemaService(connection)
+
+    await schemaService.dropJobsTable(tableName)
+    await schemaService.dropSchedulesTable(schedulesTableName)
+    await schemaService.createJobsTable(tableName)
+    await schemaService.createSchedulesTable(schedulesTableName)
+
+    return async () => {
+      await adapter?.destroy()
+      await schemaService.dropJobsTable(tableName)
+      await schemaService.dropSchedulesTable(schedulesTableName)
+      await connection.destroy()
+    }
+  })
+
+  registerDriverTestSuite({
+    test,
+    supportsAtomicDedup: false,
+    createAdapter: () => {
+      adapter = new KnexAdapter({ connection, tableName, schedulesTableName })
+      return adapter
+    },
+  })
+})
+
 test.group('Adapter | Knex (SQLite file, two connections)', () => {
   test('concurrent upserts from two connections all succeed', async ({ assert, cleanup }) => {
     const directory = await mkdtemp(join(tmpdir(), 'queue-sqlite-'))

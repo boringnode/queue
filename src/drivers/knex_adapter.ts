@@ -361,7 +361,8 @@ export class KnexAdapter implements Adapter {
     }
 
     if (maxCount > 0) {
-      const toKeep = this.#connection(this.#jobsTable)
+      // MySQL rejects LIMIT in a NOT IN subquery: read the ids to keep first.
+      const toKeep = await this.#connection(this.#jobsTable)
         .where('queue', queue)
         .where('status', status)
         .orderBy('finished_at', 'desc')
@@ -371,7 +372,10 @@ export class KnexAdapter implements Adapter {
       await this.#connection(this.#jobsTable)
         .where('queue', queue)
         .where('status', status)
-        .whereNotIn('id', toKeep)
+        .whereNotIn(
+          'id',
+          toKeep.map((row) => row.id)
+        )
         .delete()
     }
   }
