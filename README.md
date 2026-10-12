@@ -473,6 +473,13 @@ await schema.dropJobsTable()
 
 </details>
 
+#### MySQL binary log format
+
+On MySQL, the Knex and Kysely adapters acquire jobs and schedules in READ COMMITTED transactions,
+which avoids deadlocks between workers under REPEATABLE READ. With `binlog_format=STATEMENT`, InnoDB
+rejects writes in READ COMMITTED, so jobs cannot be acquired. `ROW`, the MySQL 8 default, and
+`MIXED`, the MariaDB default, both work.
+
 #### Migrating SQL schedules after an upgrade
 
 The schedules table stores its dates as epoch milliseconds (`bigint`), so they do not depend on the
