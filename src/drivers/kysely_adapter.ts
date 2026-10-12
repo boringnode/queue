@@ -360,23 +360,25 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     }
 
     if (maxCount > 0) {
-      const toKeep = await this.#jobs(connection)
-        .selectFrom(this.#jobsTable)
-        .select('id')
-        .where('queue', '=', queue)
-        .where('status', '=', status)
-        .orderBy('finished_at', 'desc')
-        .limit(maxCount)
-        .execute()
-
+      // One statement, so that a concurrent pruning cannot delete a job kept here.
+      // MySQL rejects LIMIT in an IN subquery, but accepts it in a derived table.
       await this.#jobs(connection)
         .deleteFrom(this.#jobsTable)
         .where('queue', '=', queue)
         .where('status', '=', status)
-        .where(
-          'id',
-          'not in',
-          toKeep.map((row) => row.id)
+        .where('id', 'not in', (expression) =>
+          expression
+            .selectFrom((subquery) =>
+              subquery
+                .selectFrom(this.#jobsTable)
+                .select('id')
+                .where('queue', '=', queue)
+                .where('status', '=', status)
+                .orderBy('finished_at', 'desc')
+                .limit(maxCount)
+                .as('keep')
+            )
+            .select('keep.id')
         )
         .execute()
     }
