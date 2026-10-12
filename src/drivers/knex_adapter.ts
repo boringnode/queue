@@ -18,7 +18,7 @@ import type {
   ScheduleData,
   ScheduleListOptions,
 } from '../types/main.js'
-import { DEDUP_DISPATCH_ATTEMPTS, DEFAULT_PRIORITY } from '../constants.js'
+import { DEFAULT_PRIORITY } from '../constants.js'
 import {
   calculateScore,
   createLeaseToken,
@@ -515,7 +515,7 @@ export class KnexAdapter implements Adapter {
     insertRow: Record<string, unknown>,
     dedup: NonNullable<JobData['dedup']>
   ): Promise<PushResult> {
-    for (let attempt = 1; ; attempt++) {
+    while (true) {
       try {
         return await this.#connection.transaction(async (trx) => {
           const now = Date.now()
@@ -534,12 +534,6 @@ export class KnexAdapter implements Adapter {
         if (!this.#isUniqueViolation(err) && !this.#isDeadlock(err)) throw err
         // The job id itself is the duplicate
         if (await this.getJob(jobData.id, queue)) throw err
-        if (attempt === DEDUP_DISPATCH_ATTEMPTS) {
-          throw new Error(
-            `Unable to dispatch job "${jobData.id}" with dedup id "${dedup.id}" after ${attempt} attempts`,
-            { cause: err }
-          )
-        }
       }
     }
   }

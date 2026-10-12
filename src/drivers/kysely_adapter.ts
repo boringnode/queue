@@ -16,7 +16,7 @@ import type {
   ScheduleData,
   ScheduleListOptions,
 } from '../types/main.js'
-import { DEDUP_DISPATCH_ATTEMPTS, DEFAULT_PRIORITY } from '../constants.js'
+import { DEFAULT_PRIORITY } from '../constants.js'
 import {
   calculateScore,
   createLeaseToken,
@@ -479,7 +479,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   ): Promise<PushResult> {
     const dedup = jobData.dedup!
 
-    for (let attempt = 1; ; attempt++) {
+    while (true) {
       try {
         return await this.#withTransaction(connection, async (trx) => {
           const now = Date.now()
@@ -507,12 +507,6 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
         if (!this.#isUniqueViolation(error) && !this.#isDeadlock(error)) throw error
         // The job id itself is the duplicate
         if (await this.getJob(jobData.id, queue)) throw error
-        if (attempt === DEDUP_DISPATCH_ATTEMPTS) {
-          throw new Error(
-            `Unable to dispatch job "${jobData.id}" with dedup id "${dedup.id}" after ${attempt} attempts`,
-            { cause: error }
-          )
-        }
       }
     }
   }

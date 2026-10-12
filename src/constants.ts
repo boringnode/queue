@@ -42,10 +42,3 @@ export const UNKNOWN_JOB_RETRY_DELAY = 30_000
  * Default delay before retrying after an error
  */
 export const DEFAULT_ERROR_RETRY_DELAY = '5s'
-
-/**
- * Number of times a dispatch with dedup runs its transaction before it fails.
- * A dispatch runs again when it loses the insert of a dedup id to a concurrent
- * one, so a second pass is enough unless the owner keeps changing.
- */
-export const DEDUP_DISPATCH_ATTEMPTS = 5

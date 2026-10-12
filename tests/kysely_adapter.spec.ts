@@ -46,7 +46,7 @@ test.group('Adapter | Kysely (SQLite)', (group) => {
     const job = { id: 'same-id', name: 'TestJob', payload: {}, attempts: 0 }
 
     await adapter.pushOn('default', { ...job, dedup: { id: 'first' } })
-    // The primary key violation itself, not a retry of the dispatch
+    // The primary key violation itself, rather than a dispatch that runs again
     const error = await adapter.pushOn('default', { ...job, dedup: { id: 'second' } }).then(
       () => null,
       (rejection: { code?: string }) => rejection
