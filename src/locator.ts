@@ -21,7 +21,10 @@ type LocatorEntry = {
 
 type RegisterFromGlobOptions = {
   hotReload?: boolean
-  /** Receives the files that fail to load. Defaults to the console. */
+  /**
+   * Receives the files that fail to load, and the warning when no job is
+   * found. Defaults to the console.
+   */
   logger?: Logger
 }
 
@@ -74,7 +77,8 @@ class LocatorSingleton {
    *
    * Each file should have a default export that is a Job class.
    * The class name is used as the registration name. A file that fails to
-   * import is logged at the `error` level and skipped.
+   * import is logged at the `error` level and skipped. When the patterns
+   * match no job file, a warning is logged.
    *
    * @param patterns - Glob patterns to match job files
    * @returns Number of jobs successfully registered
@@ -92,18 +96,6 @@ class LocatorSingleton {
     patterns: string[],
     options: RegisterFromGlobOptions = {}
   ): Promise<number> {
-    const { registered } = await this.loadFromGlob(patterns, options)
-    return registered
-  }
-
-  /**
-   * Like `registerFromGlob()`, but also counts the matched files that failed
-   * to load, so a caller can tell them from patterns that match nothing.
-   */
-  async loadFromGlob(
-    patterns: string[],
-    options: RegisterFromGlobOptions = {}
-  ): Promise<{ registered: number; failed: number }> {
     const logger = options.logger ?? consoleLogger
     let registered = 0
     let failed = 0
@@ -134,7 +126,15 @@ class LocatorSingleton {
       }
     }
 
-    return { registered, failed }
+    // Files that failed to load were logged: the patterns matched them.
+    if (registered === 0 && failed === 0) {
+      logger.warn(
+        `No jobs found for locations: ${patterns.join(', ')}. ` +
+          'Verify your glob patterns match your job files.'
+      )
+    }
+
+    return registered
   }
 
   /**

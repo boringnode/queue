@@ -1,4 +1,5 @@
 import { test } from '@japa/runner'
+import { MemoryLogger } from './_mocks/memory_logger.js'
 import { fork, type ChildProcess } from 'node:child_process'
 import { realpath } from 'node:fs/promises'
 import { resolve } from 'node:path'
@@ -114,6 +115,17 @@ test.group('Locator', (group) => {
     await Locator.registerFromGlob(['./examples/jobs/*.ts'])
 
     assert.equal(Locator.get('SendEmailJob'), SendEmailJob)
+  })
+
+  test('should warn through its logger when patterns match no job', async ({ assert }) => {
+    const logger = new MemoryLogger()
+
+    const registered = await Locator.registerFromGlob(['./non-existent-path/**/*.ts'], { logger })
+
+    assert.equal(registered, 0)
+    assert.lengthOf(logger.logs, 1)
+    assert.equal(logger.logs[0].level, 'warn')
+    assert.include(logger.logs[0].message, 'No jobs found for locations: ./non-existent-path')
   })
 
   test('should return undefined for non-existent job', ({ assert }) => {

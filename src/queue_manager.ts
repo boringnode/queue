@@ -182,20 +182,10 @@ class QueueManagerSingleton {
       return 0
     }
 
-    const { registered, failed } = await Locator.loadFromGlob(locations, {
+    return Locator.registerFromGlob(locations, {
       hotReload: this.#hotReload,
       logger: this.#logger,
     })
-
-    // Files that failed to load were logged: the patterns matched them.
-    if (registered === 0 && failed === 0) {
-      this.#logger.warn(
-        `No jobs found for locations: ${locations.join(', ')}. ` +
-          'Verify your glob patterns match your job files.'
-      )
-    }
-
-    return registered
   }
 
   /**

@@ -206,7 +206,7 @@ test.group('QueueManager', () => {
     assert.lengthOf(logger.logs, 1)
     assert.equal(logger.logs[0].level, 'error')
     assert.include(logger.logs[0].message, `Failed to load job from ${brokenFile}`)
-    assert.equal((logger.logs[0].obj?.err as Error).message, 'Syntax mistake')
+    assert.equal((logger.logs[0].obj!.err as Error).message, 'Syntax mistake')
   })
 
   test('should load jobs from configured locations', async ({ assert, cleanup }) => {
