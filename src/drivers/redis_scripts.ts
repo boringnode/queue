@@ -525,11 +525,31 @@ ${REDIS_JOB_STORAGE_LUA}
   })
 `
 
+/**
+ * Time a worker has to finalize its cron claim. A cron claim not finalized
+ * stays in the due index until then, so a claimer finds it once its worker
+ * died and finalizes it. A claimer finalizing a claim whose worker is only
+ * slow writes the same next run, and only one of them applies.
+ */
+const CRON_CLAIM_LEASE_MS = 10_000
+
 const SCHEDULE_DUE_INDEX_LUA = `
+  local cron_claim_lease_ms = ${CRON_CLAIM_LEASE_MS}
+
+  -- Returns the end of the lease of a cron claim not finalized yet, or nil.
+  local function cron_claim_expires_at(next_run_at, claim_token, claimed_at)
+    if (next_run_at or '') ~= '' or (claim_token or '') == '' then
+      return nil
+    end
+    local claimed_at_ms = tonumber(claimed_at or '')
+    return claimed_at_ms and (claimed_at_ms + cron_claim_lease_ms) or nil
+  end
+
   local function sync_schedule_due_index(schedule_key, due_key, id)
     local status = redis.call('HGET', schedule_key, 'status')
-    local next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
-    local score = next_run_at and tonumber(next_run_at) or nil
+    local fields = redis.call('HMGET', schedule_key, 'next_run_at', 'claim_token', 'claimed_at')
+    local score = tonumber(fields[1] or '')
+      or cron_claim_expires_at(fields[1], fields[2], fields[3])
 
     if status == 'active' and score then
       redis.call('ZADD', due_key, score, id)
@@ -751,6 +771,8 @@ export const MIGRATE_SCHEDULES_SCRIPT = `
   local ids = redis.call('SMEMBERS', schedules_index_key)
   local count = 0
 
+${SCHEDULE_DUE_INDEX_LUA}
+
   local legacy_schedules = {}
   local legacy_keys = {}
 
@@ -802,13 +824,8 @@ export const MIGRATE_SCHEDULES_SCRIPT = `
 
   for i = 1, #ids do
     local id = ids[i]
-    local schedule_key = schedule_key_prefix .. id
-    local status = redis.call('HGET', schedule_key, 'status')
-    local next_run_at = redis.call('HGET', schedule_key, 'next_run_at')
-    local score = next_run_at and tonumber(next_run_at) or nil
-
-    if status == 'active' and score then
-      redis.call('ZADD', due_key, score, id)
+    sync_schedule_due_index(schedule_key_prefix .. id, due_key, id)
+    if redis.call('ZSCORE', due_key, id) then
       count = count + 1
     end
   end
@@ -825,15 +842,24 @@ export const MIGRATE_SCHEDULES_SCRIPT = `
  * Stale entries (paused, exhausted, deleted) are cleaned from the ZSET on
  * sight so subsequent calls skip them.
  *
+ * A cron claim stays indexed until its lease ends. A claim its worker did not
+ * finalize by then is returned as `unfinalized` instead of claiming anything,
+ * so the caller can finalize it as its worker would have.
+ *
  * KEYS[1] = schedules::due (the ZSET)
  * KEYS[2] = schedule key prefix (e.g. "schedules::data::")
  * ARGV[1] = now (epoch milliseconds)
+ * ARGV[2] = claim token, kept by the schedule when it is a cron
+ *
+ * Returns nil, or `{ 'claimed' | 'unfinalized', <schedule hash as JSON> }`.
  */
 export const CLAIM_SCHEDULE_SCRIPT = `
   local due_key = KEYS[1]
   local prefix = KEYS[2]
   local now = tonumber(ARGV[1])
   local claim_token = ARGV[2]
+
+${SCHEDULE_DUE_INDEX_LUA}
 
   while true do
     local candidates = redis.call('ZRANGEBYSCORE', due_key, '-inf', tostring(now), 'LIMIT', 0, 1)
@@ -866,7 +892,17 @@ export const CLAIM_SCHEDULE_SCRIPT = `
         -- If the ZSET score is stale, repair it and skip this candidate.
         local hash_nra = schedule.next_run_at
         local hash_score = hash_nra and tonumber(hash_nra) or nil
-        if not hash_score then
+        local claim_expires_at =
+          cron_claim_expires_at(hash_nra, schedule.claim_token, schedule.claimed_at)
+        if claim_expires_at and claim_expires_at <= now then
+          -- Its worker did not finalize it in time. Hide it for another lease, so
+          -- concurrent claimers skip it and a failing finalization does not block
+          -- other schedules.
+          redis.call('ZADD', due_key, now + cron_claim_lease_ms, id)
+          return { 'unfinalized', cjson.encode(schedule) }
+        elseif claim_expires_at then
+          redis.call('ZADD', due_key, claim_expires_at, id)
+        elseif not hash_score then
           redis.call('ZREM', due_key, id)
         elseif hash_score > now then
           redis.call('ZADD', due_key, hash_score, id)
@@ -913,15 +949,10 @@ export const CLAIM_SCHEDULE_SCRIPT = `
               'claim_token', new_claim_token,
               'claimed_at', new_claimed_at)
 
-            -- Update or remove from ZSET
-            if new_next_run_at ~= '' then
-              redis.call('ZADD', due_key, tonumber(new_next_run_at), id)
-            else
-              redis.call('ZREM', due_key, id)
-            end
+            sync_schedule_due_index(schedule_key, due_key, id)
 
             -- Return the schedule data (before update) as JSON
-            return cjson.encode(schedule)
+            return { 'claimed', cjson.encode(schedule) }
           end
         end
       end

@@ -636,36 +636,53 @@ export class RedisAdapter implements Adapter {
   async claimDueSchedule(): Promise<ScheduleData | null> {
     const now = Date.now()
     const claimToken = randomUUID()
-    const result = await this.#connection.eval(
-      CLAIM_SCHEDULE_SCRIPT,
-      2,
-      schedulesDueKey,
-      scheduleDataPrefix,
-      now.toString(),
-      claimToken
-    )
 
-    if (!result) {
-      return null
+    while (true) {
+      const result = (await this.#connection.eval(
+        CLAIM_SCHEDULE_SCRIPT,
+        2,
+        schedulesDueKey,
+        scheduleDataPrefix,
+        now.toString(),
+        claimToken
+      )) as ['claimed' | 'unfinalized', string] | null
+
+      if (!result) {
+        return null
+      }
+
+      const [outcome, json] = result
+      const data = JSON.parse(json) as Record<string, string>
+
+      // The worker of this cron claim died before finalizing it. Its occurrence
+      // ran already, so finalize it and look for another due schedule.
+      if (outcome === 'unfinalized') {
+        await this.#finalizeCronClaim({
+          id: data.id,
+          cronExpression: data.cron_expression,
+          timezone: data.timezone,
+          configRevision: data.config_revision || '',
+          claimToken: data.claim_token,
+          claimedAt: Number(data.claimed_at),
+        })
+        continue
+      }
+
+      // The Lua script only computes interval runs: cron needs cron-parser.
+      // Until finalized, the claim keeps the schedule from being claimed again.
+      if (data.cron_expression) {
+        await this.#finalizeCronClaim({
+          id: data.id,
+          cronExpression: data.cron_expression,
+          timezone: data.timezone,
+          configRevision: data.config_revision || '',
+          claimToken,
+          claimedAt: now,
+        })
+      }
+
+      return this.#hashToScheduleData(data)
     }
-
-    const data = JSON.parse(result as string) as Record<string, string>
-
-    // If cron expression, we need to recalculate next_run_at properly.
-    // The Lua script only handles simple interval; cron needs JS cron-parser.
-    // This is safe because the schedule is already claimed (run_count incremented).
-    if (data.cron_expression) {
-      await this.#finalizeCronClaim({
-        id: data.id,
-        cronExpression: data.cron_expression,
-        timezone: data.timezone,
-        configRevision: data.config_revision || '',
-        claimToken,
-        claimedAt: now,
-      })
-    }
-
-    return this.#hashToScheduleData(data)
   }
 
   /**

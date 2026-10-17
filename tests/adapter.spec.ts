@@ -1569,6 +1569,120 @@ test.group('Adapter | Redis', (group) => {
     assert.equal((await adapter.getSchedule(id))!.runCount, 1)
   })
 
+  test('a later claim finalizes a cron claim never finalized', async ({ assert, cleanup }) => {
+    const originalNow = Date.now
+    cleanup(() => {
+      Date.now = originalNow
+    })
+
+    const adapter = new RedisAdapter(connection)
+    const id = 'cron-claim-never-finalized-then-claimed'
+    const claimedAt = Date.parse('2030-01-01T09:00:01Z')
+
+    await adapter.upsertSchedule({
+      id,
+      name: 'CronJob',
+      payload: {},
+      cronExpression: '0 9 * * *',
+      timezone: 'UTC',
+      nextRunAt: new Date('2030-01-01T09:00:00Z'),
+    })
+    Date.now = () => claimedAt
+    await claimWithoutFinalization(adapter)
+
+    // The claim may still be finalized by its worker.
+    Date.now = () => claimedAt + 1_000
+    assert.isNull(await new RedisAdapter(connection).claimDueSchedule())
+    assert.isNull((await adapter.getSchedule(id))!.nextRunAt)
+
+    // Its worker died: the next claim finalizes it without running the claimed occurrence again.
+    Date.now = () => claimedAt + 60_000
+    assert.isNull(await new RedisAdapter(connection).claimDueSchedule())
+
+    const nextRunAt = Date.parse('2030-01-02T09:00:00Z')
+    const schedule = await adapter.getSchedule(id)
+    assert.equal(schedule!.nextRunAt?.getTime(), nextRunAt)
+    assert.equal(schedule!.runCount, 1)
+    assert.equal(Number(await connection.zscore('schedules::due', id)), nextRunAt)
+
+    Date.now = () => nextRunAt
+    assert.equal((await new RedisAdapter(connection).claimDueSchedule())?.id, id)
+  })
+
+  test('a cron claim finalized late by its worker and by another claimer runs once', async ({
+    assert,
+    cleanup,
+  }) => {
+    const secondConnection = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+      keyPrefix: KEY_PREFIX,
+      db: 15,
+    })
+    const originalNow = Date.now
+    const originalEval = connection.eval.bind(connection)
+    cleanup(async () => {
+      Date.now = originalNow
+      connection.eval = originalEval
+      await secondConnection.quit()
+    })
+
+    const adapter = new RedisAdapter(connection)
+    const secondAdapter = new RedisAdapter(secondConnection)
+    const id = 'cron-claim-finalized-twice'
+    const claimedAt = Date.parse('2030-01-01T09:00:01Z')
+
+    // Every minute, so the occurrence after the claim is due when the second claimer runs.
+    await adapter.upsertSchedule({
+      id,
+      name: 'CronJob',
+      payload: {},
+      cronExpression: '* * * * *',
+      timezone: 'UTC',
+      nextRunAt: new Date('2030-01-01T09:00:00Z'),
+    })
+
+    let releaseClaim!: () => void
+    let claimReturned!: () => void
+    const claimReleased = new Promise<void>((resolve) => {
+      releaseClaim = resolve
+    })
+    const claimHasReturned = new Promise<void>((resolve) => {
+      claimReturned = resolve
+    })
+    let gateNextEval = true
+    connection.eval = (async (...args: Parameters<typeof connection.eval>) => {
+      const result = await originalEval(...args)
+      if (gateNextEval) {
+        gateNextEval = false
+        claimReturned()
+        await claimReleased
+      }
+      return result
+    }) as typeof connection.eval
+
+    // The first worker claims 09:00 and stalls before finalizing.
+    Date.now = () => claimedAt
+    const firstClaim = adapter.claimDueSchedule()
+    await claimHasReturned
+
+    // The second one finalizes the stalled claim, then claims 09:01.
+    Date.now = () => Date.parse('2030-01-01T09:01:30Z')
+    const secondClaimed = await secondAdapter.claimDueSchedule()
+
+    releaseClaim()
+    const firstClaimed = await firstClaim
+
+    assert.equal(firstClaimed?.nextRunAt?.toISOString(), '2030-01-01T09:00:00.000Z')
+    assert.equal(secondClaimed?.nextRunAt?.toISOString(), '2030-01-01T09:01:00.000Z')
+
+    // The late finalization of the first worker does not move the next run back to 09:01.
+    const schedule = await adapter.getSchedule(id)
+    assert.equal(schedule!.runCount, 2)
+    assert.equal(schedule!.nextRunAt?.toISOString(), '2030-01-01T09:02:00.000Z')
+    assert.isNull(await secondAdapter.claimDueSchedule())
+  })
+
   test('a manual trigger does not move the time a cron claim is finalized from', async ({
     assert,
   }) => {
@@ -1873,7 +1987,7 @@ test.group('Adapter | Redis', (group) => {
     assert.equal(awaitingSecondFinalization!.name, 'RecreatedCronJob')
     assert.equal(awaitingSecondFinalization!.timezone, 'America/New_York')
     assert.isNull(awaitingSecondFinalization!.nextRunAt)
-    assert.isNull(await connection.zscore('schedules::due', id))
+    assert.isNull(await adapter.claimDueSchedule())
 
     releaseSecondClaim()
     await secondClaim
