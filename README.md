@@ -290,14 +290,22 @@ Keep completed and failed jobs for debugging:
 ```typescript
 export default class ImportantJob extends Job<Payload> {
   static options: JobOptions = {
-    // Keep last 1000 completed jobs
+    queue: 'important',
+
+    // Keep the last 1000 completed jobs of the queue
     removeOnComplete: { count: 1000 },
 
-    // Keep failed jobs for 7 days
+    // Keep the failed jobs of the queue for 7 days
     removeOnFail: { age: '7d' },
   }
 }
 ```
+
+Retention limits apply to the history of a queue, not of a job class: when a job finishes, `count`
+and `age` prune the completed (or failed) jobs of its queue, whatever their class. A job kept with
+`removeOnComplete: false` is still pruned by another class's `{ count: 1 }` on the same queue. Give
+job classes that need different retention their own queue, as `ImportantJob` does above. This is the
+same on every adapter.
 
 <details>
 <summary><strong>Retention options</strong></summary>

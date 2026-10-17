@@ -300,7 +300,9 @@ export interface JobOptions {
   /**
    * Retention policy for completed jobs.
    *
-   * By default, completed jobs are removed immediately.
+   * By default, completed jobs are removed immediately. `count` and `age`
+   * prune the completed jobs of the whole queue, whatever their class: use a
+   * separate queue for jobs that need a different retention.
    */
   removeOnComplete?: JobRetention
 
@@ -308,6 +310,8 @@ export interface JobOptions {
    * Retention policy for failed jobs.
    *
    * By default, failed jobs are removed immediately after the failure hooks run.
+   * `count` and `age` prune the failed jobs of the whole queue, whatever their
+   * class: use a separate queue for jobs that need a different retention.
    */
   removeOnFail?: JobRetention
 }
