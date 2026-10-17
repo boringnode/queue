@@ -45,6 +45,31 @@ test.group('FakeAdapter', () => {
     await adapter.destroy()
   })
 
+  test('should store payloads as JSON, like real adapters', async ({ assert }) => {
+    const adapter = fake()()
+    const payload = { sentAt: new Date(0), tags: ['a'] }
+
+    await adapter.pushOn('default', { id: 'job-1', name: 'SendEmailJob', payload, attempts: 0 })
+    payload.tags.push('b')
+
+    const expected = { sentAt: '1970-01-01T00:00:00.000Z', tags: ['a'] }
+    assert.deepEqual(adapter.getPushedJobs()[0].job.payload, expected)
+    assert.deepEqual((await adapter.popFrom('default'))?.payload, expected)
+
+    await assert.rejects(
+      () =>
+        adapter.pushLaterOn(
+          'default',
+          { id: 'job-2', name: 'SendEmailJob', payload: { count: 1n }, attempts: 0 },
+          10
+        ),
+      /BigInt/
+    )
+    adapter.assertPushedCount(1)
+
+    await adapter.destroy()
+  })
+
   test('should support matcher functions and getters', async ({ assert }) => {
     const adapter = fake()()
 

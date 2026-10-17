@@ -608,6 +608,10 @@ fake.assertPushedCount(1)
 
 You can also call `QueueManager.restore()` manually if you need more control over when the real adapters are restored.
 
+Like the real adapters, the fake stores each job as JSON: assertions see a `Date` in the payload as
+an ISO string, a payload mutated after dispatch keeps the value it had when dispatched, and a payload
+JSON cannot encode, such as a `BigInt`, makes the dispatch reject.
+
 ### Sync (for testing)
 
 ```typescript

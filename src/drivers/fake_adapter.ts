@@ -76,6 +76,14 @@ export function fake() {
 }
 
 /**
+ * Store a job as real adapters do, through JSON: the record no longer shares
+ * objects with the caller, a Date becomes a string, and a BigInt throws.
+ */
+function serialize(jobData: JobData): JobData {
+  return JSON.parse(JSON.stringify(jobData))
+}
+
+/**
  * In-memory adapter designed for tests with assertion helpers.
  */
 export class FakeAdapter implements Adapter {
@@ -180,7 +188,8 @@ export class FakeAdapter implements Adapter {
     return this.pushOn('default', jobData)
   }
 
-  async pushOn(queue: string, jobData: JobData): Promise<PushResult | void> {
+  async pushOn(queue: string, job: JobData): Promise<PushResult | void> {
+    const jobData = serialize(job)
     const deduped = await this.#applyDedup(queue, jobData)
     if (deduped) return deduped
 
@@ -196,7 +205,8 @@ export class FakeAdapter implements Adapter {
     return this.pushLaterOn('default', jobData, delay)
   }
 
-  async pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<PushResult | void> {
+  async pushLaterOn(queue: string, job: JobData, delay: number): Promise<PushResult | void> {
+    const jobData = serialize(job)
     const deduped = await this.#applyDedup(queue, jobData)
     if (deduped) return deduped
 
@@ -664,7 +674,7 @@ export class FakeAdapter implements Adapter {
         if (existing) {
           const replaceable = existing.location === 'pending' || existing.location === 'delayed'
           if (jobData.dedup.replace && replaceable) {
-            existing.job.payload = structuredClone(jobData.payload)
+            existing.job.payload = jobData.payload
             if (jobData.dedup.extend && entry.ttl) {
               entry.createdAt = now
             }
