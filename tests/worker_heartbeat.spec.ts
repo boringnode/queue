@@ -4,8 +4,14 @@ import { JobPool } from '../src/job_pool.js'
 import { WorkerHeartbeat } from '../src/worker_heartbeat.js'
 import { ControllableAdapter } from './_mocks/controllable_adapter.js'
 import { trackPromise } from './_utils/track_promise.js'
+import { MemoryLogger } from './_mocks/memory_logger.js'
 
-function createHeartbeat(adapter: ControllableAdapter, pool: JobPool, interval = 10) {
+function createHeartbeat(
+  adapter: ControllableAdapter,
+  pool: JobPool,
+  interval = 10,
+  logger = new MemoryLogger()
+) {
   return new WorkerHeartbeat({
     workerId: 'test-worker',
     queues: ['default'],
@@ -13,6 +19,7 @@ function createHeartbeat(adapter: ControllableAdapter, pool: JobPool, interval =
     pool,
     adapter,
     wrapInternal: (operation) => operation(),
+    logger,
   })
 }
 
@@ -87,13 +94,15 @@ test.group('WorkerHeartbeat', () => {
     await heartbeat.stop()
   })
 
-  test('absorbs renewal errors', async ({ assert, cleanup }) => {
+  test('absorbs and logs renewal errors', async ({ assert, cleanup }) => {
     const adapter = new ControllableAdapter()
     const pool = new JobPool()
     const execution = Promise.withResolvers<void>()
     await acquireIntoPool(adapter, pool, 'renewed-job', execution.promise)
-    adapter.renewals.fail(1, new Error('renewal failed'))
-    const heartbeat = createHeartbeat(adapter, pool, 1)
+    const error = new Error('renewal failed')
+    adapter.renewals.fail(1, error)
+    const logger = new MemoryLogger()
+    const heartbeat = createHeartbeat(adapter, pool, 1, logger)
 
     cleanup(async () => {
       execution.resolve()
@@ -106,6 +115,11 @@ test.group('WorkerHeartbeat', () => {
     await heartbeat.stop()
 
     assert.isAtLeast(adapter.renewals.calls, 1)
+    const warnings = logger.logs.filter((entry) => entry.level === 'warn')
+    assert.lengthOf(warnings, 1)
+    assert.strictEqual(warnings[0].obj?.err, error)
+    assert.equal(warnings[0].obj?.queue, 'default')
+    assert.equal(warnings[0].obj?.workerId, 'test-worker')
   })
 
   test('prevents an active Job from being recovered as stalled', async ({ assert, cleanup }) => {

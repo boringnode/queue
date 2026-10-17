@@ -3045,3 +3045,112 @@ test.group('Worker | one per process', (group) => {
     await run
   })
 })
+
+test.group('Worker | finalization errors', () => {
+  function createLoggedFixture() {
+    const logger = new MemoryLogger()
+    const fixture = createWorkerFixture({ config: { logger } })
+    return { fixture, logger }
+  }
+
+  async function runOneJob(fixture: ReturnType<typeof createWorkerFixture>) {
+    await fixture.worker.processCycle(['default']) // started
+    await fixture.worker.processCycle(['default']) // completed
+  }
+
+  test('logs a completion the adapter rejects', async ({ assert, cleanup }) => {
+    class CompletedJob extends Job {
+      async execute() {}
+    }
+
+    const { fixture, logger } = createLoggedFixture()
+    const error = new Error('Connection lost')
+    fixture.adapter.finalizations.fail(1, error)
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(CompletedJob, { id: 'unsaved-completion' })
+    await runOneJob(fixture)
+
+    const errorLogs = logger.logs.filter((entry) => entry.level === 'error')
+    assert.lengthOf(errorLogs, 1)
+    assert.strictEqual(errorLogs[0].obj?.err, error)
+    assert.equal(errorLogs[0].obj?.jobId, 'unsaved-completion')
+    assert.equal(errorLogs[0].obj?.queue, 'default')
+    assert.equal(errorLogs[0].obj?.workerId, fixture.worker.id)
+    assert.include(errorLogs[0].message, '"CompletedJob" (unsaved-completion)')
+  })
+
+  test('retries a finalization that lost a deadlock', async ({ assert, cleanup }) => {
+    class CompletedJob extends Job {
+      async execute() {}
+    }
+
+    const { fixture, logger } = createLoggedFixture()
+    const deadlock = Object.assign(new Error('Deadlock found when trying to get lock'), {
+      code: 'ER_LOCK_DEADLOCK',
+      errno: 1213,
+    })
+    fixture.adapter.finalizations.fail(1, deadlock).fail(2, deadlock)
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(CompletedJob, { id: 'deadlocked-completion' })
+    await runOneJob(fixture)
+
+    assert.equal(fixture.adapter.finalizations.calls, 3)
+    assert.isNull(await fixture.adapter.getJob('deadlocked-completion', 'default'))
+    assert.deepEqual(
+      logger.logs.filter((entry) => entry.level === 'error'),
+      []
+    )
+  })
+
+  test('logs an error thrown by the failed() hook', async ({ assert, cleanup }) => {
+    const hookError = new Error('failed() hook crashed')
+
+    class FailingJob extends Job {
+      static options = { removeOnFail: false }
+
+      async execute() {
+        throw new Error('Job failed')
+      }
+
+      async failed() {
+        throw hookError
+      }
+    }
+
+    const { fixture, logger } = createLoggedFixture()
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(FailingJob, { id: 'failing-hook' })
+    await runOneJob(fixture)
+
+    const record = await fixture.adapter.getJob('failing-hook', 'default')
+    assert.equal(record?.status, 'failed')
+
+    const errorLogs = logger.logs.filter((entry) => entry.level === 'error')
+    assert.lengthOf(errorLogs, 1)
+    assert.strictEqual(errorLogs[0].obj?.err, hookError)
+    assert.equal(errorLogs[0].obj?.jobId, 'failing-hook')
+    assert.include(errorLogs[0].message, 'failed()')
+  })
+
+  test('logs a job that fails because its own timeout is invalid', async ({ assert, cleanup }) => {
+    class InvalidTimeoutJob extends Job {
+      static options = { timeout: 1.5 }
+
+      async execute() {}
+    }
+
+    const { fixture, logger } = createLoggedFixture()
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(InvalidTimeoutJob, { id: 'invalid-timeout' })
+    await runOneJob(fixture)
+
+    const errorLogs = logger.logs.filter((entry) => entry.level === 'error')
+    assert.lengthOf(errorLogs, 1)
+    assert.instanceOf(errorLogs[0].obj?.err, errors.E_INVALID_TIMEOUT)
+    assert.equal(errorLogs[0].obj?.jobId, 'invalid-timeout')
+  })
+})

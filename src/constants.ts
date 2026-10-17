@@ -42,3 +42,14 @@ export const UNKNOWN_JOB_RETRY_DELAY = 30_000
  * Default delay before retrying after an error
  */
 export const DEFAULT_ERROR_RETRY_DELAY = '5s'
+
+/**
+ * Number of times a worker retries completing, failing, or retrying a job
+ * after the database chose it as a deadlock victim
+ */
+export const FINALIZATION_RETRIES = 3
+
+/**
+ * Base delay between finalization retries, in ms. It grows with each retry.
+ */
+export const FINALIZATION_RETRY_DELAY = 25

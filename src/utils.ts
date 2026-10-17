@@ -98,3 +98,16 @@ export function calculateScore(priority: number, timestamp: number): number {
 export function createLeaseToken(workerId: string): string {
   return `${workerId}:${randomUUID()}`
 }
+
+/**
+ * Whether a database error is transient lock contention: the transaction was
+ * rolled back and can run again as is. Covers MySQL deadlocks
+ * (ER_LOCK_DEADLOCK, 1213) and PostgreSQL deadlocks and serialization
+ * failures (40P01, 40001).
+ */
+export function isDeadlockError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false
+
+  const { code, errno } = error as { code?: unknown; errno?: unknown }
+  return code === 'ER_LOCK_DEADLOCK' || errno === 1213 || code === '40P01' || code === '40001'
+}

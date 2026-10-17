@@ -890,6 +890,11 @@ await QueueManager.init({
 })
 ```
 
+The Worker logs at the `error` level a failed cycle, a job it could not complete, fail, or retry in
+the adapter (it stays active and runs again once recovered as stalled), an error thrown by a
+`failed()` hook, and a job that fails to initialize, such as one with an invalid `timeout`. A lease
+renewal that fails is logged at the `warn` level.
+
 ## OpenTelemetry Instrumentation (experimental)
 
 > [!WARNING]

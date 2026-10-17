@@ -1,6 +1,6 @@
-import debug from './debug.js'
 import type { Adapter } from './contracts/adapter.js'
 import type { JobPool } from './job_pool.js'
+import type { Logger } from './logger.js'
 
 export type HeartbeatOperationWrapper = <T>(operation: () => Promise<T>) => Promise<T>
 
@@ -11,6 +11,7 @@ export interface WorkerHeartbeatOptions {
   pool: JobPool
   adapter: Adapter
   wrapInternal: HeartbeatOperationWrapper
+  logger: Logger
 }
 
 /**
@@ -23,6 +24,7 @@ export class WorkerHeartbeat {
   readonly #pool: JobPool
   readonly #adapter: Adapter
   readonly #wrapInternal: HeartbeatOperationWrapper
+  readonly #logger: Logger
 
   #timer?: NodeJS.Timeout
   #renewal?: Promise<void>
@@ -34,6 +36,7 @@ export class WorkerHeartbeat {
     this.#pool = options.pool
     this.#adapter = options.adapter
     this.#wrapInternal = options.wrapInternal
+    this.#logger = options.logger
   }
 
   start(): void {
@@ -81,7 +84,12 @@ export class WorkerHeartbeat {
       try {
         await this.#wrapInternal(() => this.#adapter.renewJobs(queue, jobs))
       } catch (error) {
-        debug('worker %s: failed to renew jobs on queue %s: %O', this.#workerId, queue, error)
+        // The next renewal tries again. Until one succeeds, a job running
+        // longer than stalledThreshold can be recovered as stalled.
+        this.#logger.warn(
+          { err: error as Error, queue, workerId: this.#workerId },
+          `Failed to renew the leases of ${jobs.length} running job(s) on queue "${queue}"`
+        )
       }
     }
   }

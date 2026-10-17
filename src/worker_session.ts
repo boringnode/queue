@@ -1,7 +1,7 @@
 import { setTimeout } from 'node:timers/promises'
 import debug from './debug.js'
 import * as errors from './exceptions.js'
-import { parse } from './utils.js'
+import { isDeadlockError, parse } from './utils.js'
 import { JobPool, type PoolEntry } from './job_pool.js'
 import { WorkerHeartbeat, type HeartbeatOperationWrapper } from './worker_heartbeat.js'
 import { Locator } from './locator.js'
@@ -9,7 +9,12 @@ import type { SingleJobDispatchRequest } from './job_dispatch_runtime.js'
 import type { Adapter, AcquiredJob } from './contracts/adapter.js'
 import type { JobExecutionOutcome, JobExecutionRuntime } from './job_runtime.js'
 import type { Logger, WorkerCycle } from './types/main.js'
-import { DEFAULT_ERROR_RETRY_DELAY, UNKNOWN_JOB_RETRY_DELAY } from './constants.js'
+import {
+  DEFAULT_ERROR_RETRY_DELAY,
+  FINALIZATION_RETRIES,
+  FINALIZATION_RETRY_DELAY,
+  UNKNOWN_JOB_RETRY_DELAY,
+} from './constants.js'
 
 type StartedCycle = Extract<WorkerCycle, { type: 'started' }>
 type SessionMode = 'continuous' | 'manual'
@@ -97,6 +102,7 @@ export class WorkerSession {
       pool: this.#pool,
       adapter: options.adapter,
       wrapInternal: options.wrapInternal,
+      logger: options.logger,
     })
   }
 
@@ -444,10 +450,35 @@ export class WorkerSession {
     if (!result) return null
 
     const { job, queue } = result
-    const promise = this.#execute(job, queue)
-    this.#pool.add(job, queue, promise)
+    this.#pool.add(job, queue, this.#observe(job, queue, this.#execute(job, queue)))
 
     return { type: 'started', queue, job }
+  }
+
+  /**
+   * Log the failure of a job's execution path. Nothing awaits it but the
+   * pool, so an error left here would go unnoticed: the job stays active
+   * and runs again once recovered as stalled.
+   */
+  async #observe(job: AcquiredJob, queue: string, execution: Promise<void>): Promise<void> {
+    try {
+      await execution
+    } catch (error) {
+      this.#logJobError(
+        error,
+        job,
+        queue,
+        `Failed to finalize job "${job.name}" (${job.id}). It stays active and runs again ` +
+          'once recovered as stalled'
+      )
+    }
+  }
+
+  #logJobError(error: unknown, job: AcquiredJob, queue: string, message: string): void {
+    this.#logger.error(
+      { err: error as Error, jobId: job.id, queue, workerId: this.#workerId },
+      message
+    )
   }
 
   async #execute(job: AcquiredJob, queue: string): Promise<void> {
@@ -486,9 +517,7 @@ export class WorkerSession {
     if (outcome.type === 'completed') {
       this.#checkLease(
         job,
-        await this.#wrapInternal(() =>
-          this.#adapter.completeJob(job, queue, outcome.removeOnComplete)
-        )
+        await this.#finalize(() => this.#adapter.completeJob(job, queue, outcome.removeOnComplete))
       )
       return
     }
@@ -496,10 +525,15 @@ export class WorkerSession {
     if (outcome.type === 'initialization-failed') {
       if (outcome.jobNotFound && (await this.#requeueUnknownJob(job, queue))) return
 
-      debug('worker %s: failed to initialize job %s (%s)', this.#workerId, job.id, job.name)
+      this.#logJobError(
+        outcome.error,
+        job,
+        queue,
+        `Job "${job.name}" (${job.id}) failed to initialize and will not be retried`
+      )
       this.#checkLease(
         job,
-        await this.#wrapInternal(() =>
+        await this.#finalize(() =>
           this.#adapter.failJob(job, queue, outcome.error, outcome.removeOnFail)
         )
       )
@@ -507,17 +541,21 @@ export class WorkerSession {
     }
 
     if (outcome.type === 'failed') {
+      if (outcome.failedHookError) {
+        this.#logJobError(
+          outcome.failedHookError,
+          job,
+          queue,
+          `The failed() hook of job "${job.name}" (${job.id}) threw`
+        )
+      }
+
       this.#checkLease(
         job,
-        await this.#wrapInternal(() =>
+        await this.#finalize(() =>
           this.#adapter.failJob(job, queue, outcome.error, outcome.removeOnFail)
         )
       )
-
-      if (outcome.failedHookError) {
-        throw outcome.failedHookError
-      }
-
       return
     }
 
@@ -528,12 +566,30 @@ export class WorkerSession {
         job.id,
         outcome.retryAt.toISOString()
       )
-      this.#checkLease(
-        job,
-        await this.#wrapInternal(() => this.#adapter.retryJob(job, queue, outcome.retryAt))
-      )
-    } else {
-      this.#checkLease(job, await this.#wrapInternal(() => this.#adapter.retryJob(job, queue)))
+    }
+
+    this.#checkLease(
+      job,
+      await this.#finalize(() => this.#adapter.retryJob(job, queue, outcome.retryAt))
+    )
+  }
+
+  /**
+   * Run an adapter call that completes, fails, or retries a job. A deadlock
+   * rolled the call back, so it runs again, a bounded number of times: a
+   * completion contending with another worker's lease renewal must not leave
+   * the job active, to run again once recovered as stalled.
+   */
+  async #finalize(operation: () => Promise<boolean>): Promise<boolean> {
+    for (let retry = 1; ; retry++) {
+      try {
+        return await this.#wrapInternal(operation)
+      } catch (error) {
+        if (retry > FINALIZATION_RETRIES || !isDeadlockError(error)) throw error
+
+        debug('worker %s: finalization deadlocked, retry %d', this.#workerId, retry)
+        await setTimeout(FINALIZATION_RETRY_DELAY * retry)
+      }
     }
   }
 
@@ -552,7 +608,7 @@ export class WorkerSession {
     if (job.attempts >= limit) return false
 
     const retryAt = new Date(Date.now() + UNKNOWN_JOB_RETRY_DELAY)
-    const requeued = await this.#wrapInternal(() => this.#adapter.retryJob(job, queue, retryAt))
+    const requeued = await this.#finalize(() => this.#adapter.retryJob(job, queue, retryAt))
     this.#checkLease(job, requeued)
 
     if (requeued) {
@@ -646,7 +702,7 @@ export class WorkerSession {
       // error stalls again and comes back on a later recovery.
       for (const job of exceeded) {
         debug('worker %s: failing job %s after it stalled too many times', this.#workerId, job.id)
-        this.#pool.add(job, queue, this.#failStalled(job, queue))
+        this.#pool.add(job, queue, this.#observe(job, queue, this.#failStalled(job, queue)))
       }
     }
   }
