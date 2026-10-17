@@ -472,6 +472,23 @@ const adapter = kysely<Database>(db, { dialect: 'postgres' })
 The adapter never destroys the application-owned Kysely instance. Use `tableName` and
 `schedulesTableName` in the options when your migration uses custom names.
 
+The application also owns the database driver. With PostgreSQL, a `pg` client emits an `error` event
+when its connection breaks, for example on a database restart, and Node.js exits on an `error`
+event without a listener. Listen on the pool and on each client it creates:
+
+```typescript
+import pg from 'pg'
+import { Kysely, PostgresDialect } from 'kysely'
+
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL })
+pool.on('error', (error) => logger.error({ err: error }, 'Idle PostgreSQL client error'))
+pool.on('connect', (client) => {
+  client.on('error', (error) => logger.error({ err: error }, 'PostgreSQL client error'))
+})
+
+const db = new Kysely<Database>({ dialect: new PostgresDialect({ pool }) })
+```
+
 <details>
 <summary><strong>Database setup with KyselyQueueSchemaService</strong></summary>
 
@@ -629,7 +646,7 @@ Use the `sync` adapter for tests and lightweight local development only.
 - A delayed job (`.in()`) runs in a timer of the process. `QueueManager.destroy()` cancels the
   delayed jobs that have not run yet.
 
-Example: with `maxRetries: 3` and an exponential backoff of `1s`, `2s`, `4s`,
+Example: with `maxRetries: 3` and an exponential backoff of about `1s`, `2s`, `4s`,
 the request or command that dispatched the job can stay busy for about 7 seconds
 before the job exhausts its retries and runs `failed()`.
 
@@ -711,8 +728,11 @@ then the queue's `defaultJobOptions`, then the queue's `retry`, then the global
 ```typescript
 import { exponentialBackoff, linearBackoff, fixedBackoff } from '@boringnode/queue'
 
-// Exponential: 1s, 2s, 4s, 8s...
+// Exponential: about 1s, 2s, 4s, 8s... (jitter of ±25% by default)
 exponentialBackoff({ baseDelay: '1s', maxDelay: '1m', multiplier: 2 })
+
+// Exponential without jitter: exactly 1s, 2s, 4s, 8s...
+exponentialBackoff({ baseDelay: '1s', maxDelay: '1m', multiplier: 2, jitter: false })
 
 // Linear: 1s, 2s, 3s, 4s...
 linearBackoff({ baseDelay: '1s', maxDelay: '30s', multiplier: 1 })
@@ -828,7 +848,7 @@ const redisSchedules = await Schedule.list({}, { adapter: 'redis' })
 | Method              | Description                                  |
 | ------------------- | -------------------------------------------- |
 | `.id(string)`       | Unique identifier (defaults to the job name) |
-| `.every(duration)`  | Fixed interval ('5s', '1m', '1h')            |
+| `.every(duration)`  | Interval after each run ('5s', '1m', '1h')   |
 | `.cron(expression)` | Cron schedule                                |
 | `.timezone(tz)`     | Timezone (default: 'UTC')                    |
 | `.from(date)`       | Start boundary                               |
@@ -838,6 +858,9 @@ const redisSchedules = await Schedule.list({}, { adapter: 'redis' })
 
 Scheduling the same Job twice without `.id()` replaces the first Schedule, since both use the job
 name as their id.
+
+An `.every()` interval counts from the moment a Worker claims the run, not from the previous
+planned run: with `.every('1m')`, a run claimed 3 seconds late moves the next ones 3 seconds later.
 
 Defining a Schedule that already exists updates it without resetting it, so you can define your
 Schedules at every boot:

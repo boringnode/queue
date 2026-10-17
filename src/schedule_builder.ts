@@ -68,8 +68,9 @@ export class ScheduleBuilder<TPayload = unknown> implements PromiseLike<Schedule
   }
 
   /**
-   * Set a repeating interval for the schedule.
-   * Mutually exclusive with `cron()`.
+   * Set a repeating interval for the schedule. The next run is due this
+   * interval after a Worker claims the current one, so a late claim delays
+   * the following runs. Mutually exclusive with `cron()`.
    */
   every(interval: Duration): this {
     this.#everyMs = parse(interval)

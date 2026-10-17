@@ -170,7 +170,9 @@ export class BackoffStrategy {
 /**
  * Create an exponential backoff strategy factory.
  *
- * Delay doubles with each attempt: 1s → 2s → 4s → 8s → ...
+ * Delay doubles with each attempt: about 1s → 2s → 4s → 8s → ... The
+ * default jitter moves each delay by up to ±25%; pass `jitter: false` for
+ * exact delays.
  *
  * Default config:
  * - baseDelay: 1s
