@@ -12,6 +12,8 @@ import { ControllableAdapter } from './_mocks/controllable_adapter.js'
 import { createWorkerFixture } from './_utils/create_worker_fixture.js'
 import { trackPromise } from './_utils/track_promise.js'
 import { MemoryLogger } from './_mocks/memory_logger.js'
+import { executeChannel } from '../src/tracing_channels.js'
+import type { JobExecuteMessage } from '../src/types/tracing_channels.js'
 
 const config = {
   default: 'memory',
@@ -1381,7 +1383,16 @@ test.group('Worker', () => {
       worker: { unknownJobRetries: 2 },
     })
 
+    // Tracing reports what happens to the job: a return to the queue is a retry.
+    const traced = new Map<string, JobExecuteMessage>()
+    const captureTrace = (message: unknown) => {
+      const executeMessage = message as JobExecuteMessage
+      traced.set(executeMessage.job.id, { ...executeMessage })
+    }
+    executeChannel.asyncEnd.subscribe(captureTrace)
+
     cleanup(async () => {
+      executeChannel.asyncEnd.unsubscribe(captureTrace)
       Locator.clear()
       await worker.stop()
     })
@@ -1398,7 +1409,13 @@ test.group('Worker', () => {
     const exhausted = await sharedAdapter.getJob('returned-twice', 'default')
     assert.equal(exhausted!.status, 'failed')
     assert.equal(exhausted!.error, 'Requested job "UnknownJob" is not registered')
+    assert.equal(traced.get('returned-twice')?.status, 'failed')
+
     assert.equal((await sharedAdapter.getJob('returned-once', 'default'))!.status, 'delayed')
+    const requeued = traced.get('returned-once')
+    assert.equal(requeued?.status, 'retrying')
+    assert.instanceOf(requeued?.error, errors.E_JOB_NOT_FOUND)
+    assert.approximately(requeued!.nextRetryAt!.getTime(), Date.now() + 30_000, 1_000)
   })
 
   test('should fail a job with an unknown class at once when unknownJobRetries is 0', async ({

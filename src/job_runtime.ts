@@ -1,5 +1,5 @@
 import * as errors from './exceptions.js'
-import { DEFAULT_PRIORITY } from './constants.js'
+import { DEFAULT_PRIORITY, UNKNOWN_JOB_RETRY_DELAY } from './constants.js'
 import { executeChannel } from './tracing_channels.js'
 import type { Job } from './job.js'
 import type { AcquiredJob } from './contracts/adapter.js'
@@ -27,7 +27,12 @@ type TimedOutExecution = { timedOutExecution?: Promise<void> }
 
 export type JobExecutionOutcome =
   | { type: 'completed'; removeOnComplete?: JobRetention }
-  | ({ type: 'retry'; retryAt?: Date } & TimedOutExecution)
+  | ({
+      type: 'retry'
+      retryAt?: Date
+      /** Set when the job goes back to the queue because no class has its name. */
+      jobNotFound?: true
+    } & TimedOutExecution)
   | ({
       type: 'failed'
       reason: PermanentFailureReason
@@ -39,12 +44,17 @@ export type JobExecutionOutcome =
       type: 'initialization-failed'
       error: Error
       removeOnFail?: JobRetention
-      /**
-       * Set when no class is registered under the job name, as opposed to a
-       * registered job that failed to load, construct, or configure.
-       */
-      jobNotFound?: true
     }
+
+export interface JobExecuteOptions {
+  /**
+   * A job whose name has no registered class goes back to the queue, to run
+   * again 30 seconds later, while it has fewer attempts than this. During a
+   * rolling deploy, an old worker can take a job dispatched by new code: a
+   * worker that knows it runs it later. Defaults to 0: the job fails.
+   */
+  unknownJobRetries?: number
+}
 
 type JobExecutionRuntimeDependencies = {
   /** Returns undefined when no class is registered under the name. */
@@ -99,14 +109,18 @@ export class JobExecutionRuntime {
   /**
    * Execute a single acquired Job attempt and return the adapter-facing outcome.
    */
-  execute(job: AcquiredJob, queue: string): Promise<JobExecutionOutcome> {
+  execute(
+    job: AcquiredJob,
+    queue: string,
+    options: JobExecuteOptions = {}
+  ): Promise<JobExecutionOutcome> {
     const executeMessage: JobExecuteMessage = { job, queue }
     const startTime = performance.now()
 
     const run = () =>
       executeChannel.tracePromise(async () => {
         try {
-          return await this.#executeAttempt(job, queue, executeMessage)
+          return await this.#executeAttempt(job, queue, executeMessage, options)
         } finally {
           executeMessage.duration = Number((performance.now() - startTime).toFixed(2))
         }
@@ -172,7 +186,8 @@ export class JobExecutionRuntime {
   async #executeAttempt(
     job: AcquiredJob,
     queue: string,
-    executeMessage: JobExecuteMessage
+    executeMessage: JobExecuteMessage,
+    executeOptions: JobExecuteOptions
   ): Promise<JobExecutionOutcome> {
     let instance: Job
     let options: JobOptions | undefined
@@ -184,18 +199,27 @@ export class JobExecutionRuntime {
       timeout = parseTimeout(this.#configResolver.resolveJobOptions(queue, options).timeout)
     } catch (error) {
       const initializationError = error as Error
-      const retention = this.#configResolver.resolveJobOptions(queue, options)
+      executeMessage.error = initializationError
+
+      // Only a name with no class goes back to the queue: an E_JOB_NOT_FOUND
+      // thrown while loading or constructing a registered job, for another
+      // name, fails it like any other initialization error.
+      if (
+        error instanceof JobNotRegistered &&
+        job.attempts < (executeOptions.unknownJobRetries ?? 0)
+      ) {
+        const retryAt = new Date(Date.now() + UNKNOWN_JOB_RETRY_DELAY)
+        executeMessage.status = 'retrying'
+        executeMessage.nextRetryAt = retryAt
+        return { type: 'retry', retryAt, jobNotFound: true }
+      }
 
       executeMessage.status = 'failed'
-      executeMessage.error = initializationError
 
       return {
         type: 'initialization-failed',
         error: initializationError,
-        removeOnFail: retention.removeOnFail,
-        // An E_JOB_NOT_FOUND thrown while loading or constructing a registered
-        // job, for another name, is an initialization error like any other.
-        ...(error instanceof JobNotRegistered ? { jobNotFound: true as const } : {}),
+        removeOnFail: this.#configResolver.resolveJobOptions(queue, options).removeOnFail,
       }
     }
 

@@ -293,22 +293,39 @@ test.group('JobExecutionRuntime', () => {
     assert.strictEqual(outcome.failedHookError, hookFailure)
   })
 
-  test('flags a job name with no registered class', async ({ assert }) => {
+  test('retries a job name with no registered class within unknownJobRetries', async ({
+    assert,
+  }) => {
     const runtime = new JobExecutionRuntime({
       resolveJob: async () => undefined,
       configResolver: new QueueConfigResolver({}),
     })
 
-    const outcome = await runtime.execute(acquiredJob(), 'default')
+    const outcome = await runtime.execute(acquiredJob(), 'default', { unknownJobRetries: 1 })
+
+    assert.equal(outcome.type, 'retry')
+    if (outcome.type !== 'retry') return
+    assert.isTrue(outcome.jobNotFound)
+    assert.approximately(outcome.retryAt!.getTime(), Date.now() + 30_000, 1_000)
+  })
+
+  test('fails a job name with no registered class past unknownJobRetries', async ({ assert }) => {
+    const runtime = new JobExecutionRuntime({
+      resolveJob: async () => undefined,
+      configResolver: new QueueConfigResolver({}),
+    })
+
+    const outcome = await runtime.execute({ ...acquiredJob(), attempts: 1 }, 'default', {
+      unknownJobRetries: 1,
+    })
 
     assert.equal(outcome.type, 'initialization-failed')
     if (outcome.type !== 'initialization-failed') return
-    assert.isTrue(outcome.jobNotFound)
     assert.instanceOf(outcome.error, errors.E_JOB_NOT_FOUND)
     assert.equal(outcome.error.message, 'Requested job "TestJob" is not registered')
   })
 
-  test('does not flag an E_JOB_NOT_FOUND thrown by a registered job', async ({ assert }) => {
+  test('does not retry an E_JOB_NOT_FOUND thrown by a registered job', async ({ assert }) => {
     class MissingDependencyJob extends Job {
       constructor() {
         super()
@@ -323,15 +340,14 @@ test.group('JobExecutionRuntime', () => {
       configResolver: new QueueConfigResolver({}),
     })
 
-    const outcome = await runtime.execute(acquiredJob(), 'default')
+    const outcome = await runtime.execute(acquiredJob(), 'default', { unknownJobRetries: 10 })
 
     assert.equal(outcome.type, 'initialization-failed')
     if (outcome.type !== 'initialization-failed') return
     assert.instanceOf(outcome.error, errors.E_JOB_NOT_FOUND)
-    assert.notProperty(outcome, 'jobNotFound')
   })
 
-  test('does not flag an unknown stalled job, which fails for good', async ({ assert }) => {
+  test('fails an unknown stalled job for good', async ({ assert }) => {
     const runtime = new JobExecutionRuntime({
       resolveJob: async () => undefined,
       configResolver: new QueueConfigResolver({}),
@@ -340,7 +356,6 @@ test.group('JobExecutionRuntime', () => {
     const outcome = await runtime.failStalled(acquiredJob(), 'default', 1)
 
     assert.equal(outcome.type, 'initialization-failed')
-    assert.notProperty(outcome, 'jobNotFound')
   })
 
   test('returns initialization-failed when a stalled Job cannot be instantiated', async ({

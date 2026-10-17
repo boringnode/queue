@@ -486,7 +486,9 @@ export class WorkerSession {
 
     debug('worker %s: executing job %s (%s)', this.#workerId, job.id, job.name)
 
-    const outcome = await this.#jobExecutionRuntime.execute(job, queue)
+    const outcome = await this.#jobExecutionRuntime.execute(job, queue, {
+      unknownJobRetries: this.#settings.unknownJobRetries,
+    })
 
     try {
       await this.#finalizeExecution(job, queue, outcome)
@@ -523,8 +525,6 @@ export class WorkerSession {
     }
 
     if (outcome.type === 'initialization-failed') {
-      if (outcome.jobNotFound && (await this.#requeueUnknownJob(job, queue))) return
-
       this.#logJobError(
         outcome.error,
         job,
@@ -568,10 +568,16 @@ export class WorkerSession {
       )
     }
 
-    this.#checkLease(
-      job,
-      await this.#finalize(() => this.#adapter.retryJob(job, queue, outcome.retryAt))
-    )
+    const retried = await this.#finalize(() => this.#adapter.retryJob(job, queue, outcome.retryAt))
+    this.#checkLease(job, retried)
+
+    if (retried && outcome.jobNotFound) {
+      this.#logger.warn(
+        `Job "${job.name}" (${job.id}) is not registered on this worker. It went back to queue ` +
+          `"${queue}" and runs again in ${UNKNOWN_JOB_RETRY_DELAY / 1000}s ` +
+          `(${job.attempts + 1}/${this.#settings.unknownJobRetries}).`
+      )
+    }
   }
 
   /**
@@ -591,35 +597,6 @@ export class WorkerSession {
         await setTimeout(FINALIZATION_RETRY_DELAY * retry)
       }
     }
-  }
-
-  /**
-   * Put a job whose class this worker does not know back in the queue, a
-   * bounded number of times. During a rolling deploy, an old worker can take
-   * a job dispatched by new code: a worker that knows it runs it later.
-   * Other initialization failures are bugs, and retrying them changes nothing:
-   * the runtime sets `jobNotFound` only when no class has the job name.
-   *
-   * @returns Whether the job was handled here: false once the limit is
-   * reached, so the caller fails it. A lost lease counts as handled.
-   */
-  async #requeueUnknownJob(job: AcquiredJob, queue: string): Promise<boolean> {
-    const limit = this.#settings.unknownJobRetries
-    if (job.attempts >= limit) return false
-
-    const retryAt = new Date(Date.now() + UNKNOWN_JOB_RETRY_DELAY)
-    const requeued = await this.#finalize(() => this.#adapter.retryJob(job, queue, retryAt))
-    this.#checkLease(job, requeued)
-
-    if (requeued) {
-      this.#logger.warn(
-        `Job "${job.name}" (${job.id}) is not registered on this worker. It went back to queue ` +
-          `"${queue}" and runs again in ${UNKNOWN_JOB_RETRY_DELAY / 1000}s ` +
-          `(${job.attempts + 1}/${limit}).`
-      )
-    }
-
-    return true
   }
 
   /**

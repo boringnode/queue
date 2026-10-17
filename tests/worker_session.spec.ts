@@ -401,8 +401,8 @@ test.group('WorkerSession', () => {
       logger,
       jobExecutionRuntime: {
         execute: async () => ({
-          type: 'initialization-failed' as const,
-          error: new Error('not registered'),
+          type: 'retry' as const,
+          retryAt: new Date(Date.now() + 30_000),
           jobNotFound: true as const,
         }),
       },
