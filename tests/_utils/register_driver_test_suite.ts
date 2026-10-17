@@ -1393,6 +1393,48 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.equal(retried!.attempts, 1)
   })
 
+  test('payloads that Redis Lua cannot decode do not block the queue', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    adapter.setWorkerId('worker-1')
+
+    // JSON.parse accepts both, Redis cjson rejects them.
+    let deep: unknown = 'leaf'
+    for (let depth = 0; depth < 1100; depth++) deep = [deep]
+    const payloads: Record<string, unknown> = { 'lone-surrogate': '\ud800', 'deep-nesting': deep }
+
+    for (const [id, payload] of Object.entries(payloads)) {
+      await adapter.pushLaterOn('test-queue', { id, name: 'TestJob', payload, attempts: 0 }, 1)
+    }
+    await adapter.pushOn('test-queue', { id: 'healthy', name: 'TestJob', payload: {}, attempts: 0 })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    const acquired: AcquiredJob[] = []
+    for (let i = 0; i < 3; i++) {
+      const job = await adapter.popFrom('test-queue')
+      if (job) acquired.push(job)
+    }
+    assert.sameMembers(
+      acquired.map((job) => job.id),
+      ['lone-surrogate', 'deep-nesting', 'healthy']
+    )
+
+    for (const job of acquired.filter((acquiredJob) => acquiredJob.id !== 'healthy')) {
+      assert.deepEqual(job.payload, payloads[job.id])
+      assert.isTrue(await adapter.retryJob(job, 'test-queue'))
+
+      const record = await adapter.getJob(job.id, 'test-queue')
+      assert.equal(record?.status, 'pending')
+      assert.equal(record?.data.attempts, 1)
+    }
+
+    assert.isNotNull(await adapter.popFrom('test-queue'))
+    assert.isNotNull(await adapter.popFrom('test-queue'))
+    await new Promise((resolve) => setTimeout(resolve, 30))
+
+    const { recovered } = await adapter.recoverStalledJobs('test-queue', 10, 1, 100)
+    assert.equal(recovered, 3)
+  })
+
   test('delayed job becomes available after delay', async ({ assert }) => {
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')

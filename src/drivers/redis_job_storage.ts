@@ -36,6 +36,18 @@ export function encodeRedisJobPayloadOverlay(payload: JobData['payload']): [stri
 }
 
 export const REDIS_JOB_STORAGE_LUA = `
+  -- Read the fields a script needs from the original job JSON. cjson rejects
+  -- some JSON that JSON.parse accepts, such as a lone surrogate or more than
+  -- 1000 levels of nesting in the payload: such a job gets the defaults
+  -- (priority 5, attempts 0) instead of failing every script that touches it.
+  local function read_job_fields(job_data)
+    local ok, job = pcall(cjson.decode, job_data)
+    if ok and type(job) == 'table' then
+      return job
+    end
+    return {}
+  end
+
   local function read_job_overlay(overlay_key, job_id)
     local overlay_json = redis.call('HGET', overlay_key, job_id)
     if overlay_json then

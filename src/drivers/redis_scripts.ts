@@ -128,8 +128,7 @@ ${REDIS_JOB_STORAGE_LUA}
       local job_id = ready_job_ids[i]
       local job_data = redis.call('HGET', data_key, job_id)
       if job_data then
-        local job = cjson.decode(job_data)
-        local priority = job.priority or 5
+        local priority = read_job_fields(job_data).priority or 5
         local score = priority * 10000000000000 + now
         redis.call('ZADD', pending_key, score, job_id)
         redis.call('ZREM', delayed_key, job_id)
@@ -198,8 +197,8 @@ ${REDIS_LEASE_LUA}
   -- Read job data to extract dedup.id before deleting
   local job_data = redis.call('HGET', data_key, job_id)
   if job_data then
-    local ok, job = pcall(cjson.decode, job_data)
-    if ok and job and job.dedup and job.dedup.id then
+    local job = read_job_fields(job_data)
+    if job.dedup and job.dedup.id then
       local dkey = dedup_prefix .. job.dedup.id
       if redis.call('GET', dkey) == job_id then
         redis.call('DEL', dkey)
@@ -258,8 +257,8 @@ ${REDIS_LEASE_LUA}
       local id = ids[i]
       local d = redis.call('HGET', data_key, id)
       if d then
-        local ok, job = pcall(cjson.decode, d)
-        if ok and job and job.dedup and job.dedup.id then
+        local job = read_job_fields(d)
+        if job.dedup and job.dedup.id then
           local dkey = dedup_prefix .. job.dedup.id
           if redis.call('GET', dkey) == id then
             redis.call('DEL', dkey)
@@ -331,12 +330,15 @@ ${REDIS_LEASE_LUA}
     return 0
   end
 
+  -- Read everything before the first write: an error past it would leave
+  -- the job in no state, since a script does not roll back its writes.
+  local job = read_job_fields(job_data)
+  local overlay = read_job_overlay(overlay_key, job_id)
+
   -- Remove from active
   redis.call('HDEL', active_key, job_id)
 
   -- Increment attempts without rewriting opaque job JSON.
-  local job = cjson.decode(job_data)
-  local overlay = read_job_overlay(overlay_key, job_id)
   overlay.attempts = (overlay.attempts or job.attempts or 0) + 1
   write_job_overlay(overlay_key, job_id, overlay)
 
@@ -395,7 +397,7 @@ ${REDIS_JOB_STORAGE_LUA}
     if active.acquiredAt < stalled_cutoff then
       local job_data = redis.call('HGET', data_key, job_id)
       if job_data then
-        local job = cjson.decode(job_data)
+        local job = read_job_fields(job_data)
         local overlay = read_job_overlay(overlay_key, job_id)
         local current_stalled_count = overlay.stalledCount or job.stalledCount or 0
 
