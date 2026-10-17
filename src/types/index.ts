@@ -1,5 +1,6 @@
 export type {
   AdapterFactory,
+  AdapterFactoryContext,
   AdapterSelector,
   BackoffConfig,
   BackoffStrategy,

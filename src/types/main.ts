@@ -574,9 +574,17 @@ export type WorkerCycle =
     }
 
 /**
+ * What QueueManager hands an adapter factory when it creates the adapter.
+ */
+export interface AdapterFactoryContext {
+  /** The logger configured on QueueManager. */
+  logger: Logger
+}
+
+/**
  * Factory used to lazily create adapter instances.
  */
-export type AdapterFactory<T extends Adapter = Adapter> = () => T
+export type AdapterFactory<T extends Adapter = Adapter> = (context?: AdapterFactoryContext) => T
 
 /**
  * Status of a schedule.

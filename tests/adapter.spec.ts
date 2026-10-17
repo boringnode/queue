@@ -16,6 +16,7 @@ import { withRedisWriteSpy } from './_utils/with_redis_write_spy.js'
 import { withKnexQuerySpy } from './_utils/with_knex_query_spy.js'
 import { pauseKnexDeletes } from './_utils/pause_deletes.js'
 import { registerRetentionRaceSuite } from './_utils/register_retention_race_suite.js'
+import { MemoryLogger } from './_mocks/memory_logger.js'
 
 const KEY_PREFIX = 'boringnode::queue::test::'
 
@@ -58,6 +59,31 @@ test.group('Adapter | Memory', (group) => {
     },
     supportsConcurrency: false,
   })
+})
+
+test('redis factory logs the errors of the connection it creates', async ({ assert }) => {
+  const logger = new MemoryLogger()
+  // Nothing listens on port 1: the connection fails once and gives up.
+  const adapter = redis({ host: '127.0.0.1', port: 1, retryStrategy: () => null })({ logger })
+
+  try {
+    for (let wait = 0; wait < 50 && logger.logs.length === 0; wait++) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+
+    const errorLogs = logger.logs.filter((entry) => entry.level === 'error')
+    assert.lengthOf(errorLogs, 1)
+    assert.match(String(errorLogs[0].obj?.err), /ECONNREFUSED/)
+  } finally {
+    await adapter.destroy().catch(() => {})
+  }
+})
+
+test('redis factory leaves the errors of an app connection to the app', ({ assert }) => {
+  const connection = new Redis({ lazyConnect: true })
+  redis(connection)({ logger: new MemoryLogger() })
+
+  assert.equal(connection.listenerCount('error'), 0)
 })
 
 test.group('Adapter | Redis', (group) => {

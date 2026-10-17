@@ -245,7 +245,7 @@ class QueueManagerSingleton {
     debug('using adapter "%s"', adapter)
 
     try {
-      const instance = adapterFactory()
+      const instance = adapterFactory({ logger: this.#logger })
       this.#adapterInstances.set(adapter, instance)
       return instance
     } catch (error) {

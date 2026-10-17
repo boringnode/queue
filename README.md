@@ -337,6 +337,10 @@ const connection = new Redis({ host: 'localhost' })
 const adapter = redis(connection)
 ```
 
+When it creates the connection from options, the adapter logs its errors, such as failed
+reconnections, through the configured logger. A connection you pass in is yours: attach an `error`
+listener to it, or ioredis writes each error to stderr.
+
 #### Migrating Redis schedules after an upgrade
 
 The Redis adapter stores each schedule at `schedules::data::<id>` and uses a `schedules::due`

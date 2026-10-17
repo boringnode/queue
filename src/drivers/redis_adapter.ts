@@ -9,7 +9,8 @@ import type {
   PushResult,
   StalledJobsRecovery,
 } from '../contracts/adapter.js'
-import type { DedupOutcome } from '../types/main.js'
+import { consoleLogger } from '../logger.js'
+import type { AdapterFactoryContext, DedupOutcome } from '../types/main.js'
 import type {
   JobData,
   JobRecord,
@@ -59,13 +60,14 @@ function isRedisConnection(config?: RedisConfig): config is Redis {
  * Accepts either a Redis instance or Redis options.
  *
  * When passing options, the adapter will create and manage
- * the connection lifecycle (closing it on destroy).
+ * the connection lifecycle (closing it on destroy), and logs the
+ * connection errors through the QueueManager logger.
  *
  * When passing a Redis instance, the caller is responsible for
- * managing the connection lifecycle.
+ * managing the connection lifecycle and listening to its errors.
  */
 export function redis(config?: RedisConfig) {
-  return () => {
+  return ({ logger }: AdapterFactoryContext = { logger: consoleLogger }) => {
     if (isRedisConnection(config)) {
       return new RedisAdapter(config, false)
     }
@@ -79,6 +81,11 @@ export function redis(config?: RedisConfig) {
     }
 
     const connection = new Redis(options)
+    // Without a listener, ioredis writes every reconnection error to stderr.
+    connection.on('error', (error) => {
+      logger.error({ err: error }, 'Redis connection error')
+    })
+
     return new RedisAdapter(connection, true)
   }
 }
