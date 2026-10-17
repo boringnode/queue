@@ -144,6 +144,27 @@ test.group('SyncAdapter', (group) => {
     assert.equal((logger.logs[0].obj?.err as Error).message, 'failed hook exploded')
   })
 
+  test('destroy() should cancel delayed jobs that have not run yet', async ({ assert }) => {
+    let executions = 0
+
+    class DelayedSyncJob extends Job<Record<string, never>> {
+      async execute() {
+        executions++
+      }
+    }
+
+    await QueueManager.init({ default: 'sync', adapters: { sync: sync() } })
+    Locator.register('DelayedSyncJob', DelayedSyncJob)
+    const adapter = QueueManager.use()
+    const job = { id: 'delayed-sync-job', name: 'DelayedSyncJob', payload: {}, attempts: 0 }
+
+    await adapter.pushLaterOn('default', job, 20)
+    await adapter.destroy()
+    await sleep(40)
+
+    assert.equal(executions, 0)
+  })
+
   test('should ignore .dedup() and execute every dispatch inline', async ({ assert }) => {
     const executedPayloads: Array<{ n: number }> = []
 

@@ -622,6 +622,8 @@ Use the `sync` adapter for tests and lightweight local development only.
 - Retries are executed inline, not by a background worker.
 - If you configure backoff, the adapter will `sleep` between attempts.
 - This means the caller can stay blocked for the full retry duration.
+- A delayed job (`.in()`) runs in a timer of the process. `QueueManager.destroy()` cancels the
+  delayed jobs that have not run yet.
 
 Example: with `maxRetries: 3` and an exponential backoff of `1s`, `2s`, `4s`,
 the request or command that dispatched the job can stay busy for about 7 seconds

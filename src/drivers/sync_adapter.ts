@@ -22,6 +22,8 @@ export function sync() {
  * Pop/complete/fail/retry are not supported as jobs are executed synchronously.
  */
 export class SyncAdapter implements Adapter {
+  #pendingTimeouts = new Set<NodeJS.Timeout>()
+
   setWorkerId(_workerId: string): void {}
 
   push(jobData: JobData): Promise<void> {
@@ -36,8 +38,13 @@ export class SyncAdapter implements Adapter {
     return this.pushLaterOn('default', jobData, delay)
   }
 
+  /**
+   * Run the job after the delay, in this process. `destroy()` cancels the
+   * jobs whose delay has not elapsed.
+   */
   pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<void> {
-    setTimeout(() => {
+    const timeout = setTimeout(() => {
+      this.#pendingTimeouts.delete(timeout)
       void this.#execute(jobData, queue).catch((error) => {
         QueueManager.getLogger().error(
           { err: error, jobId: jobData.id, jobName: jobData.name, queue },
@@ -45,6 +52,7 @@ export class SyncAdapter implements Adapter {
         )
       })
     }, delay)
+    this.#pendingTimeouts.add(timeout)
 
     return Promise.resolve()
   }
@@ -116,6 +124,11 @@ export class SyncAdapter implements Adapter {
   }
 
   destroy(): Promise<void> {
+    for (const timeout of this.#pendingTimeouts) {
+      clearTimeout(timeout)
+    }
+
+    this.#pendingTimeouts.clear()
     return Promise.resolve()
   }
 
