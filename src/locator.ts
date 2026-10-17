@@ -2,6 +2,7 @@ import { Job } from './job.js'
 import * as errors from './exceptions.js'
 import type { JobClass } from './types/main.js'
 import debug from './debug.js'
+import { consoleLogger, type Logger } from './logger.js'
 import { glob } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -20,6 +21,8 @@ type LocatorEntry = {
 
 type RegisterFromGlobOptions = {
   hotReload?: boolean
+  /** Receives the files that fail to load. Defaults to the console. */
+  logger?: Logger
 }
 
 /**
@@ -70,7 +73,8 @@ class LocatorSingleton {
    * Auto-register job classes from files matching glob patterns.
    *
    * Each file should have a default export that is a Job class.
-   * The class name is used as the registration name.
+   * The class name is used as the registration name. A file that fails to
+   * import is logged at the `error` level and skipped.
    *
    * @param patterns - Glob patterns to match job files
    * @returns Number of jobs successfully registered
@@ -88,7 +92,21 @@ class LocatorSingleton {
     patterns: string[],
     options: RegisterFromGlobOptions = {}
   ): Promise<number> {
+    const { registered } = await this.loadFromGlob(patterns, options)
+    return registered
+  }
+
+  /**
+   * Like `registerFromGlob()`, but also counts the matched files that failed
+   * to load, so a caller can tell them from patterns that match nothing.
+   */
+  async loadFromGlob(
+    patterns: string[],
+    options: RegisterFromGlobOptions = {}
+  ): Promise<{ registered: number; failed: number }> {
+    const logger = options.logger ?? consoleLogger
     let registered = 0
+    let failed = 0
 
     for (const pattern of patterns) {
       debug('registering jobs from glob pattern: %s', pattern)
@@ -110,12 +128,13 @@ class LocatorSingleton {
             registered++
           }
         } catch (error) {
-          console.warn(`Failed to load job from ${file}:`, error)
+          failed++
+          logger.error({ err: error as Error, file }, `Failed to load job from ${file}`)
         }
       }
     }
 
-    return registered
+    return { registered, failed }
   }
 
   /**

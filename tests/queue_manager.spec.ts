@@ -1,3 +1,4 @@
+import { join } from 'node:path'
 import { test } from '@japa/runner'
 import * as errors from '../src/exceptions.js'
 import { QueueManager } from '../src/queue_manager.js'
@@ -187,6 +188,25 @@ test.group('QueueManager', () => {
     assert.equal(logger.logs.length, 1)
     assert.equal(logger.logs[0].level, 'warn')
     assert.include(logger.logs[0].message, 'No jobs found for locations')
+  })
+
+  test('should log a job file that fails to load through the logger', async ({ assert, fs }) => {
+    const logger = new MemoryLogger()
+    await fs.create('broken_job.js', `throw new Error('Syntax mistake')`)
+    const brokenFile = join(fs.basePath, 'broken_job.js')
+
+    await QueueManager.init({
+      default: 'sync',
+      adapters: { sync: sync() },
+      locations: [brokenFile],
+      logger,
+    })
+
+    // The file matched: no warning to check the glob patterns.
+    assert.lengthOf(logger.logs, 1)
+    assert.equal(logger.logs[0].level, 'error')
+    assert.include(logger.logs[0].message, `Failed to load job from ${brokenFile}`)
+    assert.equal((logger.logs[0].obj?.err as Error).message, 'Syntax mistake')
   })
 
   test('should load jobs from configured locations', async ({ assert, cleanup }) => {
