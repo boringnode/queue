@@ -148,6 +148,9 @@ export class Worker {
    * Run one Worker per process: starting a second one while another runs
    * throws, since initializing it would destroy the Adapters of the first.
    * A Worker holds the process from `start()` until its `stop()` completes.
+   * `start()` resolves once that stop has finalized every Job. The Adapter
+   * connections stay open: call `QueueManager.destroy()` afterwards to let
+   * the process exit.
    *
    * @param queues - Queue names to process in priority order
    */
@@ -178,6 +181,7 @@ export class Worker {
     }
 
     await session.start()
+    await this.#stopOperation
   }
 
   #reserveProcess(): void {

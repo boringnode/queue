@@ -528,6 +528,7 @@ test.group('WorkerSession', () => {
     await adapter.acquisitions.waitForSettled(1)
     await setTimeout(0)
     await session.stop()
+    await setTimeout(0)
 
     assert.isTrue(start.settled)
   })
@@ -542,6 +543,7 @@ test.group('WorkerSession', () => {
     await adapter.acquisitions.waitForSettled(1)
     await setTimeout(0)
     await session.stop()
+    await setTimeout(0)
 
     assert.isTrue(start.settled)
   })

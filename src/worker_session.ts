@@ -148,6 +148,10 @@ export class WorkerSession {
         this.#startCompletion = undefined
       }
     }
+
+    // The loop ends as soon as stop() begins: wait until it has drained the
+    // pool, so start() resolves only once the session is quiescent.
+    await this.#stopOperation
   }
 
   process(): AsyncGenerator<WorkerCycle, void, unknown> {

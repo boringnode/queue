@@ -94,10 +94,14 @@ await SendEmailJob.dispatch({ to: 'user@example.com' })
 ### 4. Start a Worker
 
 ```typescript
-import { Worker } from '@boringnode/queue'
+import { QueueManager, Worker } from '@boringnode/queue'
 
 const worker = new Worker(config)
 await worker.start(['default', 'email'])
+
+// start() resolves once the Worker has stopped (SIGTERM, SIGINT, or worker.stop())
+// and finished its jobs. Close the Adapter connections so the process can exit.
+await QueueManager.destroy()
 ```
 
 ## Hot Reloading Jobs
@@ -850,6 +854,11 @@ Run one Worker per process. A Worker listens on one Adapter, so to process the q
 Adapters, start one process per Adapter. Starting a second Worker while another one runs in the
 same process throws `E_WORKER_ALREADY_RUNNING`: initializing it would destroy the Adapters of the
 first one. A Worker holds the process until its `stop()` completes.
+
+`await worker.start()` resolves once the Worker is stopped, by SIGINT/SIGTERM when
+`gracefulShutdown` is enabled or by `worker.stop()`, and every running job is finalized. Stopping a
+Worker does not close the Adapter connections (Redis, Knex, Kysely), which keep the process alive:
+call `await QueueManager.destroy()` after `await worker.start()` to let the process exit.
 
 A job is stalled when its worker stops renewing it for longer than `stalledThreshold`, usually
 because the process crashed. A stalled job goes back to the queue up to `maxStalledCount` times.

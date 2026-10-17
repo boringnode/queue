@@ -2972,6 +2972,32 @@ test.group('Worker | one per process', (group) => {
     await otherRun
   })
 
+  test('start() resolves only once stop() has finalized every job', async ({ assert, cleanup }) => {
+    class BlockedJob extends Job {
+      async execute() {}
+    }
+
+    const fixture = createWorkerFixture({ worker: { concurrency: 2 } })
+    fixture.adapter.finalizations.block(1, 2)
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(BlockedJob, { id: 'first-job' })
+    await fixture.push(BlockedJob, { id: 'second-job' })
+    const running = trackPromise(fixture.start())
+    await fixture.adapter.finalizations.waitForStarted(2)
+
+    const stop = trackPromise(fixture.worker.stop())
+    fixture.adapter.finalizations.release(1)
+    await fixture.adapter.finalizations.waitForSettled(1)
+    await setTimeout(10)
+
+    assert.isFalse(running.settled, 'start() must wait until the stop has drained every job')
+
+    fixture.adapter.finalizations.release(2)
+    await running.promise
+    assert.isTrue(stop.settled)
+  })
+
   test('a restart requested during stop() reserves the process again', async ({
     assert,
     cleanup,
