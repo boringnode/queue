@@ -172,6 +172,8 @@ export class Worker {
 
       if (shutdownGeneration !== this.#shutdownGeneration) return
 
+      // From here, initializing QueueManager again would destroy our Adapters.
+      QueueManager.reserveForWorker(this)
       session = this.#useSession(queues)
       this.#setupGracefulShutdown()
     } catch (error) {
@@ -196,6 +198,7 @@ export class Worker {
     if (Worker.#running === this) {
       Worker.#running = undefined
     }
+    QueueManager.releaseWorker(this)
   }
 
   /**

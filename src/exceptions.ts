@@ -62,6 +62,13 @@ export const E_WORKER_ALREADY_RUNNING = createError(
   500
 )
 
+export const E_WORKER_RUNNING = createError(
+  'Cannot initialize QueueManager while a Worker runs in this process: it would destroy the ' +
+    'Adapters of the Worker. The Worker already initialized QueueManager with its config.',
+  'E_WORKER_RUNNING',
+  500
+)
+
 export const E_QUEUE_NOT_INITIALIZED = createError(
   'QueueManager is not initialized. Call QueueManager.init() before using it.',
   'E_QUEUE_NOT_INITIALIZED',

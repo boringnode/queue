@@ -902,7 +902,9 @@ const config = {
 Run one Worker per process. A Worker listens on one Adapter, so to process the queues of several
 Adapters, start one process per Adapter. Starting a second Worker while another one runs in the
 same process throws `E_WORKER_ALREADY_RUNNING`: initializing it would destroy the Adapters of the
-first one. A Worker holds the process until its `stop()` completes.
+first one. A Worker holds the process until its `stop()` completes. For the same reason,
+`QueueManager.init()` throws `E_WORKER_RUNNING` while a Worker runs: the Worker already initialized
+QueueManager with its config, so dispatch jobs from the Worker process without calling `init()`.
 
 `await worker.start()` resolves once the Worker is stopped, by SIGINT/SIGTERM when
 `gracefulShutdown` is enabled or by `worker.stop()`, and every running job is finalized. Stopping a

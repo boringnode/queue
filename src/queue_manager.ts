@@ -73,6 +73,8 @@ class QueueManagerSingleton {
   #locations: string[] = []
   #hotReload = false
   #fakeState?: QueueManagerFakeState
+  /** The Worker running on the current configuration, see `reserveForWorker()`. */
+  #worker?: object
 
   /**
    * Initialize the queue system with the given configuration.
@@ -101,6 +103,10 @@ class QueueManagerSingleton {
   async init(config: QueueManagerConfig) {
     debug('initializing queue manager with config: %O', config)
 
+    if (this.#worker) {
+      throw new errors.E_WORKER_RUNNING()
+    }
+
     this.#validateConfig(config)
 
     await this.#cleanupBeforeReinitialization()
@@ -122,6 +128,24 @@ class QueueManagerSingleton {
     this.#initialized = true
 
     return this
+  }
+
+  /**
+   * Keep the current configuration and its Adapters for a running Worker:
+   * until `releaseWorker()`, `init()` throws `E_WORKER_RUNNING` instead of
+   * destroying them. Used by `Worker.start()`.
+   */
+  reserveForWorker(worker: object): void {
+    this.#worker = worker
+  }
+
+  /**
+   * Release the reservation of `reserveForWorker()`.
+   */
+  releaseWorker(worker: object): void {
+    if (this.#worker === worker) {
+      this.#worker = undefined
+    }
   }
 
   /**
