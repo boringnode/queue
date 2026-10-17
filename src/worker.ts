@@ -1,7 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import debug from './debug.js'
 import { parse } from './utils.js'
-import { QueueManager } from './queue_manager.js'
+import {
+  QueueManager,
+  initQueueManagerForWorker,
+  releaseQueueManager,
+  reserveQueueManager,
+} from './queue_manager.js'
 import { jobDispatchRuntime } from './job_dispatch_runtime.js'
 import {
   WorkerSession,
@@ -128,7 +133,7 @@ export class Worker {
   async #initialize(): Promise<void> {
     debug('initializing worker %s', this.#id)
 
-    await QueueManager.init(this.#config)
+    await initQueueManagerForWorker(this, this.#config)
 
     this.#adapter = QueueManager.use(this.#config.worker?.adapter)
     this.#adapter.setWorkerId(this.#id)
@@ -172,8 +177,6 @@ export class Worker {
 
       if (shutdownGeneration !== this.#shutdownGeneration) return
 
-      // From here, initializing QueueManager again would destroy our Adapters.
-      QueueManager.reserveForWorker(this)
       session = this.#useSession(queues)
       this.#setupGracefulShutdown()
     } catch (error) {
@@ -192,13 +195,15 @@ export class Worker {
     }
 
     Worker.#running = this
+    // Before any await: initializing QueueManager again would destroy our Adapters.
+    reserveQueueManager(this)
   }
 
   #releaseProcess(): void {
     if (Worker.#running === this) {
       Worker.#running = undefined
     }
-    QueueManager.releaseWorker(this)
+    releaseQueueManager(this)
   }
 
   /**

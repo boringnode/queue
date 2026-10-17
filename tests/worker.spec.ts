@@ -2967,7 +2967,10 @@ test.group('Worker | one per process', (group) => {
     const running = worker.start(['default'])
     await setTimeout(20)
 
-    await assert.rejects(() => QueueManager.init(config(adapter)), errors.E_WORKER_RUNNING)
+    await assert.rejects(
+      () => QueueManager.init(config(adapter)),
+      errors.E_INIT_WHILE_WORKER_RUNNING
+    )
     assert.isFalse(adapter.destroyed)
 
     await adapter.push({ id: 'after-init', name: 'CountedJob', payload: {}, attempts: 0 })
@@ -2979,6 +2982,27 @@ test.group('Worker | one per process', (group) => {
 
     // The stopped Worker no longer needs the Adapters.
     await QueueManager.init(config(new MemoryAdapter()))
+  })
+
+  test('QueueManager.init() rejects right after start() of an initialized Worker', async ({
+    assert,
+    cleanup,
+  }) => {
+    const adapter = new DestroyAwareMemoryAdapter()
+    const worker = new Worker(config(adapter))
+    cleanup(() => worker.stop())
+
+    await worker.init()
+    const running = worker.start(['default'])
+
+    await assert.rejects(
+      () => QueueManager.init(config(adapter)),
+      errors.E_INIT_WHILE_WORKER_RUNNING
+    )
+    assert.isFalse(adapter.destroyed)
+
+    await worker.stop()
+    await running
   })
 
   test('start() accepts another Worker once the first one stopped', async ({ cleanup }) => {

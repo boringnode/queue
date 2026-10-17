@@ -46,7 +46,37 @@ type QueueManagerFakeState = {
  *   adapters: {
  *     redis: redis({ host: 'localhost' }),
  *   },
- *   locations: ['./jobs/**\/*.js'],
+ *   locations: ['./jobs/**
+ * The Worker that holds the QueueManager configuration and its Adapters,
+ * from `worker.start()` until its stop completes. Module state, not exported
+ * by the package: only the Worker reserves and releases it.
+ */
+const workerReservation: { owner?: object; initializing?: object } = {}
+
+/** Reserve QueueManager for a starting Worker: `init()` rejects meanwhile. */
+export function reserveQueueManager(worker: object): void {
+  workerReservation.owner = worker
+}
+
+export function releaseQueueManager(worker: object): void {
+  if (workerReservation.owner === worker) workerReservation.owner = undefined
+}
+
+/**
+ * Initialize QueueManager on behalf of the Worker that reserved it. `init()`
+ * checks the reservation before its first await, so the exemption only
+ * covers this call, not a concurrent `init()` from the application.
+ */
+export function initQueueManagerForWorker(worker: object, config: QueueManagerConfig) {
+  workerReservation.initializing = worker
+  try {
+    return QueueManager.init(config)
+  } finally {
+    workerReservation.initializing = undefined
+  }
+}
+
+/**\/*.js'],
  *   retry: {
  *     maxRetries: 3,
  *     backoff: exponentialBackoff(),
@@ -73,8 +103,6 @@ class QueueManagerSingleton {
   #locations: string[] = []
   #hotReload = false
   #fakeState?: QueueManagerFakeState
-  /** The Worker running on the current configuration, see `reserveForWorker()`. */
-  #worker?: object
 
   /**
    * Initialize the queue system with the given configuration.
@@ -103,8 +131,9 @@ class QueueManagerSingleton {
   async init(config: QueueManagerConfig) {
     debug('initializing queue manager with config: %O', config)
 
-    if (this.#worker) {
-      throw new errors.E_WORKER_RUNNING()
+    // Synchronous, before the first await: see initQueueManagerForWorker().
+    if (workerReservation.owner && workerReservation.owner !== workerReservation.initializing) {
+      throw new errors.E_INIT_WHILE_WORKER_RUNNING()
     }
 
     this.#validateConfig(config)
@@ -128,24 +157,6 @@ class QueueManagerSingleton {
     this.#initialized = true
 
     return this
-  }
-
-  /**
-   * Keep the current configuration and its Adapters for a running Worker:
-   * until `releaseWorker()`, `init()` throws `E_WORKER_RUNNING` instead of
-   * destroying them. Used by `Worker.start()`.
-   */
-  reserveForWorker(worker: object): void {
-    this.#worker = worker
-  }
-
-  /**
-   * Release the reservation of `reserveForWorker()`.
-   */
-  releaseWorker(worker: object): void {
-    if (this.#worker === worker) {
-      this.#worker = undefined
-    }
   }
 
   /**

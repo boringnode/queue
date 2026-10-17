@@ -7,12 +7,12 @@ in the same process, for example to dispatch jobs from the Worker process, it de
 of the Worker: the Worker then failed every cycle (`Connection is closed` with Redis) and never ran
 another job.
 
-`QueueManager.init()` now throws the new `E_WORKER_RUNNING` error while a Worker started with
-`worker.start()` runs in the process, and changes nothing. The Worker already initialized
+`QueueManager.init()` now throws the new `E_INIT_WHILE_WORKER_RUNNING` error, and changes nothing,
+from the moment `worker.start()` is called until the Worker has stopped. The Worker initializes
 QueueManager with its config: dispatch jobs without calling `init()`. Once the Worker has stopped,
 `init()` works again.
 
 ## Breaking Changes
 
 Code that calls `QueueManager.init()` while a Worker runs in the same process now gets
-`E_WORKER_RUNNING` instead of silently breaking the Worker. Remove that call.
+`E_INIT_WHILE_WORKER_RUNNING` instead of silently breaking the Worker. Remove that call.
