@@ -42,6 +42,7 @@ test.group('Adapter | Kysely (SQLite)', (group) => {
 
   registerDriverTestSuite({
     test,
+    rejectsDuplicateJobIds: true,
     createAdapter: () => {
       adapter = new KyselyAdapter({ connection, dialect: 'sqlite' })
       return adapter
@@ -206,6 +207,7 @@ test.group('Adapter | Kysely (PostgreSQL)', (group) => {
 
   registerDriverTestSuite({
     test,
+    rejectsDuplicateJobIds: true,
     createAdapter: () => {
       adapter = new KyselyAdapter({
         connection,
@@ -274,6 +276,7 @@ test.group('Adapter | Kysely (MySQL)', (group) => {
 
   registerDriverTestSuite({
     test,
+    rejectsDuplicateJobIds: true,
     createAdapter: () => {
       adapter = new KyselyAdapter({
         connection,

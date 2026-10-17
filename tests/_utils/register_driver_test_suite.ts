@@ -16,6 +16,12 @@ interface DriverTestSuiteOptions {
    * @default true
    */
   supportsAtomicDedup?: boolean
+  /**
+   * Whether storing a job id that is already stored rejects, as the SQL
+   * primary key does. Then a batch holding such an id must insert nothing.
+   * @default false
+   */
+  rejectsDuplicateJobIds?: boolean
 }
 
 /** A lease on a job that was never acquired. */
@@ -2375,20 +2381,16 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.equal(await adapter.sizeOf('test-queue'), 14_000)
   }).timeout(30_000)
 
-  test('pushManyOn should insert every job of a large batch or none', async ({ assert }) => {
-    const adapter = await options.createAdapter()
-    const jobs = largeBatch(2_000)
-    await adapter.pushOn('test-queue', jobs.at(-1)!)
+  if (options.rejectsDuplicateJobIds) {
+    test('pushManyOn should insert nothing when its last chunk fails', async ({ assert }) => {
+      const adapter = await options.createAdapter()
+      const jobs = largeBatch(2_000)
+      await adapter.pushOn('test-queue', jobs.at(-1)!)
 
-    // SQL adapters reject the duplicate id: none of the batch may remain.
-    // Other adapters accept it.
-    const rejected = await adapter.pushManyOn('test-queue', jobs).then(
-      () => false,
-      () => true
-    )
-
-    if (rejected) assert.equal(await adapter.sizeOf('test-queue'), 1)
-  }).timeout(30_000)
+      await assert.rejects(() => adapter.pushManyOn('test-queue', jobs))
+      assert.equal(await adapter.sizeOf('test-queue'), 1)
+    }).timeout(30_000)
+  }
 
   test('pushManyOn with empty array should not error', async ({ assert }) => {
     const adapter = await options.createAdapter()
