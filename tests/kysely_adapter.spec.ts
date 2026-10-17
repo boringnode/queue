@@ -48,6 +48,35 @@ test.group('Adapter | Kysely (SQLite)', (group) => {
     },
   })
 
+  test('pushManyOn joins the transaction it was given as connection', async ({ assert }) => {
+    const jobs = Array.from({ length: 600 }, (_, index) => ({
+      id: `in-transaction-${index}`,
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+    }))
+
+    const failure = await connection
+      .transaction()
+      .execute(async (trx) => {
+        const transactional = new KyselyAdapter<QueueDatabase>({
+          connection: trx,
+          dialect: 'sqlite',
+        })
+        await transactional.pushManyOn('default', jobs)
+        assert.equal(await transactional.sizeOf('default'), 600)
+        throw new Error('roll back')
+      })
+      .then(
+        () => null,
+        (error: Error) => error.message
+      )
+
+    assert.equal(failure, 'roll back')
+    adapter = new KyselyAdapter({ connection, dialect: 'sqlite' })
+    assert.equal(await adapter.sizeOf('default'), 0)
+  })
+
   test('dedup should reject a job id that is already stored', async ({ assert }) => {
     adapter = new KyselyAdapter({ connection, dialect: 'sqlite' })
     const job = { id: 'same-id', name: 'TestJob', payload: {}, attempts: 0 }

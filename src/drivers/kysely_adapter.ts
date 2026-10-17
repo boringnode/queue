@@ -666,15 +666,22 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
       score: calculateScore(job.priority ?? DEFAULT_PRIORITY, now),
     }))
 
-    // Inserts in chunks within one transaction: all jobs or none.
-    await this.#connection.transaction().execute(async (trx) => {
+    // Inserts in chunks within one transaction: all jobs or none. A
+    // connection that is already a transaction cannot open another one.
+    const insertChunks = async (connection: InternalKyselyConnection<DB>) => {
       for (let start = 0; start < rows.length; start += SQL_INSERT_CHUNK_SIZE) {
-        await this.#jobs(trx)
+        await this.#jobs(connection)
           .insertInto(this.#jobsTable)
           .values(rows.slice(start, start + SQL_INSERT_CHUNK_SIZE))
           .execute()
       }
-    })
+    }
+
+    if (this.#connection.isTransaction) {
+      await insertChunks(this.#connection)
+    } else {
+      await this.#connection.transaction().execute(insertChunks)
+    }
   }
 
   async size(): Promise<number> {

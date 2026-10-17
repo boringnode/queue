@@ -2191,6 +2191,31 @@ test.group('Adapter | Knex (SQLite)', (group) => {
     },
   })
 
+  test('pushManyOn joins the transaction it was given as connection', async ({ assert }) => {
+    const jobs = Array.from({ length: 600 }, (_, index) => ({
+      id: `in-transaction-${index}`,
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+    }))
+
+    const failure = await connection
+      .transaction(async (trx) => {
+        const transactional = new KnexAdapter({ connection: trx })
+        await transactional.pushManyOn('default', jobs)
+        assert.equal(await transactional.sizeOf('default'), 600)
+        throw new Error('roll back')
+      })
+      .then(
+        () => null,
+        (error: Error) => error.message
+      )
+
+    assert.equal(failure, 'roll back')
+    adapter = new KnexAdapter({ connection })
+    assert.equal(await adapter.sizeOf('default'), 0)
+  })
+
   test('addDedupColumns should leave a dedup slot to its latest job', async ({ assert }) => {
     await assertDedupMigration(assert, connection, 'queue_jobs')
   })
