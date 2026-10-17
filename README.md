@@ -100,7 +100,8 @@ const worker = new Worker(config)
 await worker.start(['default', 'email'])
 
 // start() resolves once the Worker has stopped (SIGTERM, SIGINT, or worker.stop())
-// and finished its jobs. Close the Adapter connections so the process can exit.
+// and finished its jobs. Close the Adapter connections so the process can exit,
+// then the database connections your application owns, if any.
 await QueueManager.destroy()
 ```
 
@@ -321,10 +322,14 @@ same on every adapter.
 Query job history:
 
 ```typescript
-const job = await adapter.getJob('job-id', 'queue-name')
-console.log(job.status) // 'completed' | 'failed'
-console.log(job.finishedAt) // timestamp
-console.log(job.error) // error message (if failed)
+const adapter = QueueManager.use()
+const job = await adapter.getJob('job-id', 'queue-name') // null once removed
+
+if (job) {
+  console.log(job.status) // 'completed' | 'failed'
+  console.log(job.finishedAt) // timestamp
+  console.log(job.error) // error message (if failed)
+}
 ```
 
 </details>
@@ -938,6 +943,17 @@ dispatch jobs from the Worker process without calling `init()`.
 `gracefulShutdown` is enabled or by `worker.stop()`, and every running job is finalized. Stopping a
 Worker does not close the Adapter connections (Redis, Knex, Kysely), which keep the process alive:
 call `await QueueManager.destroy()` after `await worker.start()` to let the process exit.
+
+`QueueManager.destroy()` only closes the connections the Adapters created from options. A connection
+your application passed in stays open: an ioredis instance, a Knex instance, or a Kysely instance
+(always owned by the application). Close it after `QueueManager.destroy()`, or the process waits
+for it: a `pg` pool keeps it alive until `idleTimeoutMillis`, and forever when it is `0`.
+
+```typescript
+await worker.start(['default'])
+await QueueManager.destroy()
+await db.destroy() // the application's Kysely or Knex instance
+```
 
 A job is stalled when its worker stops renewing it for longer than `stalledThreshold`, usually
 because the process crashed. A stalled job goes back to the queue up to `maxStalledCount` times.
