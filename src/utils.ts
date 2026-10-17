@@ -1,8 +1,13 @@
 import { randomUUID } from 'node:crypto'
+import { setTimeout } from 'node:timers/promises'
 import { parse as parseDuration } from '@lukeed/ms'
 import type { Duration, JobRetention } from './types/main.js'
 import * as errors from './exceptions.js'
-import { PRIORITY_SCORE_MULTIPLIER } from './constants.js'
+import {
+  FINALIZATION_RETRIES,
+  FINALIZATION_RETRY_DELAY,
+  PRIORITY_SCORE_MULTIPLIER,
+} from './constants.js'
 
 export interface ResolvedRetention {
   keep: boolean
@@ -110,4 +115,19 @@ export function isDeadlockError(error: unknown): boolean {
 
   const { code, errno } = error as { code?: unknown; errno?: unknown }
   return code === 'ER_LOCK_DEADLOCK' || errno === 1213 || code === '40P01' || code === '40001'
+}
+
+/**
+ * Run a database operation, and run it again, a bounded number of times,
+ * when the database rolled it back as a deadlock victim.
+ */
+export async function retryOnDeadlock<T>(operation: () => Promise<T>): Promise<T> {
+  for (let retry = 1; ; retry++) {
+    try {
+      return await operation()
+    } catch (error) {
+      if (retry > FINALIZATION_RETRIES || !isDeadlockError(error)) throw error
+      await setTimeout(FINALIZATION_RETRY_DELAY * retry)
+    }
+  }
 }

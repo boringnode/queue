@@ -8,6 +8,7 @@ import type {
   StalledJobsRecovery,
 } from '../contracts/adapter.js'
 import type {
+  AdapterFactoryContext,
   JobData,
   JobRecord,
   JobRetention,
@@ -17,12 +18,14 @@ import type {
   ScheduleListOptions,
 } from '../types/main.js'
 import debug from '../debug.js'
+import { consoleLogger, type Logger } from '../logger.js'
 import { DEFAULT_PRIORITY, SQL_INSERT_CHUNK_SIZE } from '../constants.js'
 import {
   calculateScore,
   createLeaseToken,
   epochToDate,
   isDeadlockError,
+  retryOnDeadlock,
   resolveRetention,
   resolveSchedulePayload,
 } from '../utils.js'
@@ -85,6 +88,11 @@ export interface KyselyAdapterOptions {
   dialect: KyselyDialect
   tableName?: string
   schedulesTableName?: string
+  /**
+   * Receives the retention prunings that fail. Defaults to the QueueManager
+   * logger when created through `kysely()`, to the console otherwise.
+   */
+  logger?: Logger
 }
 
 export interface KyselyAdapterConfig<DB> extends KyselyAdapterOptions {
@@ -115,7 +123,8 @@ type ScheduleRow = {
  * The application owns the supplied Kysely connection and its lifecycle.
  */
 export function kysely<DB>(connection: Kysely<DB>, options: KyselyAdapterOptions) {
-  return () => new KyselyAdapter({ ...options, connection })
+  return (context?: AdapterFactoryContext) =>
+    new KyselyAdapter({ logger: context?.logger, ...options, connection })
 }
 
 /** Persistent queue adapter backed by a caller-owned Kysely connection. */
@@ -124,6 +133,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   readonly #dialect: KyselyDialect
   readonly #jobsTable: string
   readonly #schedulesTable: string
+  readonly #logger: Logger
   #workerId: string = ''
   #scheduleDatesCheck: Promise<void> | undefined
 
@@ -132,6 +142,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     this.#dialect = config.dialect
     this.#jobsTable = config.tableName ?? 'queue_jobs'
     this.#schedulesTable = config.schedulesTableName ?? 'queue_schedules'
+    this.#logger = config.logger ?? consoleLogger
   }
 
   setWorkerId(workerId: string): void {
@@ -296,7 +307,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
 
     if (result.numUpdatedRows === 0n) return false
 
-    await this.#pruneHistory(this.#connection, queue, 'completed', maxAge, maxCount, now)
+    await this.#pruneHistoryAfterFinalization(queue, 'completed', maxAge, maxCount, now)
     return true
   }
 
@@ -337,7 +348,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
 
     if (result.numUpdatedRows === 0n) return false
 
-    await this.#pruneHistory(this.#connection, queue, 'failed', maxAge, maxCount, now)
+    await this.#pruneHistoryAfterFinalization(queue, 'failed', maxAge, maxCount, now)
     return true
   }
 
@@ -356,6 +367,31 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
       data: JSON.parse(row.data) as JobData,
       finishedAt: row.finished_at == null ? undefined : Number(row.finished_at),
       error: row.error ?? undefined,
+    }
+  }
+
+  /**
+   * Prune the history of a queue after a finalization, which is committed
+   * already: a failed pruning must neither undo it nor fail the call. A
+   * deadlock runs the pruning again, a bounded number of times. Another
+   * error is logged, and the next finalization on the queue prunes again.
+   */
+  async #pruneHistoryAfterFinalization(
+    queue: string,
+    status: 'completed' | 'failed',
+    maxAge: number,
+    maxCount: number,
+    now: number
+  ): Promise<void> {
+    try {
+      await retryOnDeadlock(() =>
+        this.#pruneHistory(this.#connection, queue, status, maxAge, maxCount, now)
+      )
+    } catch (error) {
+      this.#logger.error(
+        { err: error as Error, queue, status },
+        `Failed to prune the ${status} jobs of queue "${queue}"`
+      )
     }
   }
 

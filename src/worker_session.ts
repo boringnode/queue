@@ -1,7 +1,7 @@
 import { setTimeout } from 'node:timers/promises'
 import debug from './debug.js'
 import * as errors from './exceptions.js'
-import { isDeadlockError, parse } from './utils.js'
+import { parse, retryOnDeadlock } from './utils.js'
 import { JobPool, type PoolEntry } from './job_pool.js'
 import { WorkerHeartbeat, type HeartbeatOperationWrapper } from './worker_heartbeat.js'
 import { Locator } from './locator.js'
@@ -9,12 +9,7 @@ import type { SingleJobDispatchRequest } from './job_dispatch_runtime.js'
 import type { Adapter, AcquiredJob } from './contracts/adapter.js'
 import type { JobExecutionOutcome, JobExecutionRuntime } from './job_runtime.js'
 import type { Logger, WorkerCycle } from './types/main.js'
-import {
-  DEFAULT_ERROR_RETRY_DELAY,
-  FINALIZATION_RETRIES,
-  FINALIZATION_RETRY_DELAY,
-  UNKNOWN_JOB_RETRY_DELAY,
-} from './constants.js'
+import { DEFAULT_ERROR_RETRY_DELAY, UNKNOWN_JOB_RETRY_DELAY } from './constants.js'
 
 type StartedCycle = Extract<WorkerCycle, { type: 'started' }>
 type SessionMode = 'continuous' | 'manual'
@@ -586,17 +581,8 @@ export class WorkerSession {
    * completion contending with another worker's lease renewal must not leave
    * the job active, to run again once recovered as stalled.
    */
-  async #finalize(operation: () => Promise<boolean>): Promise<boolean> {
-    for (let retry = 1; ; retry++) {
-      try {
-        return await this.#wrapInternal(operation)
-      } catch (error) {
-        if (retry > FINALIZATION_RETRIES || !isDeadlockError(error)) throw error
-
-        debug('worker %s: finalization deadlocked, retry %d', this.#workerId, retry)
-        await setTimeout(FINALIZATION_RETRY_DELAY * retry)
-      }
-    }
+  #finalize(operation: () => Promise<boolean>): Promise<boolean> {
+    return retryOnDeadlock(() => this.#wrapInternal(operation))
   }
 
   /**

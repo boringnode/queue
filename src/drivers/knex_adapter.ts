@@ -9,6 +9,7 @@ import type {
   StalledJobsRecovery,
 } from '../contracts/adapter.js'
 import type {
+  AdapterFactoryContext,
   DedupOutcome,
   JobData,
   JobRecord,
@@ -19,12 +20,14 @@ import type {
   ScheduleListOptions,
 } from '../types/main.js'
 import debug from '../debug.js'
+import { consoleLogger, type Logger } from '../logger.js'
 import { DEFAULT_PRIORITY, SQL_INSERT_CHUNK_SIZE } from '../constants.js'
 import {
   calculateScore,
   createLeaseToken,
   epochToDate,
   isDeadlockError,
+  retryOnDeadlock,
   resolveRetention,
   resolveSchedulePayload,
 } from '../utils.js'
@@ -42,6 +45,8 @@ export interface KnexAdapterOptions {
   tableName?: string
   schedulesTableName?: string
   ownsConnection?: boolean
+  /** Receives the retention prunings that fail. Defaults to the console. */
+  logger?: Logger
 }
 
 /**
@@ -79,10 +84,15 @@ interface ScheduleRow extends DbRow {
  * managing the connection lifecycle.
  */
 export function knex(config: KnexConfig, tableName?: string) {
-  return () => {
+  return (context?: AdapterFactoryContext) => {
     const isKnexInstance = typeof config === 'function'
     const connection = isKnexInstance ? config : KnexPkg(config)
-    return new KnexAdapter({ connection, tableName, ownsConnection: !isKnexInstance })
+    return new KnexAdapter({
+      connection,
+      tableName,
+      ownsConnection: !isKnexInstance,
+      logger: context?.logger,
+    })
   }
 }
 
@@ -95,6 +105,7 @@ export class KnexAdapter implements Adapter {
   readonly #jobsTable: string
   readonly #schedulesTable: string
   readonly #ownsConnection: boolean
+  readonly #logger: Logger
   #workerId: string = ''
   #scheduleDatesCheck: Promise<void> | undefined
 
@@ -103,6 +114,7 @@ export class KnexAdapter implements Adapter {
     this.#jobsTable = config.tableName ?? 'queue_jobs'
     this.#schedulesTable = config.schedulesTableName ?? 'queue_schedules'
     this.#ownsConnection = config.ownsConnection ?? false
+    this.#logger = config.logger ?? consoleLogger
   }
 
   setWorkerId(workerId: string): void {
@@ -332,7 +344,7 @@ export class KnexAdapter implements Adapter {
       return false
     }
 
-    await this.#pruneHistory(queue, 'completed', maxAge, maxCount, now)
+    await this.#pruneHistoryAfterFinalization(queue, 'completed', maxAge, maxCount, now)
     return true
   }
 
@@ -363,7 +375,7 @@ export class KnexAdapter implements Adapter {
       return false
     }
 
-    await this.#pruneHistory(queue, 'failed', maxAge, maxCount, now)
+    await this.#pruneHistoryAfterFinalization(queue, 'failed', maxAge, maxCount, now)
     return true
   }
 
@@ -395,6 +407,29 @@ export class KnexAdapter implements Adapter {
       data: jobData,
       finishedAt: row.finished_at ? Number(row.finished_at) : undefined,
       error: row.error || undefined,
+    }
+  }
+
+  /**
+   * Prune the history of a queue after a finalization, which is committed
+   * already: a failed pruning must neither undo it nor fail the call. A
+   * deadlock runs the pruning again, a bounded number of times. Another
+   * error is logged, and the next finalization on the queue prunes again.
+   */
+  async #pruneHistoryAfterFinalization(
+    queue: string,
+    status: 'completed' | 'failed',
+    maxAge: number,
+    maxCount: number,
+    now: number
+  ): Promise<void> {
+    try {
+      await retryOnDeadlock(() => this.#pruneHistory(queue, status, maxAge, maxCount, now))
+    } catch (error) {
+      this.#logger.error(
+        { err: error as Error, queue, status },
+        `Failed to prune the ${status} jobs of queue "${queue}"`
+      )
     }
   }
 

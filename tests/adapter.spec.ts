@@ -17,6 +17,10 @@ import { withKnexQuerySpy } from './_utils/with_knex_query_spy.js'
 import { pauseKnexDeletes } from './_utils/pause_deletes.js'
 import { registerRetentionRaceSuite } from './_utils/register_retention_race_suite.js'
 import { MemoryLogger } from './_mocks/memory_logger.js'
+import {
+  pgDeleteFailureSql,
+  registerPruneFailureSuite,
+} from './_utils/register_prune_failure_suite.js'
 import { startSqliteWriteContender } from './_utils/sqlite_write_contender.js'
 
 const KEY_PREFIX = 'boringnode::queue::test::'
@@ -2338,6 +2342,19 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     createAdapter: () => {
       adapter = new KnexAdapter({ connection, tableName, schedulesTableName })
       return adapter
+    },
+  })
+
+  registerPruneFailureSuite({
+    test,
+    createAdapter: (logger) => {
+      adapter = new KnexAdapter({ connection, tableName, schedulesTableName, logger })
+      return adapter
+    },
+    failDeletes: async (sqlstate, count) => {
+      for (const statement of pgDeleteFailureSql(tableName, sqlstate, count)) {
+        await connection.raw(statement)
+      }
     },
   })
 

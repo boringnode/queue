@@ -13,6 +13,10 @@ import {
   type QueueJobTable,
 } from '../src/drivers/kysely_adapter.js'
 import { registerDriverTestSuite } from './_utils/register_driver_test_suite.js'
+import {
+  pgDeleteFailureSql,
+  registerPruneFailureSuite,
+} from './_utils/register_prune_failure_suite.js'
 import { startSqliteWriteContender } from './_utils/sqlite_write_contender.js'
 import { pauseKyselyDeletes } from './_utils/pause_deletes.js'
 import { registerRetentionRaceSuite } from './_utils/register_retention_race_suite.js'
@@ -181,6 +185,25 @@ test.group('Adapter | Kysely (PostgreSQL)', (group) => {
         schedulesTableName,
       })
       return adapter
+    },
+  })
+
+  registerPruneFailureSuite({
+    test,
+    createAdapter: (logger) => {
+      adapter = new KyselyAdapter({
+        connection,
+        dialect: 'postgres',
+        tableName,
+        schedulesTableName,
+        logger,
+      })
+      return adapter
+    },
+    failDeletes: async (sqlstate, count) => {
+      for (const statement of pgDeleteFailureSql(tableName, sqlstate, count)) {
+        await sql.raw(statement).execute(connection)
+      }
     },
   })
 })

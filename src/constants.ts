@@ -44,8 +44,9 @@ export const UNKNOWN_JOB_RETRY_DELAY = 30_000
 export const DEFAULT_ERROR_RETRY_DELAY = '5s'
 
 /**
- * Number of times a worker retries completing, failing, or retrying a job
- * after the database chose it as a deadlock victim
+ * Number of times a worker retries completing, failing, or retrying a job,
+ * or an adapter retries a retention pruning, after the database chose it as
+ * a deadlock victim
  */
 export const FINALIZATION_RETRIES = 3
 
