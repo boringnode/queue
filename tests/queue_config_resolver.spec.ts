@@ -56,6 +56,39 @@ test.group('QueueConfigResolver', () => {
     assert.equal(config.maxRetries, 0)
   })
 
+  test('should resolve retries from defaultJobOptions with correct precedence', ({ assert }) => {
+    const globalBackoff = exponentialBackoff()
+    const queueBackoff = exponentialBackoff()
+    const resolver = QueueConfigResolver.from({
+      default: 'sync',
+      adapters: { sync: () => ({}) as any },
+      retry: { maxRetries: 9, backoff: globalBackoff },
+      defaultJobOptions: { maxRetries: 4 },
+      queues: {
+        email: { defaultJobOptions: { retry: { maxRetries: 2, backoff: queueBackoff } } },
+        sms: { retry: { maxRetries: 6 } },
+      },
+    })
+
+    assert.deepEqual(resolver.resolveRetryConfig('email', { maxRetries: 1 }), {
+      maxRetries: 1,
+      backoff: queueBackoff,
+    })
+    assert.deepEqual(resolver.resolveRetryConfig('email'), {
+      maxRetries: 2,
+      backoff: queueBackoff,
+    })
+    // A queue's own retry config is more specific than the global defaults.
+    assert.deepEqual(resolver.resolveRetryConfig('sms'), {
+      maxRetries: 6,
+      backoff: globalBackoff,
+    })
+    assert.deepEqual(resolver.resolveRetryConfig('reports'), {
+      maxRetries: 4,
+      backoff: globalBackoff,
+    })
+  })
+
   test('should resolve job retention options with correct precedence', ({ assert }) => {
     const resolver = QueueConfigResolver.from({
       default: 'sync',

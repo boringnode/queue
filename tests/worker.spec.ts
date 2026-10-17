@@ -381,6 +381,36 @@ test.group('Worker', () => {
     assert.equal(cycle.type, 'completed')
   })
 
+  test('should retry with the maxRetries of the defaultJobOptions', async ({ assert, cleanup }) => {
+    class FailingJob extends Job {
+      async execute() {
+        throw new Error('Job failed')
+      }
+    }
+
+    const fixture = createWorkerFixture({
+      config: {
+        defaultJobOptions: { maxRetries: 1 },
+        queues: { reports: { defaultJobOptions: { retry: { maxRetries: 0 } } } },
+      },
+    })
+    cleanup(() => fixture.cleanup())
+
+    await fixture.push(FailingJob, { id: 'global-default', payload: {} })
+    await fixture.push(FailingJob, { id: 'queue-default', queue: 'reports', payload: {} })
+
+    for (const queue of ['default', 'reports']) {
+      await fixture.worker.processCycle([queue]) // started
+      await fixture.worker.processCycle([queue]) // completed
+      await fixture.worker.stop()
+    }
+
+    const retried = await fixture.adapter.getJob('global-default', 'default')
+    assert.equal(retried?.status, 'pending')
+    assert.equal(retried?.data.attempts, 1)
+    assert.isNull(await fixture.adapter.getJob('queue-default', 'reports'))
+  })
+
   test('should maintain concurrency when one job is slow', async ({ assert, cleanup }) => {
     const executionOrder: string[] = []
     const startTimes: Record<string, number> = {}

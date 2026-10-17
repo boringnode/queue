@@ -651,6 +651,25 @@ export default class ReliableJob extends Job<Payload> {
 `maxRetries` can be defined directly on the job options, and `retry.backoff`
 controls the delay between attempts.
 
+They can also be set for every job, globally or per queue, in `defaultJobOptions` or in the
+dedicated `retry` config:
+
+```typescript
+await QueueManager.init({
+  // ...
+  retry: { maxRetries: 3, backoff: exponentialBackoff() },
+  defaultJobOptions: { maxRetries: 5 },
+  queues: {
+    reports: { retry: { maxRetries: 1 } },
+    emails: { defaultJobOptions: { retry: { maxRetries: 10 } } },
+  },
+})
+```
+
+`maxRetries` and `backoff` each come from the first place that sets them: the job's own options,
+then the queue's `defaultJobOptions`, then the queue's `retry`, then the global
+`defaultJobOptions`, then the global `retry`. A queue setting always wins over a global one.
+
 > With the `sync` adapter, these delays happen inline in the caller via
 > `sleep`. If a job fails repeatedly, `dispatch().run()` will take as long as
 > the total backoff duration. Use a worker-backed adapter when you do not want

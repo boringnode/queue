@@ -458,7 +458,8 @@ export interface QueueConfig {
   adapter?: string
 
   /**
-   * Retry policy applied to jobs in this queue unless overridden by job options.
+   * Retry policy applied to jobs in this queue unless overridden by the job
+   * options or the `maxRetries` / `retry` of this queue's `defaultJobOptions`.
    */
   retry?: RetryConfig
 
@@ -717,8 +718,9 @@ export interface QueueManagerConfig {
   adapters: Record<string, AdapterFactory>
 
   /**
-   * Global retry configuration applied to all jobs unless overridden by
-   * queue-level or job-level options.
+   * Global retry configuration applied to all jobs unless overridden by the
+   * job options, the queue config, or the `maxRetries` / `retry` of the
+   * global `defaultJobOptions`.
    */
   retry?: RetryConfig
 

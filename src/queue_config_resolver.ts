@@ -61,23 +61,27 @@ export class QueueConfigResolver {
   }
 
   /**
-   * Resolve the retry policy for a job using priority: job > queue > global.
+   * Resolve the retry policy for a job. `maxRetries` and `backoff` each come
+   * from the first layer that defines them:
+   *
+   * 1. the job options
+   * 2. the queue `defaultJobOptions`, then the queue `retry`
+   * 3. the global `defaultJobOptions`, then the global `retry`
    */
   resolveRetryConfig(queue: string, jobOptions?: JobOptions): RetryConfig {
     const queueConfig = this.#queueConfigs.get(queue)
-    const queueRetryConfig = queueConfig?.retry || {}
-    const jobRetryConfig = this.#normalizeJobRetryConfig(jobOptions)
+    const layers = [
+      this.#normalizeRetryConfig(jobOptions),
+      this.#normalizeRetryConfig(queueConfig?.defaultJobOptions),
+      queueConfig?.retry,
+      this.#normalizeRetryConfig(this.#globalJobOptions),
+      this.#globalRetryConfig,
+    ]
 
-    const maxRetries =
-      jobRetryConfig?.maxRetries ??
-      queueRetryConfig.maxRetries ??
-      this.#globalRetryConfig?.maxRetries ??
-      0
-
-    const backoff =
-      jobRetryConfig?.backoff || queueRetryConfig.backoff || this.#globalRetryConfig?.backoff
-
-    return { maxRetries, backoff }
+    return {
+      maxRetries: layers.find((layer) => layer?.maxRetries !== undefined)?.maxRetries ?? 0,
+      backoff: layers.find((layer) => layer?.backoff !== undefined)?.backoff,
+    }
   }
 
   /**
@@ -118,16 +122,14 @@ export class QueueConfigResolver {
   }
 
   /**
-   * Normalize job retry settings so top-level `maxRetries` participates in the
-   * merge like `retry.maxRetries`.
+   * Normalize the retry settings of job options so top-level `maxRetries`
+   * participates in the merge like `retry.maxRetries`.
    */
-  #normalizeJobRetryConfig(jobOptions?: JobOptions): RetryConfig | undefined {
-    if (!jobOptions || (jobOptions.retry === undefined && jobOptions.maxRetries === undefined)) {
-      return undefined
-    }
+  #normalizeRetryConfig(jobOptions?: JobOptions): RetryConfig | undefined {
+    if (!jobOptions) return undefined
 
     return {
-      ...jobOptions.retry,
+      backoff: jobOptions.retry?.backoff,
       maxRetries: jobOptions.retry?.maxRetries ?? jobOptions.maxRetries,
     }
   }
