@@ -19,7 +19,7 @@ import type {
   ScheduleListOptions,
 } from '../types/main.js'
 import debug from '../debug.js'
-import { DEFAULT_PRIORITY } from '../constants.js'
+import { DEFAULT_PRIORITY, SQL_INSERT_CHUNK_SIZE } from '../constants.js'
 import {
   calculateScore,
   createLeaseToken,
@@ -696,7 +696,8 @@ export class KnexAdapter implements Adapter {
       score: calculateScore(job.priority ?? DEFAULT_PRIORITY, now),
     }))
 
-    await this.#connection(this.#jobsTable).insert(rows)
+    // Inserts in chunks within one transaction: all jobs or none.
+    await this.#connection.batchInsert(this.#jobsTable, rows, SQL_INSERT_CHUNK_SIZE)
   }
 
   async size(): Promise<number> {

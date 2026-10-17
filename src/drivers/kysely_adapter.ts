@@ -17,7 +17,7 @@ import type {
   ScheduleListOptions,
 } from '../types/main.js'
 import debug from '../debug.js'
-import { DEFAULT_PRIORITY } from '../constants.js'
+import { DEFAULT_PRIORITY, SQL_INSERT_CHUNK_SIZE } from '../constants.js'
 import {
   calculateScore,
   createLeaseToken,
@@ -622,18 +622,23 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     }
 
     const now = Date.now()
-    await this.#jobs(this.#connection)
-      .insertInto(this.#jobsTable)
-      .values(
-        jobs.map((job) => ({
-          id: job.id,
-          queue,
-          status: 'pending' as const,
-          data: JSON.stringify(job),
-          score: calculateScore(job.priority ?? DEFAULT_PRIORITY, now),
-        }))
-      )
-      .execute()
+    const rows = jobs.map((job) => ({
+      id: job.id,
+      queue,
+      status: 'pending' as const,
+      data: JSON.stringify(job),
+      score: calculateScore(job.priority ?? DEFAULT_PRIORITY, now),
+    }))
+
+    // Inserts in chunks within one transaction: all jobs or none.
+    await this.#connection.transaction().execute(async (trx) => {
+      for (let start = 0; start < rows.length; start += SQL_INSERT_CHUNK_SIZE) {
+        await this.#jobs(trx)
+          .insertInto(this.#jobsTable)
+          .values(rows.slice(start, start + SQL_INSERT_CHUNK_SIZE))
+          .execute()
+      }
+    })
   }
 
   async size(): Promise<number> {

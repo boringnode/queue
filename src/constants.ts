@@ -53,3 +53,11 @@ export const FINALIZATION_RETRIES = 3
  * Base delay between finalization retries, in ms. It grows with each retry.
  */
 export const FINALIZATION_RETRY_DELAY = 25
+
+/**
+ * Rows a SQL adapter inserts per statement in a batch dispatch. It stays under
+ * the 500 terms of a SQLite compound SELECT, which Knex uses for multi-row
+ * inserts on SQLite, and far under the SQLite and PostgreSQL bound parameter
+ * limits.
+ */
+export const SQL_INSERT_CHUNK_SIZE = 500

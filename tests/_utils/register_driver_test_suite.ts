@@ -2357,6 +2357,39 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
     assert.equal(job3!.id, 'batch-3')
   })
 
+  // More rows than one statement can hold: 500 terms of a SQLite compound
+  // SELECT, 32766 SQLite variables, 65535 PostgreSQL parameters.
+  const largeBatch = (count: number) =>
+    Array.from({ length: count }, (_, index) => ({
+      id: `large-batch-${index}`,
+      name: 'TestJob',
+      payload: { index },
+      attempts: 0,
+    }))
+
+  test('pushManyOn should insert more jobs than one SQL statement holds', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+
+    await adapter.pushManyOn('test-queue', largeBatch(14_000))
+
+    assert.equal(await adapter.sizeOf('test-queue'), 14_000)
+  }).timeout(30_000)
+
+  test('pushManyOn should insert every job of a large batch or none', async ({ assert }) => {
+    const adapter = await options.createAdapter()
+    const jobs = largeBatch(2_000)
+    await adapter.pushOn('test-queue', jobs.at(-1)!)
+
+    // SQL adapters reject the duplicate id: none of the batch may remain.
+    // Other adapters accept it.
+    const rejected = await adapter.pushManyOn('test-queue', jobs).then(
+      () => false,
+      () => true
+    )
+
+    if (rejected) assert.equal(await adapter.sizeOf('test-queue'), 1)
+  }).timeout(30_000)
+
   test('pushManyOn with empty array should not error', async ({ assert }) => {
     const adapter = await options.createAdapter()
     adapter.setWorkerId('worker-1')
