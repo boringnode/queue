@@ -16,11 +16,13 @@ import type {
   ScheduleData,
   ScheduleListOptions,
 } from '../types/main.js'
+import debug from '../debug.js'
 import { DEFAULT_PRIORITY } from '../constants.js'
 import {
   calculateScore,
   createLeaseToken,
   epochToDate,
+  isDeadlockError,
   resolveRetention,
   resolveSchedulePayload,
 } from '../utils.js'
@@ -213,7 +215,22 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     })
   }
 
+  /**
+   * Move the due delayed jobs of a queue to pending. On MySQL, the updates of
+   * two workers promoting at once can deadlock. The promotion is rolled back
+   * and changes nothing: the jobs stay delayed and the next poll promotes
+   * them, so the claim goes on instead of failing the worker cycle.
+   */
   async #processDelayedJobs(connection: Kysely<DB>, queue: string, now: number): Promise<void> {
+    try {
+      await this.#promoteDelayedJobs(connection, queue, now)
+    } catch (error) {
+      if (!isDeadlockError(error)) throw error
+      debug('delayed job promotion on queue %s deadlocked, retrying on the next poll', queue)
+    }
+  }
+
+  async #promoteDelayedJobs(connection: Kysely<DB>, queue: string, now: number): Promise<void> {
     await this.#withClaimTransaction(connection, this.#jobsTable, async (trx) => {
       let query = this.#jobs(trx)
         .selectFrom(this.#jobsTable)
