@@ -17,6 +17,7 @@ import { withKnexQuerySpy } from './_utils/with_knex_query_spy.js'
 import { pauseKnexDeletes } from './_utils/pause_deletes.js'
 import { registerRetentionRaceSuite } from './_utils/register_retention_race_suite.js'
 import { MemoryLogger } from './_mocks/memory_logger.js'
+import { startSqliteWriteContender } from './_utils/sqlite_write_contender.js'
 
 const KEY_PREFIX = 'boringnode::queue::test::'
 
@@ -2660,10 +2661,11 @@ test.group('Adapter | Knex (MySQL)', (group) => {
 test.group('Adapter | Knex (SQLite file, two connections)', () => {
   const connectTwice = async (cleanup: (handler: () => Promise<void>) => void) => {
     const directory = await mkdtemp(join(tmpdir(), 'queue-sqlite-'))
+    const filename = join(directory, 'queue.sqlite')
     const connect = () =>
       Knex({
         client: 'better-sqlite3',
-        connection: { filename: join(directory, 'queue.sqlite') },
+        connection: { filename },
         useNullAsDefault: true,
         pool: { afterCreate: (db: any, done: any) => done(null, db.pragma('journal_mode = WAL')) },
       })
@@ -2674,8 +2676,36 @@ test.group('Adapter | Knex (SQLite file, two connections)', () => {
       await second.destroy()
       await rm(directory, { recursive: true, force: true })
     })
-    return [first, second] as const
+    return Object.assign([first, second] as const, { filename })
   }
+
+  test('popFrom and dedup pushes wait for a write from another process', async ({
+    assert,
+    cleanup,
+  }) => {
+    const connections = await connectTwice(cleanup)
+    await new KnexQueueSchemaService(connections[0]).createJobsTable()
+    const adapter = new KnexAdapter({ connection: connections[0] })
+    adapter.setWorkerId('worker-1')
+
+    const stopContender = await startSqliteWriteContender(connections.filename)
+    const outcomes: string[] = []
+    try {
+      for (let i = 0; i < 20; i++) {
+        const job = { id: `job-${i}`, name: 'TestJob', payload: {}, attempts: 0 }
+        for (let dispatch = 0; dispatch < 2; dispatch++) {
+          const result = await adapter.pushOn('test-queue', { ...job, dedup: { id: `dedup-${i}` } })
+          outcomes.push(result?.outcome ?? 'none')
+        }
+        await adapter.pushLaterOn('test-queue', { ...job, id: `delayed-${i}` }, 0)
+        assert.isNotNull(await adapter.popFrom('test-queue'))
+      }
+    } finally {
+      await stopContender()
+    }
+
+    assert.deepEqual(outcomes, Array.from({ length: 20 }, () => ['added', 'skipped']).flat())
+  })
 
   registerRetentionRaceSuite({
     test,

@@ -153,7 +153,7 @@ export class KnexAdapter implements Adapter {
     await this.#processDelayedJobs(queue, now)
 
     // Use a transaction to atomically pop a job
-    return this.#claimTransaction(async (trx) => {
+    return this.#claimTransaction(this.#jobsTable, async (trx) => {
       // Build the query for highest priority job (lowest score)
       let query = trx(this.#jobsTable)
         .where('queue', queue)
@@ -227,9 +227,30 @@ export class KnexAdapter implements Adapter {
    * wait on each other and InnoDB aborts one with ER_LOCK_DEADLOCK. READ
    * COMMITTED only locks the claimed rows, as PostgreSQL does by default.
    */
-  #claimTransaction<T>(callback: (trx: Knex.Transaction) => Promise<T>): Promise<T> {
-    if (!this.#isMysql()) return this.#connection.transaction(callback)
-    return this.#connection.transaction(callback, { isolationLevel: 'read committed' })
+  #claimTransaction<T>(table: string, callback: (trx: Knex.Transaction) => Promise<T>): Promise<T> {
+    if (!this.#isMysql()) return this.#writeTransaction(table, callback)
+    return this.#writeTransaction(table, callback, { isolationLevel: 'read committed' })
+  }
+
+  /**
+   * Transaction that reads rows of `table`, then writes.
+   *
+   * Knex starts a SQLite transaction with a deferred BEGIN, which takes the
+   * write lock at the first write. When another connection, such as a
+   * dispatcher process, writes between the read and that write, SQLite fails
+   * the transaction with SQLITE_BUSY at once, without waiting for the busy
+   * timeout. Writing first takes the write lock up front, as BEGIN IMMEDIATE
+   * does: the transaction waits for the busy timeout instead.
+   */
+  #writeTransaction<T>(
+    table: string,
+    callback: (trx: Knex.Transaction) => Promise<T>,
+    config?: Knex.TransactionConfig
+  ): Promise<T> {
+    return this.#connection.transaction(async (trx) => {
+      if (this.#isSqlite()) await trx.raw('update ?? set id = id where 0', [table])
+      return callback(trx)
+    }, config)
   }
 
   #isSqlite(): boolean {
@@ -239,7 +260,7 @@ export class KnexAdapter implements Adapter {
 
   async #processDelayedJobs(queue: string, now: number): Promise<void> {
     // Use a transaction with row locking to prevent race conditions
-    await this.#claimTransaction(async (trx) => {
+    await this.#claimTransaction(this.#jobsTable, async (trx) => {
       let query = trx(this.#jobsTable)
         .where('queue', queue)
         .where('status', 'delayed')
@@ -540,7 +561,7 @@ export class KnexAdapter implements Adapter {
   ): Promise<PushResult> {
     while (true) {
       try {
-        return await this.#connection.transaction(async (trx) => {
+        return await this.#writeTransaction(this.#jobsTable, async (trx) => {
           const now = Date.now()
           const existingResult = await this.#resolveExistingDedup(trx, queue, jobData, dedup, now)
           if (existingResult) return existingResult
@@ -685,7 +706,7 @@ export class KnexAdapter implements Adapter {
     const stalledCutoff = now - stalledThreshold
 
     // Use a transaction with row locking to prevent race conditions
-    return this.#claimTransaction(async (trx) => {
+    return this.#claimTransaction(this.#jobsTable, async (trx) => {
       let recovered = 0
       const exceeded: AcquiredJob[] = []
 
@@ -884,7 +905,7 @@ export class KnexAdapter implements Adapter {
 
     const now = Date.now()
 
-    return this.#claimTransaction(async (trx) => {
+    return this.#claimTransaction(this.#schedulesTable, async (trx) => {
       // Find one due schedule with row locking
       let query = trx(this.#schedulesTable)
         .where('status', 'active')

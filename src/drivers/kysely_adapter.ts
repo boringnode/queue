@@ -178,7 +178,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
 
     await this.#processDelayedJobs(this.#connection, queue, now)
 
-    return this.#withClaimTransaction(this.#connection, async (trx) => {
+    return this.#withClaimTransaction(this.#connection, this.#jobsTable, async (trx) => {
       let query = this.#jobs(trx)
         .selectFrom(this.#jobsTable)
         .selectAll()
@@ -214,7 +214,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   }
 
   async #processDelayedJobs(connection: Kysely<DB>, queue: string, now: number): Promise<void> {
-    await this.#withClaimTransaction(connection, async (trx) => {
+    await this.#withClaimTransaction(connection, this.#jobsTable, async (trx) => {
       let query = this.#jobs(trx)
         .selectFrom(this.#jobsTable)
         .select(['id', 'data'])
@@ -483,7 +483,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
 
     while (true) {
       try {
-        return await this.#withTransaction(connection, async (trx) => {
+        return await this.#withTransaction(connection, this.#jobsTable, async (trx) => {
           const now = Date.now()
           const existingResult = await this.#resolveExistingDedup(trx, queue, jobData, dedup, now)
           if (existingResult) return existingResult
@@ -642,7 +642,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
   ): Promise<StalledJobsRecovery> {
     const now = Date.now()
 
-    return this.#withClaimTransaction(this.#connection, async (trx) => {
+    return this.#withClaimTransaction(this.#connection, this.#jobsTable, async (trx) => {
       let query = this.#jobs(trx)
         .selectFrom(this.#jobsTable)
         .select(['id', 'data'])
@@ -846,7 +846,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
 
     const now = Date.now()
 
-    return this.#withClaimTransaction(this.#connection, async (trx) => {
+    return this.#withClaimTransaction(this.#connection, this.#schedulesTable, async (trx) => {
       let query = this.#schedules(trx)
         .selectFrom(this.#schedulesTable)
         .selectAll()
@@ -902,11 +902,27 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     })
   }
 
+  /**
+   * Transaction that reads rows of `table`, then writes.
+   *
+   * Kysely starts a SQLite transaction with a deferred BEGIN, which takes the
+   * write lock at the first write. When another connection, such as a
+   * dispatcher process, writes between the read and that write, SQLite fails
+   * the transaction with SQLITE_BUSY at once, without waiting for the busy
+   * timeout. Writing first takes the write lock up front, as BEGIN IMMEDIATE
+   * does: the transaction waits for the busy timeout instead.
+   */
   #withTransaction<T>(
     connection: Kysely<DB>,
+    table: string,
     callback: (trx: Transaction<DB>) => Promise<T>
   ): Promise<T> {
-    return connection.transaction().execute(callback)
+    return connection.transaction().execute(async (trx) => {
+      if (this.#dialect === 'sqlite') {
+        await sql`update ${sql.table(table)} set id = id where 0`.execute(trx)
+      }
+      return callback(trx)
+    })
   }
 
   /**
@@ -922,9 +938,10 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
    */
   #withClaimTransaction<T>(
     connection: Kysely<DB>,
+    table: string,
     callback: (trx: Transaction<DB>) => Promise<T>
   ): Promise<T> {
-    if (this.#dialect !== 'mysql') return this.#withTransaction(connection, callback)
+    if (this.#dialect !== 'mysql') return this.#withTransaction(connection, table, callback)
     return connection.transaction().setIsolationLevel('read committed').execute(callback)
   }
 

@@ -512,6 +512,22 @@ which avoids deadlocks between workers under REPEATABLE READ. With `binlog_forma
 rejects writes in READ COMMITTED, so jobs cannot be acquired. `ROW`, the MySQL 8 default, and
 `MIXED`, the MariaDB default, both work.
 
+#### SQLite with several processes
+
+SQLite lets one connection write at a time. The Knex and Kysely adapters take the write lock at the
+start of each transaction that reads then writes, as `BEGIN IMMEDIATE` does, so a worker and
+dispatchers in other processes wait for each other up to the busy timeout (5 seconds by default with
+`better-sqlite3`) instead of failing with `SQLITE_BUSY`.
+
+- Use a database file shared by the processes, and enable WAL (`PRAGMA journal_mode = WAL`) so
+  reads do not wait for writes.
+- Open one connection to the file per process. `better-sqlite3` waits for the lock synchronously:
+  a second connection in the same process holding the lock cannot release it while the first one
+  waits.
+- Every write is serialized, so a busy timeout shorter than your longest write transaction still
+  fails, and throughput stays bounded. For several workers or a high dispatch rate, use PostgreSQL
+  or MySQL.
+
 #### Migrating SQL schedules after an upgrade
 
 The schedules table stores its dates as epoch milliseconds (`bigint`), so they do not depend on the
