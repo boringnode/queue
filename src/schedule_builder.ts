@@ -148,10 +148,11 @@ export class ScheduleBuilder<TPayload = unknown> implements PromiseLike<Schedule
       ])
     }
 
-    // Validate cron expression
+    // Validate cron expression. Some expressions parse but never match
+    // (`0 0 31 4,6 *`), and only throw once asked for an occurrence.
     if (this.#cronExpression) {
       try {
-        CronExpressionParser.parse(this.#cronExpression, { tz: this.#timezone })
+        CronExpressionParser.parse(this.#cronExpression, { tz: this.#timezone }).next()
       } catch (error) {
         throw new errors.E_INVALID_CRON_EXPRESSION(
           [this.#cronExpression, (error as Error).message],

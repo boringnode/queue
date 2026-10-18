@@ -227,6 +227,14 @@ test.group('ScheduleBuilder', (group) => {
     }
   })
 
+  test('should throw for a cron expression that never matches', async ({ assert }) => {
+    // Parses fine, but April and June have no 31st
+    await assert.rejects(
+      () => new ScheduleBuilder('NeverJob', {}).cron('0 0 31 4,6 *').run(),
+      errors.E_INVALID_CRON_EXPRESSION
+    )
+  })
+
   test('should be thenable for auto-run', async ({ assert }) => {
     const builder = new ScheduleBuilder('SyncJob', { source: 'api' })
 
