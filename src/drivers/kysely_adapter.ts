@@ -675,7 +675,9 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     }))
 
     // Inserts in chunks within one transaction: all jobs or none. A
-    // connection that is already a transaction cannot open another one.
+    // connection that is already a transaction cannot open another one: a
+    // savepoint undoes the inserted chunks there, and keeps that transaction
+    // usable when the application recovers from the error.
     const insertChunks = async (connection: InternalKyselyConnection<DB>) => {
       for (let start = 0; start < rows.length; start += SQL_INSERT_CHUNK_SIZE) {
         await this.#jobs(connection)
@@ -686,7 +688,15 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     }
 
     if (this.#connection.isTransaction) {
-      await insertChunks(this.#connection)
+      const connection = this.#connection
+      await sql`savepoint queue_push_many`.execute(connection)
+      try {
+        await insertChunks(connection)
+      } catch (error) {
+        await sql`rollback to savepoint queue_push_many`.execute(connection)
+        throw error
+      }
+      await sql`release savepoint queue_push_many`.execute(connection)
     } else {
       await this.#connection.transaction().execute(insertChunks)
     }

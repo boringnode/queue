@@ -22,6 +22,11 @@ interface DriverTestSuiteOptions {
    * @default false
    */
   rejectsDuplicateJobIds?: boolean
+  /**
+   * Runs `operation` with an adapter bound to an application transaction,
+   * then commits it. Enables the tests of adapters joining that transaction.
+   */
+  inTransaction?: (operation: (adapter: Adapter) => Promise<void>) => Promise<void>
 }
 
 /** A lease on a job that was never acquired. */
@@ -2389,6 +2394,33 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
       await assert.rejects(() => adapter.pushManyOn('test-queue', jobs))
       assert.equal(await adapter.sizeOf('test-queue'), 1)
+    }).timeout(30_000)
+  }
+
+  if (options.rejectsDuplicateJobIds && options.inTransaction) {
+    const inTransaction = options.inTransaction
+
+    test('pushManyOn inside a transaction should insert nothing when a chunk fails', async ({
+      assert,
+    }) => {
+      const adapter = await options.createAdapter()
+      const jobs = largeBatch(600)
+      await adapter.pushOn('test-queue', jobs.at(-1)!)
+      let rejected = false
+
+      // The application recovers from the failed batch and commits its other writes.
+      await inTransaction(async (transactionAdapter) => {
+        await transactionAdapter.pushManyOn('test-queue', jobs).catch(() => (rejected = true))
+        await transactionAdapter.pushOn('test-queue', {
+          id: 'other-write',
+          name: 'TestJob',
+          payload: {},
+          attempts: 0,
+        })
+      })
+
+      assert.isTrue(rejected)
+      assert.equal(await adapter.sizeOf('test-queue'), 2)
     }).timeout(30_000)
   }
 

@@ -2186,6 +2186,8 @@ test.group('Adapter | Knex (SQLite)', (group) => {
   registerDriverTestSuite({
     test,
     rejectsDuplicateJobIds: true,
+    inTransaction: (operation) =>
+      connection.transaction((trx) => operation(new KnexAdapter({ connection: trx }))),
     createAdapter: () => {
       adapter = new KnexAdapter({ connection })
       return adapter
@@ -2366,6 +2368,10 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
   registerDriverTestSuite({
     test,
     rejectsDuplicateJobIds: true,
+    inTransaction: (operation) =>
+      connection.transaction((trx) =>
+        operation(new KnexAdapter({ connection: trx, tableName, schedulesTableName }))
+      ),
     createAdapter: () => {
       adapter = new KnexAdapter({ connection, tableName, schedulesTableName })
       return adapter
@@ -2683,6 +2689,10 @@ test.group('Adapter | Knex (MySQL)', (group) => {
   registerDriverTestSuite({
     test,
     rejectsDuplicateJobIds: true,
+    inTransaction: (operation) =>
+      connection.transaction((trx) =>
+        operation(new KnexAdapter({ connection: trx, tableName, schedulesTableName }))
+      ),
     supportsAtomicDedup: false,
     createAdapter: () => {
       adapter = new KnexAdapter({ connection, tableName, schedulesTableName })

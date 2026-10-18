@@ -13,4 +13,5 @@ The error also carried the whole SQL statement, with every payload.
 
 They now insert batches in chunks of 500 jobs within one transaction: a batch is still inserted
 entirely or not at all. An adapter created on an application transaction inserts the chunks in that
-transaction.
+transaction, behind a savepoint: when a chunk fails, none of the batch stays in the transaction, and
+the application can still commit its other writes.

@@ -43,6 +43,12 @@ test.group('Adapter | Kysely (SQLite)', (group) => {
   registerDriverTestSuite({
     test,
     rejectsDuplicateJobIds: true,
+    inTransaction: (operation) =>
+      connection
+        .transaction()
+        .execute((trx) =>
+          operation(new KyselyAdapter<QueueDatabase>({ connection: trx, dialect: 'sqlite' }))
+        ),
     createAdapter: () => {
       adapter = new KyselyAdapter({ connection, dialect: 'sqlite' })
       return adapter
@@ -208,6 +214,17 @@ test.group('Adapter | Kysely (PostgreSQL)', (group) => {
   registerDriverTestSuite({
     test,
     rejectsDuplicateJobIds: true,
+    inTransaction: (operation) =>
+      connection.transaction().execute((trx) =>
+        operation(
+          new KyselyAdapter<QueueDatabase>({
+            connection: trx,
+            dialect: 'postgres',
+            tableName,
+            schedulesTableName,
+          })
+        )
+      ),
     createAdapter: () => {
       adapter = new KyselyAdapter({
         connection,
@@ -289,6 +306,17 @@ test.group('Adapter | Kysely (MySQL)', (group) => {
   registerDriverTestSuite({
     test,
     rejectsDuplicateJobIds: true,
+    inTransaction: (operation) =>
+      connection.transaction().execute((trx) =>
+        operation(
+          new KyselyAdapter<QueueDatabase>({
+            connection: trx,
+            dialect: 'mysql',
+            tableName,
+            schedulesTableName,
+          })
+        )
+      ),
     createAdapter: () => {
       adapter = new KyselyAdapter({
         connection,
