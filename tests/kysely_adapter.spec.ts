@@ -236,6 +236,18 @@ test.group('Adapter | Kysely (PostgreSQL)', (group) => {
         await sql.raw(statement).execute(connection)
       }
     },
+    inTransaction: (logger, operation) =>
+      connection.transaction().execute((trx) =>
+        operation(
+          new KyselyAdapter<QueueDatabase>({
+            connection: trx,
+            dialect: 'postgres',
+            tableName,
+            schedulesTableName,
+            logger,
+          })
+        )
+      ),
   })
 })
 

@@ -9,6 +9,11 @@ interface PruneFailureSuiteOptions {
   createAdapter: (logger: Logger) => Adapter | Promise<Adapter>
   /** Make the next `count` row deletions on the jobs table raise `sqlstate`. */
   failDeletes: (sqlstate: string, count: number) => Promise<void>
+  /**
+   * Run `operation` with an adapter created on an application transaction,
+   * which commits when `operation` resolves.
+   */
+  inTransaction: <T>(logger: Logger, operation: (adapter: Adapter) => Promise<T>) => Promise<T>
 }
 
 const finalizers = {
@@ -66,6 +71,26 @@ export function registerPruneFailureSuite(options: PruneFailureSuiteOptions) {
       const error = logger.logs[0].obj!.err as Error & { code?: string }
       assert.equal(error.code, 'P0001')
     })
+
+    options.test(
+      `${name} rejects a retention pruning that fails in a transaction`,
+      async ({ assert }) => {
+        const { adapter, newJob } = await setup()
+        await options.failDeletes('P0001', 100)
+        const logger = new MemoryLogger()
+
+        // The failed statement aborted the transaction of the application: it
+        // must know, or it commits nothing while believing the job finalized.
+        await assert.rejects(() =>
+          options.inTransaction(logger, (transactional) =>
+            finalize(transactional, newJob, { count: 1 })
+          )
+        )
+
+        const record = await adapter.getJob('new-job', 'prune-failure')
+        assert.equal(record!.status, 'active')
+      }
+    )
   }
 }
 

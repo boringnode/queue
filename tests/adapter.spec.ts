@@ -2383,6 +2383,10 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
         await connection.raw(statement)
       }
     },
+    inTransaction: (logger, operation) =>
+      connection.transaction((trx) =>
+        operation(new KnexAdapter({ connection: trx, tableName, schedulesTableName, logger }))
+      ),
   })
 
   test('addDedupColumns should leave a dedup slot to its latest job', async ({ assert }) => {

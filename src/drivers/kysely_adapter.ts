@@ -375,6 +375,10 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
    * already: a failed pruning must neither undo it nor fail the call. A
    * deadlock runs the pruning again, a bounded number of times. Another
    * error is logged, and the next finalization on the queue prunes again.
+   *
+   * On a transaction of the application, nothing is committed yet, and a
+   * failed statement can abort the whole transaction: the error goes to the
+   * caller, without a retry.
    */
   async #pruneHistoryAfterFinalization(
     queue: string,
@@ -383,6 +387,10 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     maxCount: number,
     now: number
   ): Promise<void> {
+    if (this.#connection.isTransaction) {
+      return this.#pruneHistory(this.#connection, queue, status, maxAge, maxCount, now)
+    }
+
     try {
       await retryOnDeadlock(() =>
         this.#pruneHistory(this.#connection, queue, status, maxAge, maxCount, now)

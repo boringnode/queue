@@ -10,7 +10,9 @@ never ran, and nothing was logged.
 
 A pruning that loses a deadlock (MySQL `ER_LOCK_DEADLOCK`, PostgreSQL `40P01` and `40001`) now runs
 again inside the adapter, up to 3 times. Any other pruning error is logged at the `error` level and
-no longer fails the finalization: the next finalization on the queue prunes again.
+no longer fails the finalization: the next finalization on the queue prunes again. On an adapter
+created on an application transaction, nothing is committed yet: a pruning error still rejects the
+call, without a retry, so the application knows its transaction failed.
 
 The adapters log through the QueueManager logger when created with `knex()` or `kysely()`. When
 constructed directly, `new KnexAdapter()` and `new KyselyAdapter()` accept a `logger` option and
