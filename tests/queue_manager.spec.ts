@@ -81,68 +81,51 @@ test.group('QueueManager', () => {
   })
 
   test('should validate adapter presence', async ({ assert }) => {
-    assert.plan(2)
-
-    try {
-      await QueueManager.init({
-        default: 'sync',
-        adapters: {},
-      })
-    } catch (error) {
-      assert.instanceOf(error, errors.E_CONFIGURATION_ERROR)
-      assert.equal(
-        error.message,
-        'Configuration error. Reason: At least one adapter must be configured'
-      )
-    }
+    await assert.rejects(
+      () =>
+        QueueManager.init({
+          default: 'sync',
+          adapters: {},
+        }),
+      errors.E_CONFIGURATION_ERROR,
+      'Configuration error. Reason: At least one adapter must be configured'
+    )
   })
 
   test('should validate default adapter presence', async ({ assert }) => {
-    assert.plan(2)
-
-    try {
-      await QueueManager.init({
-        default: '',
-        adapters: { sync: sync() },
-      })
-    } catch (error) {
-      assert.instanceOf(error, errors.E_CONFIGURATION_ERROR)
-      assert.equal(error.message, 'Configuration error. Reason: Default adapter must be specified')
-    }
+    await assert.rejects(
+      () =>
+        QueueManager.init({
+          default: '',
+          adapters: { sync: sync() },
+        }),
+      errors.E_CONFIGURATION_ERROR,
+      'Configuration error. Reason: Default adapter must be specified'
+    )
   })
 
   test('should validate that adapter is a function', async ({ assert }) => {
-    assert.plan(2)
-
-    try {
-      await QueueManager.init({
-        default: 'sync',
-        adapters: { sync: 'not-a-function' as any },
-      })
-    } catch (error) {
-      assert.instanceOf(error, errors.E_CONFIGURATION_ERROR)
-      assert.equal(
-        error.message,
-        'Configuration error. Reason: Adapter "sync" must be a factory function'
-      )
-    }
+    await assert.rejects(
+      () =>
+        QueueManager.init({
+          default: 'sync',
+          adapters: { sync: 'not-a-function' as any },
+        }),
+      errors.E_CONFIGURATION_ERROR,
+      'Configuration error. Reason: Adapter "sync" must be a factory function'
+    )
   })
 
   test('should validate default adapter existence in adapters', async ({ assert }) => {
-    assert.plan(2)
-
-    try {
-      await QueueManager.init({
-        default: 'missing',
-        adapters: { sync: sync() },
-      })
-    } catch (error) {
-      assert.instanceOf(error, errors.E_CONFIGURATION_ERROR)
-      assert.equal(
-        error.message,
-        'Configuration error. Reason: Default adapter "missing" not found in adapters configuration'
-      )
-    }
+    await assert.rejects(
+      () =>
+        QueueManager.init({
+          default: 'missing',
+          adapters: { sync: sync() },
+        }),
+      errors.E_CONFIGURATION_ERROR,
+      'Configuration error. Reason: Default adapter "missing" not found in adapters configuration'
+    )
   })
 
   test('should expose a config resolver after initialization', async ({ assert }) => {
@@ -171,24 +154,16 @@ test.group('QueueManager', () => {
   test('should throw E_QUEUE_NOT_INITIALIZED when use() called before init()', async ({
     assert,
   }) => {
-    assert.plan(2)
-
     await QueueManager.destroy()
 
-    try {
-      QueueManager.use()
-    } catch (error) {
-      assert.instanceOf(error, errors.E_QUEUE_NOT_INITIALIZED)
-      assert.equal(
-        error.message,
-        'QueueManager is not initialized. Call QueueManager.init() before using it.'
-      )
-    }
+    assert.throws(
+      () => QueueManager.use(),
+      errors.E_QUEUE_NOT_INITIALIZED,
+      'QueueManager is not initialized. Call QueueManager.init() before using it.'
+    )
   })
 
   test('should throw E_ADAPTER_INIT_ERROR when adapter factory throws', async ({ assert }) => {
-    assert.plan(2)
-
     await QueueManager.init({
       default: 'broken',
       adapters: {
@@ -198,15 +173,11 @@ test.group('QueueManager', () => {
       },
     })
 
-    try {
-      QueueManager.use()
-    } catch (error) {
-      assert.instanceOf(error, errors.E_ADAPTER_INIT_ERROR)
-      assert.equal(
-        error.message,
-        'Failed to initialize adapter "broken". Reason: Connection failed'
-      )
-    }
+    assert.throws(
+      () => QueueManager.use(),
+      errors.E_ADAPTER_INIT_ERROR,
+      'Failed to initialize adapter "broken". Reason: Connection failed'
+    )
   })
 
   test('should log warning when locations match no jobs', async ({ assert }) => {

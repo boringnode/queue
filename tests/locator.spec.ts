@@ -261,21 +261,19 @@ test.group('Locator', (group) => {
   }).timeout(10_000)
 
   test('should getOrThrow should throw for non-existent job', ({ assert }) => {
-    try {
-      Locator.getOrThrow('NonExistentJob')
-    } catch (error) {
-      assert.instanceOf(error, errors.E_JOB_NOT_FOUND)
-      assert.equal(error.message, 'Requested job "NonExistentJob" is not registered')
-    }
+    assert.throws(
+      () => Locator.getOrThrow('NonExistentJob'),
+      errors.E_JOB_NOT_FOUND,
+      'Requested job "NonExistentJob" is not registered'
+    )
   })
 
   test('should resolveOrThrow should throw for non-existent job', async ({ assert }) => {
-    try {
-      await Locator.resolveOrThrow('NonExistentJob')
-    } catch (error) {
-      assert.instanceOf(error, errors.E_JOB_NOT_FOUND)
-      assert.equal(error.message, 'Requested job "NonExistentJob" is not registered')
-    }
+    await assert.rejects(
+      () => Locator.resolveOrThrow('NonExistentJob'),
+      errors.E_JOB_NOT_FOUND,
+      'Requested job "NonExistentJob" is not registered'
+    )
   })
 
   test('should use constructor.name as default job name when registering from glob', async ({

@@ -69,8 +69,8 @@
     "oxlint-tsgolint": "^7.0.2004",
     "pg": "^8.23.1",
     "release-it": "^21.1.1",
-    "tsup": "^8.5.1",
-    "typescript": "^5.9.3"
+    "tsup": "^9.0.0",
+    "typescript": "^6.0.3"
   },
   "peerDependencies": {
     "@opentelemetry/api": "^1.9.0",

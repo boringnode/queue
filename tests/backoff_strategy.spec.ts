@@ -11,73 +11,43 @@ import type { JobOptions } from '../src/types/main.js'
 
 test.group('BackoffStrategy', () => {
   test('should validate negative baseDelay', ({ assert }) => {
-    assert.plan(2)
-
-    try {
-      new BackoffStrategy({ strategy: 'exponential', baseDelay: -1000 })
-    } catch (error) {
-      assert.instanceOf(error, errors.E_INVALID_BASE_DELAY)
-      assert.equal(
-        'Invalid base delay. Reason: Base delay must be a positive integer greater than zero',
-        error.message
-      )
-    }
+    assert.throws(
+      () => new BackoffStrategy({ strategy: 'exponential', baseDelay: -1000 }),
+      errors.E_INVALID_BASE_DELAY,
+      'Invalid base delay. Reason: Base delay must be a positive integer greater than zero'
+    )
   })
 
   test('should validate negative maxDelay', ({ assert }) => {
-    assert.plan(2)
-
-    try {
-      new BackoffStrategy({ strategy: 'exponential', baseDelay: 1000, maxDelay: -5000 })
-    } catch (error) {
-      assert.instanceOf(error, errors.E_INVALID_MAX_DELAY)
-      assert.equal(
-        'Invalid max delay. Reason: Max delay must be a positive integer greater than zero',
-        error.message
-      )
-    }
+    assert.throws(
+      () => new BackoffStrategy({ strategy: 'exponential', baseDelay: 1000, maxDelay: -5000 }),
+      errors.E_INVALID_MAX_DELAY,
+      'Invalid max delay. Reason: Max delay must be a positive integer greater than zero'
+    )
   })
 
   test('should validate maxDelay less than baseDelay', ({ assert }) => {
-    assert.plan(2)
-
-    try {
-      new BackoffStrategy({ strategy: 'exponential', baseDelay: 10000, maxDelay: 5000 })
-    } catch (error) {
-      assert.instanceOf(error, errors.E_INVALID_MAX_DELAY)
-      assert.equal(
-        'Invalid max delay. Reason: Max delay should be greater than base delay',
-        error.message
-      )
-    }
+    assert.throws(
+      () => new BackoffStrategy({ strategy: 'exponential', baseDelay: 10000, maxDelay: 5000 }),
+      errors.E_INVALID_MAX_DELAY,
+      'Invalid max delay. Reason: Max delay should be greater than base delay'
+    )
   })
 
   test('should validate negative multiplier', ({ assert }) => {
-    assert.plan(2)
-
-    try {
-      new BackoffStrategy({ strategy: 'exponential', baseDelay: 1000, multiplier: -1 })
-    } catch (error) {
-      assert.instanceOf(error, errors.E_INVALID_MULTIPLIER)
-      assert.equal(
-        'Invalid multiplier. Reason: Multiplier must be a positive number greater than zero',
-        error.message
-      )
-    }
+    assert.throws(
+      () => new BackoffStrategy({ strategy: 'exponential', baseDelay: 1000, multiplier: -1 }),
+      errors.E_INVALID_MULTIPLIER,
+      'Invalid multiplier. Reason: Multiplier must be a positive number greater than zero'
+    )
   })
 
   test('should validate exponential multiplier less than 1', ({ assert }) => {
-    assert.plan(2)
-
-    try {
-      new BackoffStrategy({ strategy: 'exponential', baseDelay: 1000, multiplier: 0.5 })
-    } catch (error) {
-      assert.instanceOf(error, errors.E_INVALID_MULTIPLIER)
-      assert.equal(
-        'Invalid multiplier. Reason: Exponential strategy multiplier should be >= 1',
-        error.message
-      )
-    }
+    assert.throws(
+      () => new BackoffStrategy({ strategy: 'exponential', baseDelay: 1000, multiplier: 0.5 }),
+      errors.E_INVALID_MULTIPLIER,
+      'Invalid multiplier. Reason: Exponential strategy multiplier should be >= 1'
+    )
   })
 
   test('should return frozen config copy', ({ assert }) => {
