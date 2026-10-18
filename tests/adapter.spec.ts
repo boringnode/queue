@@ -2702,6 +2702,7 @@ test.group('Adapter | Knex (MySQL)', (group) => {
 
   registerRetentionRaceSuite({
     test,
+    manyConsumers: true,
     createAdapters: async (beforeDelete, cleanup) => {
       const first = pauseKnexDeletes(Knex(config), beforeDelete)
       const second = Knex(config)

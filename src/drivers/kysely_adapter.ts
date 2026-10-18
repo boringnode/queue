@@ -19,7 +19,7 @@ import type {
 } from '../types/main.js'
 import debug from '../debug.js'
 import { consoleLogger, type Logger } from '../logger.js'
-import { DEFAULT_PRIORITY, SQL_INSERT_CHUNK_SIZE } from '../constants.js'
+import { DEFAULT_PRIORITY, SQL_INSERT_CHUNK_SIZE, SQL_PRUNE_BATCH_SIZE } from '../constants.js'
 import {
   calculateScore,
   createLeaseToken,
@@ -420,37 +420,57 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     now: number
   ): Promise<void> {
     if (maxAge > 0) {
-      await this.#jobs(connection)
-        .deleteFrom(this.#jobsTable)
+      const expired = await this.#jobs(connection)
+        .selectFrom(this.#jobsTable)
+        .select('id')
         .where('queue', '=', queue)
         .where('status', '=', status)
         .where('finished_at', '<', now - maxAge)
+        .limit(SQL_PRUNE_BATCH_SIZE)
         .execute()
+      await this.#deleteFinished(connection, queue, status, expired)
     }
 
     if (maxCount > 0) {
-      // One statement, so that a concurrent pruning cannot delete a job kept here.
-      // MySQL rejects LIMIT in an IN subquery, but accepts it in a derived table.
-      await this.#jobs(connection)
-        .deleteFrom(this.#jobsTable)
+      // Finished jobs only leave the history by a pruning, and newer ones
+      // only rank above: the jobs past the newest `maxCount` stay past them.
+      const surplus = await this.#jobs(connection)
+        .selectFrom(this.#jobsTable)
+        .select('id')
         .where('queue', '=', queue)
         .where('status', '=', status)
-        .where('id', 'not in', (expression) =>
-          expression
-            .selectFrom((subquery) =>
-              subquery
-                .selectFrom(this.#jobsTable)
-                .select('id')
-                .where('queue', '=', queue)
-                .where('status', '=', status)
-                .orderBy('finished_at', 'desc')
-                .limit(maxCount)
-                .as('keep')
-            )
-            .select('keep.id')
-        )
+        .orderBy('finished_at', 'desc')
+        .orderBy('id', 'desc')
+        .limit(SQL_PRUNE_BATCH_SIZE)
+        .offset(maxCount)
         .execute()
+      await this.#deleteFinished(connection, queue, status, surplus)
     }
+  }
+
+  /**
+   * Delete finished jobs found by a plain read, by primary key. Unlike a
+   * DELETE that scans the history, it locks no range of the status index, so
+   * it does not deadlock with the finalizations of other workers on MySQL.
+   */
+  async #deleteFinished(
+    connection: Kysely<DB>,
+    queue: string,
+    status: 'completed' | 'failed',
+    rows: { id: string }[]
+  ) {
+    if (rows.length === 0) return
+
+    await this.#jobs(connection)
+      .deleteFrom(this.#jobsTable)
+      .where(
+        'id',
+        'in',
+        rows.map((row) => row.id)
+      )
+      .where('queue', '=', queue)
+      .where('status', '=', status)
+      .execute()
   }
 
   async retryJob(job: JobLease, queue: string, retryAt?: Date): Promise<boolean> {

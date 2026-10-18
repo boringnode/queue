@@ -21,7 +21,7 @@ import type {
 } from '../types/main.js'
 import debug from '../debug.js'
 import { consoleLogger, type Logger } from '../logger.js'
-import { DEFAULT_PRIORITY, SQL_INSERT_CHUNK_SIZE } from '../constants.js'
+import { DEFAULT_PRIORITY, SQL_INSERT_CHUNK_SIZE, SQL_PRUNE_BATCH_SIZE } from '../constants.js'
 import {
   calculateScore,
   createLeaseToken,
@@ -449,35 +449,45 @@ export class KnexAdapter implements Adapter {
     now: number
   ): Promise<void> {
     if (maxAge > 0) {
-      const cutoff = now - maxAge
-      await this.#connection(this.#jobsTable)
+      const expired = await this.#connection(this.#jobsTable)
         .where('queue', queue)
         .where('status', status)
-        .where('finished_at', '<', cutoff)
-        .delete()
+        .where('finished_at', '<', now - maxAge)
+        .limit(SQL_PRUNE_BATCH_SIZE)
+        .pluck('id')
+      await this.#deleteFinished(queue, status, expired)
     }
 
     if (maxCount > 0) {
-      // One statement, so that a concurrent pruning cannot delete a job kept here.
-      // MySQL rejects LIMIT in an IN subquery, but accepts it in a derived table.
-      const toKeep = this.#connection
-        .from(
-          this.#connection(this.#jobsTable)
-            .where('queue', queue)
-            .where('status', status)
-            .orderBy('finished_at', 'desc')
-            .limit(maxCount)
-            .select('id')
-            .as('keep')
-        )
-        .select('id')
-
-      await this.#connection(this.#jobsTable)
+      // Finished jobs only leave the history by a pruning, and newer ones
+      // only rank above: the jobs past the newest `maxCount` stay past them.
+      const surplus = await this.#connection(this.#jobsTable)
         .where('queue', queue)
         .where('status', status)
-        .whereNotIn('id', toKeep)
-        .delete()
+        .orderBy([
+          { column: 'finished_at', order: 'desc' },
+          { column: 'id', order: 'desc' },
+        ])
+        .offset(maxCount)
+        .limit(SQL_PRUNE_BATCH_SIZE)
+        .pluck('id')
+      await this.#deleteFinished(queue, status, surplus)
     }
+  }
+
+  /**
+   * Delete finished jobs found by a plain read, by primary key. Unlike a
+   * DELETE that scans the history, it locks no range of the status index, so
+   * it does not deadlock with the finalizations of other workers on MySQL.
+   */
+  async #deleteFinished(queue: string, status: 'completed' | 'failed', ids: string[]) {
+    if (ids.length === 0) return
+
+    await this.#connection(this.#jobsTable)
+      .whereIn('id', ids)
+      .where('queue', queue)
+      .where('status', status)
+      .delete()
   }
 
   async retryJob(job: JobLease, queue: string, retryAt?: Date): Promise<boolean> {

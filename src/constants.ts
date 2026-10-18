@@ -62,3 +62,9 @@ export const FINALIZATION_RETRY_DELAY = 25
  * limits.
  */
 export const SQL_INSERT_CHUNK_SIZE = 500
+
+/**
+ * Most finished jobs one retention pruning deletes. A larger backlog, for
+ * example after lowering a retention count, shrinks over the next ones.
+ */
+export const SQL_PRUNE_BATCH_SIZE = 500

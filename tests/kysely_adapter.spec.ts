@@ -380,6 +380,7 @@ test.group('Adapter | Kysely (MySQL)', (group) => {
 
   registerRetentionRaceSuite({
     test,
+    manyConsumers: true,
     createAdapters: async (beforeDelete, cleanup) => {
       const first = new Kysely<QueueDatabase>({
         dialect: pauseKyselyDeletes(createDialect(), beforeDelete),
