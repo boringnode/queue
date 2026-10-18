@@ -28,6 +28,12 @@ interface DriverTestSuiteOptions {
    * tests of adapters joining that transaction.
    */
   inTransaction?: (operation: (adapter: Adapter) => Promise<void>) => Promise<void>
+  /**
+   * Whether `createAdapter()` can read while `inTransaction` holds a
+   * transaction open. Not on SQLite, whose one connection the transaction holds.
+   * @default false
+   */
+  readsBesideTransaction?: boolean
 }
 
 /** A lease on a job that was never acquired. */
@@ -2419,6 +2425,44 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       await inTransaction((transactionAdapter) => transactionAdapter.pushManyOn('test-queue', jobs))
       assert.equal(await adapter.sizeOf('test-queue'), 600)
     }).timeout(30_000)
+
+    test('pushOn with dedup inside a transaction joins it', async ({ assert }) => {
+      const adapter = await options.createAdapter()
+      const job = (id: string) => ({
+        id,
+        name: 'TestJob',
+        payload: {},
+        attempts: 0,
+        dedup: { id: 'in-transaction' },
+      })
+      const dispatchTwice = async (transactionAdapter: Adapter) => {
+        assert.deepEqual(await transactionAdapter.pushOn('test-queue', job('first')), {
+          outcome: 'added',
+          jobId: 'first',
+        })
+        assert.deepEqual(await transactionAdapter.pushOn('test-queue', job('second')), {
+          outcome: 'skipped',
+          jobId: 'first',
+        })
+        if (options.readsBesideTransaction) {
+          assert.isNull(await adapter.getJob('first', 'test-queue'), 'visible before commit')
+        }
+      }
+
+      await assert.rejects(
+        () =>
+          inTransaction(async (transactionAdapter) => {
+            await dispatchTwice(transactionAdapter)
+            throw rollBack
+          }),
+        rollBack.message
+      )
+      assert.isNull(await adapter.getJob('first', 'test-queue'))
+
+      await inTransaction(dispatchTwice)
+      assert.equal((await adapter.getJob('first', 'test-queue'))?.status, 'pending')
+      assert.equal(await adapter.sizeOf('test-queue'), 1)
+    })
 
     if (options.rejectsDuplicateJobIds) {
       test('pushManyOn inside a transaction rejects with the driver error', async ({ assert }) => {

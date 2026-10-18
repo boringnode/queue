@@ -262,9 +262,14 @@ export class KnexAdapter implements Adapter {
     config?: Knex.TransactionConfig
   ): Promise<T> {
     return this.#connection.transaction(async (trx) => {
-      if (this.#isSqlite()) await trx.raw('update ?? set id = id where 0', [table])
+      await this.#lockForWrite(trx, table)
       return callback(trx)
     }, config)
+  }
+
+  /** Take the SQLite write lock up front: see `#writeTransaction()`. */
+  async #lockForWrite(trx: Knex.Transaction, table: string): Promise<void> {
+    if (this.#isSqlite()) await trx.raw('update ?? set id = id where 0', [table])
   }
 
   #isSqlite(): boolean {
@@ -622,6 +627,10 @@ export class KnexAdapter implements Adapter {
    * (queue, dedup_id) index rejects a second owner. An existing owner is
    * locked for the transaction. When there is none to lock and a concurrent
    * dispatch inserts first, the transaction runs again and locks that owner.
+   *
+   * On a transaction of the application, the dispatch joins it and runs
+   * once: an error, such as the unique violation of a concurrent dispatch,
+   * goes to the application, which rolls it back.
    */
   async #pushWithDedupTxn(
     queue: string,
@@ -629,21 +638,29 @@ export class KnexAdapter implements Adapter {
     insertRow: Record<string, unknown>,
     dedup: NonNullable<JobData['dedup']>
   ): Promise<PushResult> {
+    const dispatch = async (trx: Knex.Transaction): Promise<PushResult> => {
+      const now = Date.now()
+      const existingResult = await this.#resolveExistingDedup(trx, queue, jobData, dedup, now)
+      if (existingResult) return existingResult
+
+      await trx(this.#jobsTable).insert({
+        ...insertRow,
+        dedup_id: dedup.id,
+        dedup_at: now,
+        dedup_ttl: dedup.ttl ?? null,
+      })
+      return { outcome: 'added' as DedupOutcome, jobId: jobData.id }
+    }
+
+    if (this.#connection.isTransaction) {
+      const trx = this.#connection as Knex.Transaction
+      await this.#lockForWrite(trx, this.#jobsTable)
+      return dispatch(trx)
+    }
+
     while (true) {
       try {
-        return await this.#writeTransaction(this.#jobsTable, async (trx) => {
-          const now = Date.now()
-          const existingResult = await this.#resolveExistingDedup(trx, queue, jobData, dedup, now)
-          if (existingResult) return existingResult
-
-          await trx(this.#jobsTable).insert({
-            ...insertRow,
-            dedup_id: dedup.id,
-            dedup_at: now,
-            dedup_ttl: dedup.ttl ?? null,
-          })
-          return { outcome: 'added' as DedupOutcome, jobId: jobData.id }
-        })
+        return await this.#writeTransaction(this.#jobsTable, dispatch)
       } catch (err) {
         if (!this.#isUniqueViolation(err) && !this.#isDeadlock(err)) throw err
         // The job id itself is the duplicate

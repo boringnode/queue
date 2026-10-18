@@ -2343,6 +2343,7 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
   registerDriverTestSuite({
     test,
     rejectsDuplicateJobIds: true,
+    readsBesideTransaction: true,
     inTransaction: (operation) =>
       connection.transaction((trx) =>
         operation(new KnexAdapter({ connection: trx, tableName, schedulesTableName }))
@@ -2664,6 +2665,7 @@ test.group('Adapter | Knex (MySQL)', (group) => {
   registerDriverTestSuite({
     test,
     rejectsDuplicateJobIds: true,
+    readsBesideTransaction: true,
     inTransaction: (operation) =>
       connection.transaction((trx) =>
         operation(new KnexAdapter({ connection: trx, tableName, schedulesTableName }))

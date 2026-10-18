@@ -554,6 +554,10 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
    * (queue, dedup_id) index rejects a second owner. An existing owner is
    * locked for the transaction. When there is none to lock and a concurrent
    * dispatch inserts first, the transaction runs again and locks that owner.
+   *
+   * On a transaction of the application, the dispatch joins it and runs
+   * once: an error, such as the unique violation of a concurrent dispatch,
+   * goes to the application, which rolls it back.
    */
   async #pushWithDedup(
     connection: Kysely<DB>,
@@ -562,36 +566,47 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     insertRow: Partial<JobRow> & Pick<JobRow, 'id' | 'queue' | 'status' | 'data'>
   ): Promise<PushResult> {
     const dedup = jobData.dedup!
+    const dispatch = async (trx: Transaction<DB>): Promise<PushResult> => {
+      const now = Date.now()
+      const existingResult = await this.#resolveExistingDedup(trx, queue, jobData, dedup, now)
+      if (existingResult) return existingResult
 
-    while (true) {
-      try {
-        return await this.#withTransaction(connection, this.#jobsTable, async (trx) => {
-          const now = Date.now()
-          const existingResult = await this.#resolveExistingDedup(trx, queue, jobData, dedup, now)
-          if (existingResult) return existingResult
-
-          await this.#jobs(trx)
-            .insertInto(this.#jobsTable)
-            .values({
-              ...insertRow,
-              dedup_id: dedup.id,
-              dedup_at: now,
-              dedup_ttl: dedup.ttl ?? null,
-            })
-            .execute()
-          return { outcome: 'added', jobId: jobData.id }
+      await this.#jobs(trx)
+        .insertInto(this.#jobsTable)
+        .values({
+          ...insertRow,
+          dedup_id: dedup.id,
+          dedup_at: now,
+          dedup_ttl: dedup.ttl ?? null,
         })
-      } catch (error) {
-        if (this.#isMissingDedupColumn(error)) {
-          throw new Error(
-            `Dedup columns missing on "${this.#jobsTable}". Run KyselyQueueSchemaService.addDedupColumns() before dispatching jobs with .dedup().`,
-            { cause: error }
-          )
-        }
-        if (!this.#isUniqueViolation(error) && !this.#isDeadlock(error)) throw error
-        // The job id itself is the duplicate
-        if (await this.getJob(jobData.id, queue)) throw error
+        .execute()
+      return { outcome: 'added', jobId: jobData.id }
+    }
+
+    try {
+      if (connection.isTransaction) {
+        const trx = connection as Transaction<DB>
+        await this.#lockForWrite(trx, this.#jobsTable)
+        return await dispatch(trx)
       }
+
+      while (true) {
+        try {
+          return await this.#withTransaction(connection, this.#jobsTable, dispatch)
+        } catch (error) {
+          if (!this.#isUniqueViolation(error) && !this.#isDeadlock(error)) throw error
+          // The job id itself is the duplicate
+          if (await this.getJob(jobData.id, queue)) throw error
+        }
+      }
+    } catch (error) {
+      if (this.#isMissingDedupColumn(error)) {
+        throw new Error(
+          `Dedup columns missing on "${this.#jobsTable}". Run KyselyQueueSchemaService.addDedupColumns() before dispatching jobs with .dedup().`,
+          { cause: error }
+        )
+      }
+      throw error
     }
   }
 
@@ -1013,11 +1028,16 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     callback: (trx: Transaction<DB>) => Promise<T>
   ): Promise<T> {
     return connection.transaction().execute(async (trx) => {
-      if (this.#dialect === 'sqlite') {
-        await sql`update ${sql.table(table)} set id = id where 0`.execute(trx)
-      }
+      await this.#lockForWrite(trx, table)
       return callback(trx)
     })
+  }
+
+  /** Take the SQLite write lock up front: see `#withTransaction()`. */
+  async #lockForWrite(trx: Transaction<DB>, table: string): Promise<void> {
+    if (this.#dialect === 'sqlite') {
+      await sql`update ${sql.table(table)} set id = id where 0`.execute(trx)
+    }
   }
 
   /**

@@ -185,6 +185,7 @@ test.group('Adapter | Kysely (PostgreSQL)', (group) => {
   registerDriverTestSuite({
     test,
     rejectsDuplicateJobIds: true,
+    readsBesideTransaction: true,
     inTransaction: (operation) =>
       connection.transaction().execute((trx) =>
         operation(
@@ -277,6 +278,7 @@ test.group('Adapter | Kysely (MySQL)', (group) => {
   registerDriverTestSuite({
     test,
     rejectsDuplicateJobIds: true,
+    readsBesideTransaction: true,
     inTransaction: (operation) =>
       connection.transaction().execute((trx) =>
         operation(
