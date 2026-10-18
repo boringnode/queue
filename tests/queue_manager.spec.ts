@@ -1,3 +1,5 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from '@japa/runner'
 import * as errors from '../src/exceptions.js'
@@ -5,6 +7,7 @@ import { QueueManager } from '../src/queue_manager.js'
 import { sync } from '../src/drivers/sync_adapter.js'
 import { MemoryLogger } from './_mocks/memory_logger.js'
 import { Locator } from '../src/locator.js'
+import { Job } from '../src/job.js'
 import SendEmailJob from '../examples/jobs/send_email_job.js'
 import type { Adapter } from '../src/contracts/adapter.js'
 
@@ -44,6 +47,37 @@ test.group('QueueManager', () => {
         }),
       errors.E_INVALID_TIMEOUT
     )
+  })
+
+  test('should reject a job class with an invalid timeout', async ({ assert, cleanup }) => {
+    const directory = await mkdtemp(join(tmpdir(), 'queue-jobs-'))
+    cleanup(() => rm(directory, { recursive: true, force: true }))
+    await writeFile(
+      join(directory, 'slow_job.mjs'),
+      'export default class SlowJob { static options = { timeout: "30d" } }\n'
+    )
+
+    const loading = QueueManager.init({
+      default: 'sync',
+      adapters: { sync: sync() },
+      locations: [join(directory, '*.mjs')],
+    })
+    const error = await loading.then(
+      () => undefined,
+      (reason: Error) => reason
+    )
+    assert.instanceOf(error, errors.E_INVALID_TIMEOUT)
+    assert.include(error?.message, 'Invalid timeout "30d" of job "SlowJob"')
+
+    class SlowRegisteredJob extends Job {
+      static options = { timeout: 1.5 }
+      async execute() {}
+    }
+    assert.throws(
+      () => Locator.register('SlowRegisteredJob', SlowRegisteredJob),
+      /Invalid timeout "1.5" of job "SlowRegisteredJob"/
+    )
+    assert.isUndefined(Locator.get('SlowRegisteredJob'))
   })
 
   test('should validate adapter presence', async ({ assert }) => {

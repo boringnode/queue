@@ -800,8 +800,11 @@ The job's own options win, then the queue's `defaultJobOptions`, then the global
 `worker.timeout`. Set `timeout: 0` on a job or a queue to disable a default timeout.
 
 A timeout is a whole number of milliseconds, at most 2147483647 ms (about 24.8 days), the longest
-delay Node timers support. A negative, fractional, or longer timeout in the config makes `QueueManager.init()` throw `E_INVALID_TIMEOUT`; in
-a job's options, it fails the job with that error, without retrying it.
+delay Node timers support. A negative, fractional, or longer timeout throws `E_INVALID_TIMEOUT`:
+in the config, from `QueueManager.init()`; in a job's options, when the job is registered, by
+`Locator.register()` or while `QueueManager.init()` loads `locations`, with the job name in the
+message. A job registered with `hotReload` whose new version has an invalid timeout fails with that
+error, without retrying it.
 
 ## Job Context
 

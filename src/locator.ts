@@ -3,6 +3,7 @@ import * as errors from './exceptions.js'
 import type { JobClass } from './types/main.js'
 import debug from './debug.js'
 import { consoleLogger, type Logger } from './logger.js'
+import { parseTimeout } from './utils.js'
 import { glob } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -70,6 +71,7 @@ class LocatorSingleton {
   register<T extends Job>(name: string, JobClass: JobClass<T>) {
     debug('registering job: %s', name)
 
+    parseTimeout(JobClass.options?.timeout, name)
     this.#registry.set(name, { JobClass, hotReload: false })
   }
 
@@ -106,23 +108,28 @@ class LocatorSingleton {
       for await (const file of glob(pattern)) {
         debug('found job file: %s', file)
 
-        try {
-          const absolutePath = resolve(file)
-          const module = await this.#import(absolutePath, options.hotReload ?? false)
-          const JobClass = module.default as JobClass
+        const absolutePath = resolve(file)
+        let JobClass: JobClass | undefined
 
-          if (JobClass && typeof JobClass === 'function') {
-            const jobName = JobClass.options?.name || JobClass.name
-            this.#registry.set(jobName, {
-              JobClass,
-              path: absolutePath,
-              hotReload: options.hotReload ?? false,
-            })
-            registered++
-          }
+        try {
+          const module = await this.#import(absolutePath, options.hotReload ?? false)
+          JobClass = module.default
         } catch (error) {
           failed++
           logger.error({ err: error as Error, file }, `Failed to load job from ${file}`)
+          continue
+        }
+
+        if (JobClass && typeof JobClass === 'function') {
+          const jobName = JobClass.options?.name || JobClass.name
+          // A configuration error, unlike a file that fails to load: it throws.
+          parseTimeout(JobClass.options?.timeout, jobName)
+          this.#registry.set(jobName, {
+            JobClass,
+            path: absolutePath,
+            hotReload: options.hotReload ?? false,
+          })
+          registered++
         }
       }
     }

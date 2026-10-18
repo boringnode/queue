@@ -3273,23 +3273,4 @@ test.group('Worker | finalization errors', () => {
     assert.equal(errorLogs[0].obj?.jobId, 'failing-hook')
     assert.include(errorLogs[0].message, 'failed()')
   })
-
-  test('logs a job that fails because its own timeout is invalid', async ({ assert, cleanup }) => {
-    class InvalidTimeoutJob extends Job {
-      static options = { timeout: 1.5 }
-
-      async execute() {}
-    }
-
-    const { fixture, logger } = createLoggedFixture()
-    cleanup(() => fixture.cleanup())
-
-    await fixture.push(InvalidTimeoutJob, { id: 'invalid-timeout' })
-    await runOneJob(fixture)
-
-    const errorLogs = logger.logs.filter((entry) => entry.level === 'error')
-    assert.lengthOf(errorLogs, 1)
-    assert.instanceOf(errorLogs[0].obj?.err, errors.E_INVALID_TIMEOUT)
-    assert.equal(errorLogs[0].obj?.jobId, 'invalid-timeout')
-  })
 })

@@ -69,16 +69,17 @@ const MAX_TIMEOUT = 2_147_483_647
  * Parse a job timeout into milliseconds. `undefined` and 0 mean no timeout.
  * Throws for anything `AbortSignal.timeout()` would reject or mishandle: a
  * fraction of a millisecond, a negative timeout, or one longer than Node
- * timers support (which would fire after 1 ms).
+ * timers support (which would fire after 1 ms). The error names `jobName`
+ * when given.
  */
-export function parseTimeout(timeout: Duration | undefined): number | undefined {
+export function parseTimeout(timeout: Duration | undefined, jobName?: string): number | undefined {
   if (timeout === undefined) return undefined
 
   const milliseconds = parse(timeout)
   if (milliseconds === 0) return undefined
 
   if (!Number.isInteger(milliseconds) || milliseconds < 1 || milliseconds > MAX_TIMEOUT) {
-    throw new errors.E_INVALID_TIMEOUT([String(timeout)])
+    throw new errors.E_INVALID_TIMEOUT([String(timeout), jobName ? ` of job "${jobName}"` : ''])
   }
 
   return milliseconds

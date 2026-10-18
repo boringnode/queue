@@ -196,6 +196,8 @@ export class JobExecutionRuntime {
     try {
       ;({ instance, options } = await this.#instantiate(job))
       // An invalid Job.options.timeout fails the Job without retrying it.
+      // Registration rejects one, but a job registered with hotReload is
+      // imported again for every execution, after that check.
       timeout = parseTimeout(this.#configResolver.resolveJobOptions(queue, options).timeout)
     } catch (error) {
       const initializationError = error as Error
