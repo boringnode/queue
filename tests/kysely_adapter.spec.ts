@@ -47,41 +47,12 @@ test.group('Adapter | Kysely (SQLite)', (group) => {
       connection
         .transaction()
         .execute((trx) =>
-          operation(() => new KyselyAdapter<QueueDatabase>({ connection: trx, dialect: 'sqlite' }))
+          operation(new KyselyAdapter<QueueDatabase>({ connection: trx, dialect: 'sqlite' }))
         ),
     createAdapter: () => {
       adapter = new KyselyAdapter({ connection, dialect: 'sqlite' })
       return adapter
     },
-  })
-
-  test('pushManyOn joins the transaction it was given as connection', async ({ assert }) => {
-    const jobs = Array.from({ length: 600 }, (_, index) => ({
-      id: `in-transaction-${index}`,
-      name: 'TestJob',
-      payload: {},
-      attempts: 0,
-    }))
-
-    const failure = await connection
-      .transaction()
-      .execute(async (trx) => {
-        const transactional = new KyselyAdapter<QueueDatabase>({
-          connection: trx,
-          dialect: 'sqlite',
-        })
-        await transactional.pushManyOn('default', jobs)
-        assert.equal(await transactional.sizeOf('default'), 600)
-        throw new Error('roll back')
-      })
-      .then(
-        () => null,
-        (error: Error) => error.message
-      )
-
-    assert.equal(failure, 'roll back')
-    adapter = new KyselyAdapter({ connection, dialect: 'sqlite' })
-    assert.equal(await adapter.sizeOf('default'), 0)
   })
 
   test('dedup should reject a job id that is already stored', async ({ assert }) => {
@@ -217,13 +188,12 @@ test.group('Adapter | Kysely (PostgreSQL)', (group) => {
     inTransaction: (operation) =>
       connection.transaction().execute((trx) =>
         operation(
-          () =>
-            new KyselyAdapter<QueueDatabase>({
-              connection: trx,
-              dialect: 'postgres',
-              tableName,
-              schedulesTableName,
-            })
+          new KyselyAdapter<QueueDatabase>({
+            connection: trx,
+            dialect: 'postgres',
+            tableName,
+            schedulesTableName,
+          })
         )
       ),
     createAdapter: () => {
@@ -310,13 +280,12 @@ test.group('Adapter | Kysely (MySQL)', (group) => {
     inTransaction: (operation) =>
       connection.transaction().execute((trx) =>
         operation(
-          () =>
-            new KyselyAdapter<QueueDatabase>({
-              connection: trx,
-              dialect: 'mysql',
-              tableName,
-              schedulesTableName,
-            })
+          new KyselyAdapter<QueueDatabase>({
+            connection: trx,
+            dialect: 'mysql',
+            tableName,
+            schedulesTableName,
+          })
         )
       ),
     createAdapter: () => {

@@ -749,8 +749,20 @@ export class KnexAdapter implements Adapter {
       score: calculateScore(job.priority ?? DEFAULT_PRIORITY, now),
     }))
 
-    // Inserts in chunks within one transaction: all jobs or none.
-    await this.#connection.batchInsert(this.#jobsTable, rows, SQL_INSERT_CHUNK_SIZE)
+    // Inserts in chunks within one transaction: all jobs or none. On a
+    // transaction of the application, the chunks join it: after a failure,
+    // the application rolls it back.
+    const insertChunks = async (connection: Knex) => {
+      for (let start = 0; start < rows.length; start += SQL_INSERT_CHUNK_SIZE) {
+        await connection(this.#jobsTable).insert(rows.slice(start, start + SQL_INSERT_CHUNK_SIZE))
+      }
+    }
+
+    if (this.#connection.isTransaction) {
+      await insertChunks(this.#connection)
+    } else {
+      await this.#connection.transaction(insertChunks)
+    }
   }
 
   async size(): Promise<number> {

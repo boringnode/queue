@@ -103,13 +103,6 @@ type JobsDatabase = Record<string, QueueJobTable>
 type SchedulesDatabase = Record<string, QueueScheduleTable>
 type InternalKyselyConnection<DB> = Kysely<DB> | Transaction<DB>
 
-/**
- * Last savepoint scope queued on each application transaction. Savepoints
- * nest on the connection, so an overlapping scope would roll back or release
- * the inserts of another batch: scopes on one transaction run one at a time,
- * even across adapters built on it.
- */
-const savepointScopes = new WeakMap<object, Promise<void>>()
 type JobRow = {
   [K in keyof QueueJobTable]: QueueJobTable[K] extends ColumnType<infer S, unknown, unknown>
     ? S
@@ -702,10 +695,9 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
       score: calculateScore(job.priority ?? DEFAULT_PRIORITY, now),
     }))
 
-    // Inserts in chunks within one transaction: all jobs or none. A
-    // connection that is already a transaction cannot open another one: a
-    // savepoint undoes the inserted chunks there, and keeps that transaction
-    // usable when the application recovers from the error.
+    // Inserts in chunks within one transaction: all jobs or none. On a
+    // transaction of the application, the chunks join it: after a failure,
+    // the application rolls it back.
     const insertChunks = async (connection: InternalKyselyConnection<DB>) => {
       for (let start = 0; start < rows.length; start += SQL_INSERT_CHUNK_SIZE) {
         await this.#jobs(connection)
@@ -716,22 +708,7 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
     }
 
     if (this.#connection.isTransaction) {
-      const connection = this.#connection
-      const scope = (savepointScopes.get(connection) ?? Promise.resolve()).then(async () => {
-        await sql`savepoint queue_push_many`.execute(connection)
-        try {
-          await insertChunks(connection)
-        } catch (error) {
-          await sql`rollback to savepoint queue_push_many`.execute(connection)
-          throw error
-        }
-        await sql`release savepoint queue_push_many`.execute(connection)
-      })
-      savepointScopes.set(
-        connection,
-        scope.catch(() => {})
-      )
-      await scope
+      await insertChunks(this.#connection)
     } else {
       await this.#connection.transaction().execute(insertChunks)
     }

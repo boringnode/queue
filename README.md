@@ -192,6 +192,12 @@ console.log(`Dispatched ${jobIds.length} jobs`)
 
 This uses Redis MULTI/EXEC or SQL batch insert for optimal performance.
 
+On SQL adapters, a batch is inserted in chunks of 500 jobs within one transaction: all jobs or
+none. An adapter created on a transaction of your application inserts the chunks in that
+transaction instead. When the batch fails there, the driver error reaches you unchanged and the
+transaction is yours to roll back: PostgreSQL refuses to commit it anyway, while on MySQL and
+SQLite a commit would keep the chunks inserted before the failure.
+
 ## Job Grouping
 
 Organize related jobs together for monitoring and filtering:

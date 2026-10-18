@@ -2187,36 +2187,11 @@ test.group('Adapter | Knex (SQLite)', (group) => {
     test,
     rejectsDuplicateJobIds: true,
     inTransaction: (operation) =>
-      connection.transaction((trx) => operation(() => new KnexAdapter({ connection: trx }))),
+      connection.transaction((trx) => operation(new KnexAdapter({ connection: trx }))),
     createAdapter: () => {
       adapter = new KnexAdapter({ connection })
       return adapter
     },
-  })
-
-  test('pushManyOn joins the transaction it was given as connection', async ({ assert }) => {
-    const jobs = Array.from({ length: 600 }, (_, index) => ({
-      id: `in-transaction-${index}`,
-      name: 'TestJob',
-      payload: {},
-      attempts: 0,
-    }))
-
-    const failure = await connection
-      .transaction(async (trx) => {
-        const transactional = new KnexAdapter({ connection: trx })
-        await transactional.pushManyOn('default', jobs)
-        assert.equal(await transactional.sizeOf('default'), 600)
-        throw new Error('roll back')
-      })
-      .then(
-        () => null,
-        (error: Error) => error.message
-      )
-
-    assert.equal(failure, 'roll back')
-    adapter = new KnexAdapter({ connection })
-    assert.equal(await adapter.sizeOf('default'), 0)
   })
 
   test('addDedupColumns should leave a dedup slot to its latest job', async ({ assert }) => {
@@ -2370,7 +2345,7 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     rejectsDuplicateJobIds: true,
     inTransaction: (operation) =>
       connection.transaction((trx) =>
-        operation(() => new KnexAdapter({ connection: trx, tableName, schedulesTableName }))
+        operation(new KnexAdapter({ connection: trx, tableName, schedulesTableName }))
       ),
     createAdapter: () => {
       adapter = new KnexAdapter({ connection, tableName, schedulesTableName })
@@ -2691,7 +2666,7 @@ test.group('Adapter | Knex (MySQL)', (group) => {
     rejectsDuplicateJobIds: true,
     inTransaction: (operation) =>
       connection.transaction((trx) =>
-        operation(() => new KnexAdapter({ connection: trx, tableName, schedulesTableName }))
+        operation(new KnexAdapter({ connection: trx, tableName, schedulesTableName }))
       ),
     supportsAtomicDedup: false,
     createAdapter: () => {
