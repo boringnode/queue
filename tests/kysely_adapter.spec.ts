@@ -47,7 +47,7 @@ test.group('Adapter | Kysely (SQLite)', (group) => {
       connection
         .transaction()
         .execute((trx) =>
-          operation(new KyselyAdapter<QueueDatabase>({ connection: trx, dialect: 'sqlite' }))
+          operation(() => new KyselyAdapter<QueueDatabase>({ connection: trx, dialect: 'sqlite' }))
         ),
     createAdapter: () => {
       adapter = new KyselyAdapter({ connection, dialect: 'sqlite' })
@@ -217,12 +217,13 @@ test.group('Adapter | Kysely (PostgreSQL)', (group) => {
     inTransaction: (operation) =>
       connection.transaction().execute((trx) =>
         operation(
-          new KyselyAdapter<QueueDatabase>({
-            connection: trx,
-            dialect: 'postgres',
-            tableName,
-            schedulesTableName,
-          })
+          () =>
+            new KyselyAdapter<QueueDatabase>({
+              connection: trx,
+              dialect: 'postgres',
+              tableName,
+              schedulesTableName,
+            })
         )
       ),
     createAdapter: () => {
@@ -309,12 +310,13 @@ test.group('Adapter | Kysely (MySQL)', (group) => {
     inTransaction: (operation) =>
       connection.transaction().execute((trx) =>
         operation(
-          new KyselyAdapter<QueueDatabase>({
-            connection: trx,
-            dialect: 'mysql',
-            tableName,
-            schedulesTableName,
-          })
+          () =>
+            new KyselyAdapter<QueueDatabase>({
+              connection: trx,
+              dialect: 'mysql',
+              tableName,
+              schedulesTableName,
+            })
         )
       ),
     createAdapter: () => {

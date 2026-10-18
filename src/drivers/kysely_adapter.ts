@@ -102,6 +102,14 @@ export interface KyselyAdapterConfig<DB> extends KyselyAdapterOptions {
 type JobsDatabase = Record<string, QueueJobTable>
 type SchedulesDatabase = Record<string, QueueScheduleTable>
 type InternalKyselyConnection<DB> = Kysely<DB> | Transaction<DB>
+
+/**
+ * Last savepoint scope queued on each application transaction. Savepoints
+ * nest on the connection, so an overlapping scope would roll back or release
+ * the inserts of another batch: scopes on one transaction run one at a time,
+ * even across adapters built on it.
+ */
+const savepointScopes = new WeakMap<object, Promise<void>>()
 type JobRow = {
   [K in keyof QueueJobTable]: QueueJobTable[K] extends ColumnType<infer S, unknown, unknown>
     ? S
@@ -689,14 +697,21 @@ export class KyselyAdapter<DB = QueueDatabase> implements Adapter {
 
     if (this.#connection.isTransaction) {
       const connection = this.#connection
-      await sql`savepoint queue_push_many`.execute(connection)
-      try {
-        await insertChunks(connection)
-      } catch (error) {
-        await sql`rollback to savepoint queue_push_many`.execute(connection)
-        throw error
-      }
-      await sql`release savepoint queue_push_many`.execute(connection)
+      const scope = (savepointScopes.get(connection) ?? Promise.resolve()).then(async () => {
+        await sql`savepoint queue_push_many`.execute(connection)
+        try {
+          await insertChunks(connection)
+        } catch (error) {
+          await sql`rollback to savepoint queue_push_many`.execute(connection)
+          throw error
+        }
+        await sql`release savepoint queue_push_many`.execute(connection)
+      })
+      savepointScopes.set(
+        connection,
+        scope.catch(() => {})
+      )
+      await scope
     } else {
       await this.#connection.transaction().execute(insertChunks)
     }

@@ -2187,7 +2187,7 @@ test.group('Adapter | Knex (SQLite)', (group) => {
     test,
     rejectsDuplicateJobIds: true,
     inTransaction: (operation) =>
-      connection.transaction((trx) => operation(new KnexAdapter({ connection: trx }))),
+      connection.transaction((trx) => operation(() => new KnexAdapter({ connection: trx }))),
     createAdapter: () => {
       adapter = new KnexAdapter({ connection })
       return adapter
@@ -2370,7 +2370,7 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     rejectsDuplicateJobIds: true,
     inTransaction: (operation) =>
       connection.transaction((trx) =>
-        operation(new KnexAdapter({ connection: trx, tableName, schedulesTableName }))
+        operation(() => new KnexAdapter({ connection: trx, tableName, schedulesTableName }))
       ),
     createAdapter: () => {
       adapter = new KnexAdapter({ connection, tableName, schedulesTableName })
@@ -2691,7 +2691,7 @@ test.group('Adapter | Knex (MySQL)', (group) => {
     rejectsDuplicateJobIds: true,
     inTransaction: (operation) =>
       connection.transaction((trx) =>
-        operation(new KnexAdapter({ connection: trx, tableName, schedulesTableName }))
+        operation(() => new KnexAdapter({ connection: trx, tableName, schedulesTableName }))
       ),
     supportsAtomicDedup: false,
     createAdapter: () => {

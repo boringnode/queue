@@ -23,10 +23,11 @@ interface DriverTestSuiteOptions {
    */
   rejectsDuplicateJobIds?: boolean
   /**
-   * Runs `operation` with an adapter bound to an application transaction,
-   * then commits it. Enables the tests of adapters joining that transaction.
+   * Runs `operation` within an application transaction, then commits it.
+   * Each `createAdapter()` call returns a new adapter bound to that
+   * transaction. Enables the tests of adapters joining that transaction.
    */
-  inTransaction?: (operation: (adapter: Adapter) => Promise<void>) => Promise<void>
+  inTransaction?: (operation: (createAdapter: () => Adapter) => Promise<void>) => Promise<void>
 }
 
 /** A lease on a job that was never acquired. */
@@ -2409,7 +2410,8 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
       let rejected = false
 
       // The application recovers from the failed batch and commits its other writes.
-      await inTransaction(async (transactionAdapter) => {
+      await inTransaction(async (createTransactionAdapter) => {
+        const transactionAdapter = createTransactionAdapter()
         await transactionAdapter.pushManyOn('test-queue', jobs).catch(() => (rejected = true))
         await transactionAdapter.pushOn('test-queue', {
           id: 'other-write',
@@ -2421,6 +2423,40 @@ export function registerDriverTestSuite(options: DriverTestSuiteOptions) {
 
       assert.isTrue(rejected)
       assert.equal(await adapter.sizeOf('test-queue'), 2)
+    }).timeout(30_000)
+
+    test('concurrent pushManyOn inside a transaction should only undo the failed batch', async ({
+      assert,
+    }) => {
+      const adapter = await options.createAdapter()
+      const failing = largeBatch(600)
+      await adapter.pushOn('test-queue', failing.at(-1)!)
+      const validBatch = (name: string) =>
+        Array.from({ length: 10 }, (_, index) => ({
+          id: `${name}-${index}`,
+          name: 'TestJob',
+          payload: {},
+          attempts: 0,
+        }))
+      const first = validBatch('first')
+      const second = validBatch('second')
+      let outcomes: string[] = []
+
+      // Each batch on its own adapter, all bound to the same transaction.
+      await inTransaction(async (createTransactionAdapter) => {
+        const results = await Promise.allSettled(
+          [failing, first, second].map((jobs) =>
+            createTransactionAdapter().pushManyOn('test-queue', jobs)
+          )
+        )
+        outcomes = results.map((result) => result.status)
+      })
+
+      assert.deepEqual(outcomes, ['rejected', 'fulfilled', 'fulfilled'])
+      for (const job of [...first, ...second]) {
+        assert.isNotNull(await adapter.getJob(job.id, 'test-queue'), job.id)
+      }
+      assert.equal(await adapter.sizeOf('test-queue'), 21)
     }).timeout(30_000)
   }
 
