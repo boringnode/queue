@@ -53,7 +53,7 @@ type QueueManagerFakeState = {
  */
 const workerReservation: { owner?: object; initializing?: object } = {}
 
-/** Reserve QueueManager for a starting Worker: `init()` rejects meanwhile. */
+/** Reserve QueueManager for a starting Worker: `init()` and `destroy()` reject meanwhile. */
 export function reserveQueueManager(worker: object): void {
   workerReservation.owner = worker
 }
@@ -467,6 +467,7 @@ class QueueManagerSingleton {
    *
    * Call this when shutting down the application or when
    * you need to reinitialize with a new configuration.
+   * Throws while a Worker runs in this process: stop it first.
    *
    * @example
    * ```typescript
@@ -475,6 +476,11 @@ class QueueManagerSingleton {
    * ```
    */
   async destroy() {
+    // Synchronous, before the first await, like init().
+    if (workerReservation.owner) {
+      throw new errors.E_DESTROY_WHILE_WORKER_RUNNING()
+    }
+
     for (const [name, adapter] of this.#adapterInstances) {
       debug('destroying adapter "%s"', name)
       await adapter.destroy()

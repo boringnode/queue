@@ -69,6 +69,13 @@ export const E_INIT_WHILE_WORKER_RUNNING = createError(
   500
 )
 
+export const E_DESTROY_WHILE_WORKER_RUNNING = createError(
+  'Cannot call QueueManager.destroy() while a Worker runs in this process: it would destroy the ' +
+    'Adapters of the Worker. Await worker.stop() first.',
+  'E_DESTROY_WHILE_WORKER_RUNNING',
+  500
+)
+
 export const E_QUEUE_NOT_INITIALIZED = createError(
   'QueueManager is not initialized. Call QueueManager.init() before using it.',
   'E_QUEUE_NOT_INITIALIZED',

@@ -942,7 +942,9 @@ dispatch jobs from the Worker process without calling `init()`.
 `await worker.start()` resolves once the Worker is stopped, by SIGINT/SIGTERM when
 `gracefulShutdown` is enabled or by `worker.stop()`, and every running job is finalized. Stopping a
 Worker does not close the Adapter connections (Redis, Knex, Kysely), which keep the process alive:
-call `await QueueManager.destroy()` after `await worker.start()` to let the process exit.
+call `await QueueManager.destroy()` after `await worker.start()` to let the process exit. Called
+while the Worker runs, `QueueManager.destroy()` throws `E_DESTROY_WHILE_WORKER_RUNNING` instead of
+closing the connections of the Worker.
 
 `QueueManager.destroy()` only closes the connections the Adapters created from options. A connection
 your application passed in stays open: an ioredis instance, a Knex instance, or a Kysely instance

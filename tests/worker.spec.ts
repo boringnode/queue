@@ -2947,7 +2947,7 @@ test.group('Worker | one per process', (group) => {
     await running
   })
 
-  test('QueueManager.init() rejects while a Worker runs and keeps its Adapter', async ({
+  test('QueueManager.init() and destroy() reject while a Worker runs and keep its Adapter', async ({
     assert,
     cleanup,
   }) => {
@@ -2971,6 +2971,11 @@ test.group('Worker | one per process', (group) => {
       () => QueueManager.init(config(adapter)),
       errors.E_INIT_WHILE_WORKER_RUNNING
     )
+    const destroyError = await QueueManager.destroy().then(
+      () => undefined,
+      (error: { code?: string }) => error.code
+    )
+    assert.equal(destroyError, 'E_DESTROY_WHILE_WORKER_RUNNING')
     assert.isFalse(adapter.destroyed)
 
     await adapter.push({ id: 'after-init', name: 'CountedJob', payload: {}, attempts: 0 })
