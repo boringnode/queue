@@ -185,8 +185,8 @@ export class Worker {
       throw error
     }
 
+    // Resolves once stop() has drained the session, whose own cleanup ran first.
     await session.start()
-    await this.#stopOperation
   }
 
   #reserveProcess(): void {

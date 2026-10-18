@@ -279,6 +279,46 @@ test.group('WorkerSession', () => {
     assert.isNull(await session.processCycle())
   })
 
+  test('start() resolves only once stop() has finalized every job', async ({ assert, cleanup }) => {
+    const adapter = new ControllableAdapter()
+    const executionStarted = Promise.withResolvers<void>()
+    adapter.finalizations.block(1)
+    const session = createSession({
+      adapter,
+      jobExecutionRuntime: {
+        async execute() {
+          executionStarted.resolve()
+          return { type: 'completed' }
+        },
+      },
+    })
+
+    cleanup(async () => {
+      adapter.releaseAll()
+      await session.stop()
+    })
+
+    await adapter.pushOn('default', {
+      id: 'finalized-before-start-resolves',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      priority: 0,
+    })
+
+    const start = trackPromise(session.start())
+    await executionStarted.promise
+    void session.stop()
+    await adapter.finalizations.waitForStarted()
+    await setTimeout(10)
+
+    assert.isFalse(start.settled, 'start() must wait for the finalization stop() drains')
+
+    adapter.finalizations.release(1)
+    await start.promise
+    assert.isNull(await adapter.getJob('finalized-before-start-resolves', 'default'))
+  })
+
   test('surfaces an initial probe failure without starting fan-out acquisitions', async ({
     assert,
     cleanup,
