@@ -3005,6 +3005,35 @@ test.group('Worker | one per process', (group) => {
     await running
   })
 
+  test('a restart requested during stop() keeps QueueManager reserved', async ({
+    assert,
+    cleanup,
+  }) => {
+    const adapter = new DestroyAwareMemoryAdapter()
+    const worker = new Worker(config(adapter))
+    cleanup(() => worker.stop())
+
+    const firstRun = worker.start(['default'])
+    await setTimeout(10)
+
+    const stopping = worker.stop()
+    const reinit = stopping
+      .then(() => QueueManager.init(config(new MemoryAdapter())))
+      .then(
+        () => 'resolved',
+        (error: { code?: string }) => error.code
+      )
+    const restart = worker.start(['default'])
+    await stopping
+    await firstRun
+
+    assert.equal(await reinit, 'E_INIT_WHILE_WORKER_RUNNING')
+    assert.isFalse(adapter.destroyed)
+
+    await worker.stop()
+    await restart
+  })
+
   test('start() accepts another Worker once the first one stopped', async ({ cleanup }) => {
     const adapter = new MemoryAdapter()
     const first = new Worker(config(adapter))

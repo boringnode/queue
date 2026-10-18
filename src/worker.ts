@@ -65,6 +65,8 @@ export class Worker {
   #session?: WorkerSession
   #stopOperation?: Promise<void>
   #shutdownGeneration = 0
+  /** Bumped by every start(): a stop only releases the process it started from. */
+  #reservation = 0
 
   /** The Worker whose `start()` is running in this process. */
   static #running?: Worker
@@ -161,6 +163,7 @@ export class Worker {
    */
   async start(queues: string[] = ['default']): Promise<void> {
     this.#reserveProcess()
+    const reservation = ++this.#reservation
 
     let session: WorkerSession
 
@@ -168,9 +171,6 @@ export class Worker {
       while (this.#stopOperation) {
         await this.#stopOperation
       }
-
-      // A stop that completed meanwhile released the process.
-      this.#reserveProcess()
 
       const shutdownGeneration = this.#shutdownGeneration
       await this.init()
@@ -181,7 +181,7 @@ export class Worker {
       this.#setupGracefulShutdown()
     } catch (error) {
       // Nothing runs for this Worker yet: another one can start.
-      if (!this.#session) this.#releaseProcess()
+      if (!this.#session && reservation === this.#reservation) this.#releaseProcess()
       throw error
     }
 
@@ -236,6 +236,7 @@ export class Worker {
   async #stop(): Promise<void> {
     debug('stopping worker %s', this.#id)
     this.#shutdownGeneration++
+    const reservation = this.#reservation
 
     if (this.#initOperation) {
       debug('worker %s: waiting for initialization to complete', this.#id)
@@ -252,8 +253,9 @@ export class Worker {
 
     this.#removeShutdownHandlers()
 
-    // Every job has been finalized: the Adapters are no longer needed.
-    this.#releaseProcess()
+    // Every job has been finalized: the Adapters are no longer needed,
+    // unless start() was called meanwhile and still holds the process.
+    if (reservation === this.#reservation) this.#releaseProcess()
   }
 
   /**

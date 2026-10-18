@@ -10,7 +10,8 @@ another job.
 `QueueManager.init()` now throws the new `E_INIT_WHILE_WORKER_RUNNING` error, and changes nothing,
 from the moment `worker.start()` is called until the Worker has stopped. The Worker initializes
 QueueManager with its config: dispatch jobs without calling `init()`. Once the Worker has stopped,
-`init()` works again.
+`init()` works again. A `start()` called while a `stop()` is still in progress keeps the refusal in
+place: the earlier stop no longer frees QueueManager for the restarted Worker.
 
 ## Breaking Changes
 
