@@ -19,7 +19,8 @@ type LocatorEntry = {
   hotReload: boolean
 }
 
-type RegisterFromGlobOptions = {
+/** Options of `Locator.registerFromGlob()`. */
+export type RegisterFromGlobOptions = {
   hotReload?: boolean
   /**
    * Receives the files that fail to load, and the warning when no job is

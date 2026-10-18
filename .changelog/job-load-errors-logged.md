@@ -10,4 +10,5 @@ patterns did match.
 A file that fails to load is now logged at the `error` level through the configured logger, with
 the error in `err` and the path in `file`. The `No jobs found` warning is only logged when no file
 failed to load. `Locator.registerFromGlob()` accepts a `logger` option, which defaults to the
-console logger, and now logs the `No jobs found` warning itself.
+console logger, and now logs the `No jobs found` warning itself. Its options are exported from
+`@boringnode/queue/types` as `RegisterFromGlobOptions`.

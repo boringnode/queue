@@ -38,4 +38,6 @@ export type {
   StalledJobsRecovery,
 } from '../contracts/adapter.js'
 
+export type { RegisterFromGlobOptions } from '../locator.js'
+
 export type { JobDispatchMessage, JobExecuteMessage } from './tracing_channels.js'

@@ -1,7 +1,8 @@
 import { spawnSync } from 'node:child_process'
 import { readdir, readFile } from 'node:fs/promises'
 import { test } from '@japa/runner'
-import type { DedupOutcome, PushResult } from '../src/types/index.js'
+import type { DedupOutcome, PushResult, RegisterFromGlobOptions } from '../src/types/index.js'
+import type { Locator } from '../src/locator.js'
 import type { redis, RedisConfig } from '../src/drivers/redis_adapter.js'
 import type { knex, KnexConfig } from '../src/drivers/knex_adapter.js'
 
@@ -47,6 +48,9 @@ test('public types cover adapter results and adapter configs', ({ expectTypeOf }
   expectTypeOf<PushResult['outcome']>().toEqualTypeOf<DedupOutcome>()
   expectTypeOf<Parameters<typeof redis>[0]>().toEqualTypeOf<RedisConfig | undefined>()
   expectTypeOf<Parameters<typeof knex>[0]>().toEqualTypeOf<KnexConfig>()
+  expectTypeOf<Parameters<typeof Locator.registerFromGlob>[1]>().toEqualTypeOf<
+    RegisterFromGlobOptions | undefined
+  >()
 })
 
 test('package exports every adapter and no internal driver module', async ({ assert }) => {
