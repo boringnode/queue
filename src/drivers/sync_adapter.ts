@@ -30,8 +30,8 @@ export class SyncAdapter implements Adapter {
     return this.pushOn('default', jobData)
   }
 
-  pushOn(queue: string, jobData: JobData): Promise<void> {
-    return this.#execute(jobData, queue)
+  async pushOn(queue: string, jobData: JobData): Promise<void> {
+    return this.#execute(JSON.stringify(jobData), queue)
   }
 
   pushLater(jobData: JobData, delay: number): Promise<void> {
@@ -42,10 +42,11 @@ export class SyncAdapter implements Adapter {
    * Run the job after the delay, in this process. `destroy()` cancels the
    * jobs whose delay has not elapsed.
    */
-  pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<void> {
+  async pushLaterOn(queue: string, jobData: JobData, delay: number): Promise<void> {
+    const job = JSON.stringify(jobData)
     const timeout = setTimeout(() => {
       this.#pendingTimeouts.delete(timeout)
-      void this.#execute(jobData, queue).catch((error) => {
+      void this.#execute(job, queue).catch((error) => {
         QueueManager.getLogger().error(
           { err: error, jobId: jobData.id, jobName: jobData.name, queue },
           'Failed to execute delayed sync job'
@@ -53,8 +54,6 @@ export class SyncAdapter implements Adapter {
       })
     }, delay)
     this.#pendingTimeouts.add(timeout)
-
-    return Promise.resolve()
   }
 
   pushMany(jobs: JobData[]): Promise<void> {
@@ -66,8 +65,9 @@ export class SyncAdapter implements Adapter {
       throw new Error('dedup is not supported in batch dispatch; use single dispatch')
     }
 
-    for (const job of jobs) {
-      await this.pushOn(queue, job)
+    // Encoded up front: a batch JSON cannot encode runs none of its jobs.
+    for (const job of jobs.map((jobData) => JSON.stringify(jobData))) {
+      await this.#execute(job, queue)
     }
   }
 
@@ -173,14 +173,18 @@ export class SyncAdapter implements Adapter {
     return Promise.resolve(null)
   }
 
-  async #execute(jobData: JobData, queue: string = 'default'): Promise<void> {
+  /**
+   * Run a job stored as JSON, as real adapters store it: each attempt gets
+   * its own copy, and shares no object with the caller.
+   */
+  async #execute(job: string, queue: string = 'default'): Promise<void> {
     const runtime = QueueManager.getJobExecutionRuntime()
-    let attempts = jobData.attempts
+    let attempts = (JSON.parse(job) as JobData).attempts
 
     while (true) {
       const now = Date.now()
       const acquiredJob: AcquiredJob = {
-        ...jobData,
+        ...(JSON.parse(job) as JobData),
         attempts,
         acquiredAt: now,
         leaseToken: createLeaseToken('sync'),

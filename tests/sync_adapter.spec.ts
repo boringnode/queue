@@ -144,6 +144,38 @@ test.group('SyncAdapter', (group) => {
     assert.equal((logger.logs[0].obj?.err as Error).message, 'failed hook exploded')
   })
 
+  test('should pass payloads through JSON, like real adapters', async ({ assert }) => {
+    type Payload = { sentAt: Date | string; tags: string[] | bigint }
+    const received: Payload[] = []
+
+    class JsonSyncJob extends Job<Payload> {
+      async execute() {
+        received.push(structuredClone(this.payload))
+        ;(this.payload.tags as string[]).push('handler')
+      }
+    }
+
+    await QueueManager.init({ default: 'sync', adapters: { sync: sync() } })
+    Locator.register('JsonSyncJob', JsonSyncJob)
+
+    const payload = { sentAt: new Date(0), tags: ['a'] }
+    await JsonSyncJob.dispatch(payload).run()
+    assert.deepEqual(payload.tags, ['a'], 'the handler mutated the caller payload')
+
+    await JsonSyncJob.dispatch(payload).in(10).run()
+    payload.tags.push('after-dispatch')
+    await sleep(40)
+
+    const expected = { sentAt: '1970-01-01T00:00:00.000Z', tags: ['a'] }
+    assert.deepEqual(received, [expected, expected])
+    await assert.rejects(() => JsonSyncJob.dispatch({ sentAt: '', tags: 1n }).run(), /BigInt/)
+    await assert.rejects(
+      () => JsonSyncJob.dispatch({ sentAt: '', tags: 1n }).in(10).run(),
+      /BigInt/
+    )
+    assert.lengthOf(received, 2)
+  })
+
   test('destroy() should cancel delayed jobs that have not run yet', async ({ assert }) => {
     let executions = 0
 

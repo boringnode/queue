@@ -656,6 +656,9 @@ Use the `sync` adapter for tests and lightweight local development only.
 - This means the caller can stay blocked for the full retry duration.
 - A delayed job (`.in()`) runs in a timer of the process. `QueueManager.destroy()` cancels the
   delayed jobs that have not run yet.
+- Like the real adapters, it passes each job through JSON: the handler gets a `Date` as an ISO
+  string, never the caller's own objects, and a payload JSON cannot encode, such as a `BigInt`, makes
+  the dispatch reject.
 
 Example: with `maxRetries: 3` and an exponential backoff of about `1s`, `2s`, `4s`,
 the request or command that dispatched the job can stay busy for about 7 seconds
