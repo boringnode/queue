@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createServer, type AddressInfo } from 'node:net'
 import Knex from 'knex'
 import type { Knex as KnexTypes } from 'knex'
 import { test } from '@japa/runner'
@@ -214,6 +215,25 @@ test.group('Adapter | Redis', (group) => {
     assert.isTrue(await second.wait(2000, new AbortController().signal, 0))
     assert.closeTo(Date.now() - start, 200, 100)
   })
+
+  test('aborts a blocking connection stuck in its handshake', async ({ assert, cleanup }) => {
+    // Accepts connections and never answers.
+    const blackhole = createServer(() => {})
+    await new Promise<void>((resolve) => blackhole.listen(0, '127.0.0.1', resolve))
+    cleanup(() => void blackhole.close())
+    const port = (blackhole.address() as AddressInfo).port
+    const direct = new Redis(connection.options)
+    direct.duplicate = (override?: Partial<RedisOptions>) =>
+      new Redis({ ...connection.options, host: '127.0.0.1', port, ...override })
+    cleanup(() => direct.disconnect())
+
+    const controller = new AbortController()
+    const adapter = new RedisAdapter(direct, false, new MemoryLogger())
+    const watching = adapter.watch(['default'], controller.signal)
+    setTimeout(() => controller.abort(), 100)
+
+    await assert.rejects(() => watching)
+  }).timeout(2000)
 
   test('reconnects a blocking connection that stops answering', async ({ assert, cleanup }) => {
     shortenHeartbeat(cleanup)
@@ -2689,6 +2709,60 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
 
     await assert.rejects(() => watcher)
     assert.isTrue(created[0].ended)
+  })
+
+  test('rejects a LISTEN probe whose connection stalls', async ({ assert, cleanup }) => {
+    // The LISTEN connection works, the probe never completes its handshake.
+    fakeListenClients(cleanup, (index) =>
+      index === 1 ? 'real' : { connect: () => new Promise(() => {}) }
+    )
+    const watching = new KnexAdapter({
+      connection,
+      tableName,
+      schedulesTableName,
+      notifications: true,
+    })
+
+    await assert.rejects(() => watching.watch!(['default']), /do not enable notifications/)
+  }).timeout(5000)
+
+  test('ignores a notification that is not a wake message', async ({ assert, cleanup }) => {
+    const options = { connection, tableName, schedulesTableName, notifications: true }
+    const watcher = await new KnexAdapter(options).watch!(['default'])
+    cleanup(() => watcher.close())
+    watcher.reset()
+    const waiting = watcher.wait(2000, new AbortController().signal, 0)
+
+    await connection.raw(`select pg_notify(?, 'null')`, [tableName])
+    const job = { id: 'after-null', name: 'TestJob', payload: {}, attempts: 0 }
+    await new KnexAdapter(options).pushOn('default', job)
+    assert.isTrue(await waiting)
+  })
+
+  test('watches tables found through the search path', async ({ assert, cleanup }) => {
+    const schema = 'queue_search_path'
+    await connection.raw('create schema if not exists ??', [schema])
+    cleanup(() => connection.raw('drop schema ?? cascade', [schema]))
+    // Tables only the search path finds, unlike those of the other tests.
+    const tables = { tableName: 'tenant_jobs', schedulesTableName: 'tenant_schedules' }
+    for (const [table, like] of [
+      [tables.tableName, tableName],
+      [tables.schedulesTableName, schedulesTableName],
+    ]) {
+      await connection.raw('create table ?? (like ?? including all)', [`${schema}.${table}`, like])
+    }
+    const tenant = Knex({ ...connection.client.config, searchPath: [schema] })
+    cleanup(() => tenant.destroy())
+    const options = { connection: tenant, ...tables, notifications: true }
+
+    const watcher = await new KnexAdapter(options).watch!(['default'])
+    cleanup(() => watcher.close())
+    watcher.reset()
+    const waiting = watcher.wait(2000, new AbortController().signal, 0)
+
+    const job = { id: 'tenant-job', name: 'TestJob', payload: {}, attempts: 0 }
+    await new KnexAdapter(options).pushOn('default', job)
+    assert.isTrue(await waiting)
   })
 
   test('does not wake again for a due schedule a concurrent claim holds', async ({

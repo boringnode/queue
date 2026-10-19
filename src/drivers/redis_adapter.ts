@@ -123,11 +123,14 @@ export class RedisAdapter implements Adapter {
     blocking.on('error', (error) => {
       this.#logger.error({ err: error }, 'Redis blocking connection error')
     })
-    const abort = () => blocking.disconnect()
+    // A PING queued during a silent handshake never settles: abort rejects.
+    const aborted = Promise.withResolvers<never>()
+    aborted.promise.catch(() => {})
+    const abort = () => aborted.reject(signal!.reason)
     signal?.addEventListener('abort', abort, { once: true })
 
     try {
-      await blocking.ping()
+      await Promise.race([blocking.ping(), aborted.promise])
       const seedKeys = queues.flatMap((queue) => {
         const keys = this.#getKeys(queue)
         return [keys.pending, keys.delayed, keys.marker]

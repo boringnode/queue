@@ -34,13 +34,15 @@ export function dispatchWakeMessage(
   onWake: WakeListener,
   onSchedule: WakeListener
 ): void {
-  let message: Partial<{ ready: unknown; due: unknown; schedule: unknown }>
+  let message: Partial<{ ready: unknown; due: unknown; schedule: unknown }> | null
 
   try {
     message = JSON.parse(raw)
   } catch {
     return
   }
+  // Any role allowed to connect can notify the channel, with any payload.
+  if (!message || typeof message !== 'object') return
 
   if (typeof message.schedule === 'number') {
     onSchedule(message.schedule)
