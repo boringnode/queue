@@ -2745,6 +2745,23 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     assert.isTrue(created[1].destroyed)
   }).timeout(5000)
 
+  test('aborts a watch whose connection settings lookup stalls', async ({ assert, cleanup }) => {
+    const stalled = Knex({ client: 'pg', connection: () => new Promise(() => {}) })
+    cleanup(() => stalled.destroy())
+    const watching = new KnexAdapter({
+      connection: stalled,
+      tableName,
+      schedulesTableName,
+      notifications: true,
+    })
+    const controller = new AbortController()
+
+    const watcher = watching.watch!(['default'], controller.signal)
+    setTimeout(() => controller.abort(), 50)
+
+    await assert.rejects(() => watcher)
+  }).timeout(2000)
+
   test('aborts a first LISTEN connection still in its handshake', async ({ assert, cleanup }) => {
     const created = fakeListenClients(cleanup, () => ({ connect: () => new Promise(() => {}) }))
     const watching = new KnexAdapter({
