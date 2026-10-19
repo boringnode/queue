@@ -426,7 +426,8 @@ export class KnexAdapter implements Adapter {
         payload: encodeWakeMessage({ probe: randomUUID() }),
         received: Promise.withResolvers(),
       }
-      const { received } = probe
+      const { received, payload } = probe
+      const sender = await createClient()
       let timer: NodeJS.Timeout | undefined
       const timeout = new Promise<never>((_resolve, reject) => {
         timer = setTimeout(
@@ -440,11 +441,15 @@ export class KnexAdapter implements Adapter {
           LISTEN_PROBE_TIMEOUT
         )
       })
-      const sender = await createClient()
+      // The timeout covers the connection of the sender too: it may stall.
+      const exchange = (async () => {
+        await sender.connect()
+        await sender.query('select pg_notify($1, $2)', [channel, payload])
+        await received.promise
+      })()
+      exchange.catch(() => {})
       try {
-        await Promise.race([sender.connect(), closing.promise])
-        await sender.query('select pg_notify($1, $2)', [channel, probe.payload])
-        await Promise.race([received.promise, timeout, closing.promise])
+        await Promise.race([exchange, timeout, closing.promise])
       } finally {
         clearTimeout(timer)
         probe = undefined
@@ -466,6 +471,8 @@ export class KnexAdapter implements Adapter {
         })
       })
       await Promise.race([connection.connect(), closing.promise])
+      // Announcements read unqualified tables, as the pool does.
+      await knexClient.setSchemaSearchPath(connection)
       await connection.query(`LISTEN "${channel.replaceAll('"', '""')}"`)
       if (closed) return release()
       await verify()
