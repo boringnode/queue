@@ -939,7 +939,7 @@ const config = {
   worker: {
     adapter: 'redis', // Registered Adapter listened to by this Worker
     concurrency: 5, // Parallel jobs
-    idleDelay: '2s', // Poll interval when idle (adapters without wake signals)
+    idleDelay: '2s', // Poll interval when idle. PostgreSQL: wait after a wake that found nothing
     timeout: '1m', // Default job timeout
     stalledThreshold: '30s', // When to consider job stalled
     stalledInterval: '30s', // How often to check
@@ -950,19 +950,26 @@ const config = {
 }
 ```
 
-On Redis and PostgreSQL (Knex), an idle Worker does not poll: the Adapter signals new jobs through
-Redis pub/sub or `LISTEN`/`NOTIFY`, and the Worker also wakes when a delayed job, a retry, or a
-schedule becomes due. A job dispatched in a PostgreSQL transaction is signaled when it commits. A
-signal can be lost, so the Worker still checks its queues every `stalledInterval`. Behind a pooler
-that does not support `LISTEN`, such as PgBouncer in transaction mode, pass `notifications: false`
-to `knex()`. MySQL, SQLite, and Kysely poll every `idleDelay`.
+On Redis and PostgreSQL (Knex), an idle Worker does not poll: it waits until a job is dispatched, or
+a delayed job, a retry, or a schedule becomes due. The Worker still checks its queues every
+`stalledInterval`, in case a wake was lost.
 
-The process that dispatches a job sends its signal. A job dispatched by an older version of the
-package, or written to the storage without the Adapter, sends none: the Worker finds it at its next
+- Redis: Workers wait on a marker with `BZPOPMIN`, as in BullMQ. A dispatched job wakes one idle
+  Worker, which wakes the next one while jobs remain.
+- PostgreSQL: Workers `LISTEN` for a `NOTIFY` that wakes all of them. A Worker woken for a job
+  another Worker took waits `idleDelay` before it looks again, so idle Workers never query more
+  often than when polling. A job dispatched in a transaction wakes Workers when it commits. Behind
+  a pooler that does not support `LISTEN`, such as PgBouncer in transaction mode, pass
+  `notifications: false` to `knex()`.
+- MySQL, SQLite, and Kysely poll every `idleDelay`.
+
+The process that dispatches a job wakes the Workers. A job dispatched by an older version of the
+package, or written to the storage without the Adapter, wakes none: the Worker finds it at its next
 stalled check. Upgrade the processes that dispatch jobs with, or before, the Workers. Each Worker
-holds one more connection for its subscription: a Redis connection, or a PostgreSQL connection
-outside of the Knex pool. The Worker pings it every 10 seconds and reconnects when it gets no answer
-within 5 seconds.
+holds one more connection to wait for work, checked every 10 seconds.
+
+Prefer fewer Workers with a higher `concurrency` to many Workers with a `concurrency` of 1: each
+Worker holds connections, and on PostgreSQL every `NOTIFY` reaches every Worker.
 
 Run one Worker per process. A Worker listens on one Adapter, so to process the queues of several
 Adapters, start one process per Adapter. Starting a second Worker while another one runs in the

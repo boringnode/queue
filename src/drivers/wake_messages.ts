@@ -1,34 +1,37 @@
-import type { WakeListener } from '../contracts/adapter.js'
+/**
+ * Receives the time (epoch ms) at which work may become due: now for a job
+ * ready to run, later for a delayed job, a retry, or a schedule.
+ */
+export type WakeListener = (at: number) => void
 
 /**
- * Message adapters publish on their wake channel.
+ * Message published on the LISTEN channel of the Knex adapter.
  *
  * - `{ queue, at }`: a job of `queue` becomes due at `at` (epoch ms).
  * - `{ queue }`: a job of `queue` is ready now. Without a timestamp, a
- *   writer whose clock runs ahead cannot delay the subscriber.
- * - `{ schedules: true }`: schedules changed. A schedule is not tied to a
- *   queue and its next run is not always known by the writer, so subscribers
- *   read the next due schedule from storage.
- * - `{ probe }`: sent by a subscriber to check that its connection receives
- *   notifications. Other subscribers ignore it.
+ *   writer whose clock runs ahead cannot delay the watcher.
+ * - `{ schedule }`: the next schedule run after a schedule changed, read by
+ *   the writer so watchers do not each read it.
+ * - `{ probe }`: sent by a watcher to check that its connection receives
+ *   notifications. Other watchers ignore it.
  */
-export type WakeMessage = { queue: string; at?: number } | { schedules: true } | { probe: string }
+export type WakeMessage = { queue: string; at?: number } | { schedule: number } | { probe: string }
 
 export function encodeWakeMessage(message: WakeMessage): string {
   return JSON.stringify(message)
 }
 
 /**
- * Route a raw message of the wake channel to `onWake`. Messages for other
- * queues are ignored; schedule changes call `readNextSchedule`.
+ * Route a raw message of the wake channel: a job of a watched queue to
+ * `onWake`, the next schedule run to `onSchedule`. Others are ignored.
  */
-export async function dispatchWakeMessage(
+export function dispatchWakeMessage(
   raw: string,
   queues: readonly string[],
   onWake: WakeListener,
-  readNextSchedule: () => Promise<number | null>
-): Promise<void> {
-  let message: Partial<{ queue: unknown; at: unknown; schedules: unknown }>
+  onSchedule: WakeListener
+): void {
+  let message: Partial<{ queue: unknown; at: unknown; schedule: unknown }>
 
   try {
     message = JSON.parse(raw)
@@ -36,20 +39,17 @@ export async function dispatchWakeMessage(
     return
   }
 
-  if (message.schedules === true) {
-    const at = await readNextSchedule()
-    if (at !== null) onWake(at)
-    return
-  }
-
-  if (typeof message.queue === 'string' && queues.includes(message.queue)) {
+  if (typeof message.schedule === 'number') {
+    onSchedule(message.schedule)
+  } else if (typeof message.queue === 'string' && queues.includes(message.queue)) {
     onWake(typeof message.at === 'number' ? message.at : Date.now())
   }
 }
 
 /**
- * How often a subscription connection is pinged, and how long it has to
- * answer. Tests shorten them.
+ * How often a watcher checks its connection, and how long the connection has
+ * to answer: a PING on the LISTEN connection, or the timeout of BZPOPMIN on
+ * Redis. Tests shorten them.
  */
 export const subscriptionHeartbeat = { interval: 10_000, timeout: 5_000 }
 

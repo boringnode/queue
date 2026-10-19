@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { setTimeout as sleep } from 'node:timers/promises'
 import KnexPkg from 'knex'
 import type { Knex } from 'knex'
 import type {
@@ -7,8 +8,7 @@ import type {
   JobLease,
   PushResult,
   StalledJobsRecovery,
-  Unsubscribe,
-  WakeListener,
+  WorkWatcher,
 } from '../contracts/adapter.js'
 import type {
   AdapterFactoryContext,
@@ -41,8 +41,10 @@ import {
   dispatchWakeMessage,
   encodeWakeMessage,
   startHeartbeat,
+  type WakeListener,
   type WakeMessage,
 } from './wake_messages.js'
+import { WorkerWakeup } from './worker_wakeup.js'
 
 export { KnexQueueSchemaService } from '../services/knex_queue_schema.js'
 export type { ScheduleDatesMigrationOptions } from '../services/schedule_dates.js'
@@ -69,7 +71,7 @@ export interface KnexAdapterOptions {
 interface PgListenClient {
   connect(): Promise<void>
   end(): Promise<void>
-  query(sql: string): Promise<unknown>
+  query(sql: string, values?: unknown[]): Promise<{ rows: DbRow[] }>
   on(
     event: 'notification',
     listener: (message: { channel: string; payload?: string }) => void
@@ -90,13 +92,25 @@ function wakeChannelName(table: string): string {
 const LISTEN_RECONNECT_DELAY = 1000
 const LISTEN_PROBE_TIMEOUT = 2000
 const LISTEN_MAX_RECONNECT_DELAY = 30_000
+/**
+ * Every NOTIFY reaches every LISTEN connection of the database: outside of
+ * transactions, a queue gets at most one signal per interval per adapter.
+ */
+const SIGNAL_INTERVAL = 50
 
 /**
- * A subscriber and the next schedule run it was told about.
+ * A watcher and the next schedule run it was told about.
  */
 interface ScheduleWatcher {
   onWake: WakeListener
   at: number | null
+}
+
+/** Signals of a queue that wait for the next interval. */
+interface QueueSignal {
+  ready: boolean
+  at: number | null
+  sent: Promise<void>
 }
 
 /**
@@ -174,19 +188,15 @@ export class KnexAdapter implements Adapter {
   readonly #logger: Logger
   /** Set on PostgreSQL with notifications enabled: the jobs table names the channel. */
   readonly #wakeChannel?: string
-  /** Queues with a NOTIFY of ready jobs in flight: see #pushReady. */
-  readonly #readySignals = new Map<string, { pending: boolean; sent: Promise<void> }>()
-  /** Subscribers of this adapter: see claimDueSchedule. */
+  /** Queues with a signal in flight: see #signal. */
+  readonly #signals = new Map<string, QueueSignal>()
+  /** Watchers of this adapter: see claimDueSchedule. */
   readonly #scheduleWatchers = new Set<ScheduleWatcher>()
   #workerId: string = ''
   #scheduleDatesCheck: Promise<void> | undefined
 
-  /** Defined on PostgreSQL with notifications enabled. See `Adapter.subscribe`. */
-  readonly subscribe?: (
-    queues: readonly string[],
-    onWake: WakeListener,
-    signal?: AbortSignal
-  ) => Promise<Unsubscribe>
+  /** Defined on PostgreSQL with notifications enabled. See `Adapter.watch`. */
+  readonly watch?: (queues: readonly string[], signal?: AbortSignal) => Promise<WorkWatcher>
 
   constructor(config: KnexAdapterOptions) {
     this.#connection = config.connection
@@ -197,7 +207,15 @@ export class KnexAdapter implements Adapter {
 
     if (this.#connection.client.dialect === 'postgresql' && config.notifications !== false) {
       this.#wakeChannel = wakeChannelName(this.#jobsTable)
-      this.subscribe = (queues, onWake, signal) => this.#listen(queues, onWake, signal)
+      this.watch = async (queues, signal) => {
+        const wakeup = new WorkerWakeup()
+        const close = await this.#listen(queues, (at) => wakeup.notify(at), signal)
+        return {
+          reset: () => wakeup.reset(),
+          wait: (maxDelay, abort, cooldown) => wakeup.wait(maxDelay, abort, cooldown),
+          close,
+        }
+      }
     }
   }
 
@@ -228,59 +246,70 @@ export class KnexAdapter implements Adapter {
   }
 
   /**
-   * Insert a job ready now and signal it.
+   * Signal work of `queue`: ready now, or due at `at`.
    *
-   * PostgreSQL serializes the commits that NOTIFY, so a NOTIFY per push
-   * would halve the throughput of concurrent dispatches. Outside of a
-   * transaction, the push returns once the job is stored and a queue has
-   * at most one NOTIFY in flight per adapter: a push that commits meanwhile
-   * asks for one more, sent once it completes, so after that commit.
-   * `destroy()` waits for them.
+   * In a transaction, the NOTIFY joins it. Otherwise, the work is stored and
+   * the signal is sent in the background: PostgreSQL serializes the commits
+   * that NOTIFY, and delivers each NOTIFY to every LISTEN connection. A queue
+   * gets at most one signal per SIGNAL_INTERVAL per adapter; the signals
+   * asked for meanwhile join the next one, with the earliest due time. That
+   * is enough: promoting a delayed job announces the next one. `destroy()`
+   * waits for them.
    */
-  async #pushReady(queue: string, row: Record<string, unknown>): Promise<void> {
-    if (!this.#wakeChannel || this.#connection.isTransaction) {
-      return this.#insertJob(row, { queue })
+  async #signal(queue: string, at?: number): Promise<void> {
+    if (!this.#wakeChannel) return
+    if (this.#connection.isTransaction) {
+      return this.#notify(this.#connection, at === undefined ? { queue } : { queue, at })
     }
 
-    await this.#connection(this.#jobsTable).insert(row)
-    this.#signalReady(queue)
-  }
-
-  /** Signal a ready job of `queue` that is already committed. */
-  #signalReady(queue: string): void {
-    const inFlight = this.#readySignals.get(queue)
-    if (inFlight) {
-      inFlight.pending = true
-      return
+    const pending = this.#signals.get(queue)
+    const state = pending ?? { ready: false, at: null, sent: Promise.resolve() }
+    if (at === undefined || at <= Date.now()) {
+      state.ready = true
+    } else {
+      state.at = Math.min(state.at ?? Infinity, at)
     }
+    if (pending) return
 
-    const state = { pending: true, sent: Promise.resolve() }
-    this.#readySignals.set(queue, state)
+    this.#signals.set(queue, state)
     state.sent = (async () => {
-      while (state.pending) {
-        state.pending = false
-        await this.#notify(this.#connection, { queue })
+      while (state.ready || state.at !== null) {
+        const { ready, at: dueAt } = state
+        state.ready = false
+        state.at = null
+        if (ready) await this.#notify(this.#connection, { queue })
+        if (dueAt !== null) await this.#notify(this.#connection, { queue, at: dueAt })
+        await sleep(SIGNAL_INTERVAL)
       }
-      this.#readySignals.delete(queue)
+      this.#signals.delete(queue)
     })()
   }
 
   /**
-   * Insert a job row and NOTIFY the workers in one statement, so the signal
-   * costs no round trip to dispatch.
+   * Insert a job row and signal it. In a transaction, the insert and the
+   * NOTIFY run in one statement, so the signal costs no round trip.
    */
-  async #insertJob(row: Record<string, unknown>, message: WakeMessage): Promise<void> {
+  async #insertJob(row: Record<string, unknown>, queue: string, at?: number): Promise<void> {
     const insert = this.#connection(this.#jobsTable).insert(row)
-    if (!this.#wakeChannel) {
+    if (!this.#wakeChannel || !this.#connection.isTransaction) {
       await insert
+      await this.#signal(queue, at)
       return
     }
 
+    const message: WakeMessage = at === undefined ? { queue } : { queue, at }
     await this.#connection.raw('with inserted as (?) select pg_notify(?, ?)', [
       insert,
       this.#wakeChannel,
       encodeWakeMessage(message),
     ])
+  }
+
+  /** Tell watchers the next schedule run, read in the same transaction. */
+  async #notifySchedules(connection: Knex): Promise<void> {
+    if (!this.#wakeChannel) return
+    const at = await this.#nextScheduleAt(connection)
+    if (at !== null) await this.#notify(connection, { schedule: at })
   }
 
   /**
@@ -295,7 +324,7 @@ export class KnexAdapter implements Adapter {
     queues: readonly string[],
     onWake: WakeListener,
     signal?: AbortSignal
-  ): Promise<Unsubscribe> {
+  ): Promise<() => Promise<void>> {
     const channel = this.#wakeChannel!
     const knexClient = this.#connection.client
     const watcher: ScheduleWatcher = { onWake, at: null }
@@ -332,19 +361,28 @@ export class KnexAdapter implements Adapter {
       return new knexClient.driver.Client(providedSettings)
     }
 
-    // Signals sent before listening, or while disconnected, are lost.
-    const announce = async () => {
+    // Signals sent before listening, or while disconnected, are lost. The
+    // LISTEN connection reads them: the pool keeps a connection it adds.
+    const announce = async (connection: PgListenClient) => {
+      const read = async (query: Knex.QueryBuilder) => {
+        const { sql, bindings } = query.toSQL().toNative()
+        return (await connection.query(sql, [...bindings])).rows
+      }
       onWake(Date.now())
       // One per queue: promoting a job only announces the next one of its queue.
-      const rows: Array<{ at: number | string | null }> = await this.#connection(this.#jobsTable)
-        .whereIn('queue', [...queues])
-        .where('status', 'delayed')
-        .groupBy('queue')
-        .min('execute_at as at')
+      const rows = await read(
+        this.#connection(this.#jobsTable)
+          .whereIn('queue', [...queues])
+          .where('status', 'delayed')
+          .groupBy('queue')
+          .min('execute_at as at')
+      )
       for (const row of rows) {
         if (row.at !== null) onWake(Number(row.at))
       }
-      await this.#announceNextSchedule(watcher)
+      const [next] = await read(this.#nextScheduleQuery(this.#connection))
+      watcher.at = next?.at === null || next?.at === undefined ? null : Number(next.at)
+      if (watcher.at !== null) onWake(watcher.at)
     }
 
     const onLost = (error?: Error) => {
@@ -366,7 +404,8 @@ export class KnexAdapter implements Adapter {
     }
 
     // A pooler in transaction mode, such as PgBouncer, accepts LISTEN but
-    // never delivers: check that a NOTIFY sent through the pool arrives.
+    // never delivers: check that a NOTIFY sent by another connection, outside
+    // of the pool, arrives.
     let probe: { payload: string; received: PromiseWithResolvers<void> } | undefined
     const verify = async () => {
       probe = {
@@ -387,12 +426,15 @@ export class KnexAdapter implements Adapter {
           LISTEN_PROBE_TIMEOUT
         )
       })
+      const sender = await createClient()
       try {
-        await this.#connection.raw('select pg_notify(?, ?)', [channel, probe.payload])
+        await Promise.race([sender.connect(), closing.promise])
+        await sender.query('select pg_notify($1, $2)', [channel, probe.payload])
         await Promise.race([received.promise, timeout, closing.promise])
       } finally {
         clearTimeout(timer)
         probe = undefined
+        void sender.end().catch(() => {})
       }
     }
 
@@ -404,17 +446,17 @@ export class KnexAdapter implements Adapter {
       connection.on('notification', (message) => {
         if (message.channel !== channel || !message.payload) return
         if (message.payload === probe?.payload) return probe.received.resolve()
-        dispatchWakeMessage(message.payload, queues, onWake, async () => {
-          watcher.at = await this.#nextScheduleAt()
-          return watcher.at
-        }).catch((error) => this.#logger.error({ err: error }, 'Failed to handle a wake signal'))
+        dispatchWakeMessage(message.payload, queues, onWake, (at) => {
+          watcher.at = at
+          onWake(at)
+        })
       })
       await Promise.race([connection.connect(), closing.promise])
       await connection.query(`LISTEN "${channel.replaceAll('"', '""')}"`)
       if (closed) return release()
       await verify()
       listening = true
-      await announce()
+      await announce(connection)
     }
     const stopHeartbeat = startHeartbeat(
       () => (listening ? client?.query('select 1') : undefined),
@@ -459,8 +501,13 @@ export class KnexAdapter implements Adapter {
    * Next run of a schedule that claimDueSchedule can claim: a schedule past
    * its run limit or end date stays active but never runs again.
    */
-  async #nextScheduleAt(): Promise<number | null> {
-    const row = await this.#connection(this.#schedulesTable)
+  async #nextScheduleAt(connection: Knex = this.#connection): Promise<number | null> {
+    const row = await this.#nextScheduleQuery(connection)
+    return row?.at === null || row?.at === undefined ? null : Number(row.at)
+  }
+
+  #nextScheduleQuery(connection: Knex) {
+    return connection(this.#schedulesTable)
       .where('status', 'active')
       .whereNotNull('next_run_at')
       .where((builder) => {
@@ -477,7 +524,6 @@ export class KnexAdapter implements Adapter {
       })
       .min('next_run_at as at')
       .first()
-    return row?.at === null || row?.at === undefined ? null : Number(row.at)
   }
 
   setWorkerId(workerId: string): void {
@@ -485,7 +531,7 @@ export class KnexAdapter implements Adapter {
   }
 
   async destroy(): Promise<void> {
-    await Promise.all([...this.#readySignals.values()].map((state) => state.sent))
+    await Promise.all([...this.#signals.values()].map((state) => state.sent))
     if (this.#ownsConnection) {
       await this.#connection.destroy()
     }
@@ -896,7 +942,7 @@ export class KnexAdapter implements Adapter {
         score: null,
         execute_at: retryAt.getTime(),
       })
-      if (updated > 0) await this.#notify(this.#connection, { queue, at: retryAt.getTime() })
+      if (updated > 0) await this.#signal(queue, retryAt.getTime())
       return updated > 0
     }
 
@@ -912,7 +958,7 @@ export class KnexAdapter implements Adapter {
       score,
       execute_at: null,
     })
-    if (updated > 0) await this.#notify(this.#connection, { queue })
+    if (updated > 0) await this.#signal(queue)
     return updated > 0
   }
 
@@ -933,21 +979,14 @@ export class KnexAdapter implements Adapter {
         data: JSON.stringify(jobData),
         score,
       })
-      if (this.#connection.isTransaction) {
-        await this.#notify(this.#connection, { queue })
-      } else if (this.#wakeChannel) {
-        this.#signalReady(queue)
-      }
+      await this.#signal(queue)
       return result
     }
 
-    await this.#pushReady(queue, {
-      id: jobData.id,
-      queue,
-      status: 'pending',
-      data: JSON.stringify(jobData),
-      score,
-    })
+    await this.#insertJob(
+      { id: jobData.id, queue, status: 'pending', data: JSON.stringify(jobData), score },
+      queue
+    )
   }
 
   async pushLater(jobData: JobData, delay: number): Promise<PushResult | void> {
@@ -965,7 +1004,7 @@ export class KnexAdapter implements Adapter {
         data: JSON.stringify(jobData),
         execute_at: executeAt,
       })
-      await this.#notify(this.#connection, { queue, at: executeAt })
+      await this.#signal(queue, executeAt)
       return result
     }
 
@@ -977,7 +1016,8 @@ export class KnexAdapter implements Adapter {
         data: JSON.stringify(jobData),
         execute_at: executeAt,
       },
-      { queue, at: executeAt }
+      queue,
+      executeAt
     )
   }
 
@@ -1334,7 +1374,7 @@ export class KnexAdapter implements Adapter {
         ]),
         ...definition,
       })
-    await this.#notify(this.#connection, { schedules: true })
+    await this.#notifySchedules(this.#connection)
 
     return id
   }
@@ -1385,7 +1425,7 @@ export class KnexAdapter implements Adapter {
 
     if (Object.keys(data).length > 0) {
       await this.#connection(this.#schedulesTable).where('id', id).update(data)
-      await this.#notify(this.#connection, { schedules: true })
+      await this.#notifySchedules(this.#connection)
     }
   }
 
@@ -1393,7 +1433,7 @@ export class KnexAdapter implements Adapter {
     await this.#assertScheduleDatesMigrated()
 
     await this.#connection(this.#schedulesTable).where('id', id).delete()
-    await this.#notify(this.#connection, { schedules: true })
+    await this.#notifySchedules(this.#connection)
   }
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
@@ -1455,7 +1495,7 @@ export class KnexAdapter implements Adapter {
         last_run_at: now,
         run_count: newRunCount,
       })
-      await this.#notify(trx, { schedules: true })
+      await this.#notifySchedules(trx)
 
       // Return schedule data (before update state for payload)
       return this.#rowToScheduleData(row)
