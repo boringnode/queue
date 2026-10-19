@@ -7,22 +7,25 @@ export type WakeListener = (at: number) => void
 /**
  * Message published on the LISTEN channel of the Knex adapter.
  *
- * - `{ queue, at }`: a job of `queue` becomes due at `at` (epoch ms).
- * - `{ queue }`: a job of `queue` is ready now. Without a timestamp, a
+ * - `{ ready, due }`: jobs of the `ready` queues are ready now, and a job of
+ *   each `due` queue becomes due at its time (epoch ms). Without a time, a
  *   writer whose clock runs ahead cannot delay the watcher.
  * - `{ schedule }`: the next schedule run after a schedule changed, read by
  *   the writer so watchers do not each read it.
  * - `{ probe }`: sent by a watcher to check that its connection receives
  *   notifications. Other watchers ignore it.
  */
-export type WakeMessage = { queue: string; at?: number } | { schedule: number } | { probe: string }
+export type WakeMessage =
+  | { ready?: string[]; due?: Record<string, number> }
+  | { schedule: number }
+  | { probe: string }
 
 export function encodeWakeMessage(message: WakeMessage): string {
   return JSON.stringify(message)
 }
 
 /**
- * Route a raw message of the wake channel: a job of a watched queue to
+ * Route a raw message of the wake channel: jobs of the watched queues to
  * `onWake`, the next schedule run to `onSchedule`. Others are ignored.
  */
 export function dispatchWakeMessage(
@@ -31,7 +34,7 @@ export function dispatchWakeMessage(
   onWake: WakeListener,
   onSchedule: WakeListener
 ): void {
-  let message: Partial<{ queue: unknown; at: unknown; schedule: unknown }>
+  let message: Partial<{ ready: unknown; due: unknown; schedule: unknown }>
 
   try {
     message = JSON.parse(raw)
@@ -41,8 +44,16 @@ export function dispatchWakeMessage(
 
   if (typeof message.schedule === 'number') {
     onSchedule(message.schedule)
-  } else if (typeof message.queue === 'string' && queues.includes(message.queue)) {
-    onWake(typeof message.at === 'number' ? message.at : Date.now())
+    return
+  }
+
+  if (Array.isArray(message.ready) && message.ready.some((queue) => queues.includes(queue))) {
+    onWake(Date.now())
+  }
+  if (message.due && typeof message.due === 'object') {
+    for (const [queue, at] of Object.entries(message.due)) {
+      if (typeof at === 'number' && queues.includes(queue)) onWake(at)
+    }
   }
 }
 

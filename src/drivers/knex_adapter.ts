@@ -59,8 +59,12 @@ export interface KnexAdapterOptions {
   logger?: Logger
   /**
    * PostgreSQL only. Wake workers through LISTEN/NOTIFY instead of polling.
-   * Disable it behind a pooler that does not support LISTEN, such as
-   * PgBouncer in transaction mode. Defaults to true.
+   * Defaults to false. Enable it on every process that dispatches jobs, not
+   * only on workers: a job dispatched without it wakes no worker.
+   *
+   * Each worker holds one more connection, and every NOTIFY reaches every
+   * worker: suited to a few workers with a high concurrency. Not supported
+   * behind a pooler in transaction mode, such as PgBouncer.
    */
   notifications?: boolean
 }
@@ -89,6 +93,11 @@ function wakeChannelName(table: string): string {
   return `queue_jobs_${createHash('sha256').update(table).digest('hex').slice(0, 40)}`
 }
 
+/** The message of a job of `queue` ready now, or due at `at`. */
+function jobMessage(queue: string, at?: number): WakeMessage {
+  return at === undefined ? { ready: [queue] } : { due: { [queue]: at } }
+}
+
 const LISTEN_RECONNECT_DELAY = 1000
 const LISTEN_PROBE_TIMEOUT = 2000
 const LISTEN_MAX_RECONNECT_DELAY = 30_000
@@ -106,10 +115,11 @@ interface ScheduleWatcher {
   at: number | null
 }
 
-/** Signals of a queue that wait for the next interval. */
-interface QueueSignal {
-  ready: boolean
-  at: number | null
+/** Signals that wait for the next NOTIFY of an adapter. */
+interface PendingSignals {
+  ready: Set<string>
+  /** The earliest due time by queue. */
+  due: Map<string, number>
   sent: Promise<void>
 }
 
@@ -158,7 +168,7 @@ export type KnexFactoryOptions = Pick<
  * ```ts
  * knex(config)
  * knex(config, 'custom_jobs_table')
- * knex(config, { tableName: 'custom_jobs_table', notifications: false })
+ * knex(config, { tableName: 'custom_jobs_table', notifications: true })
  * ```
  */
 export function knex(config: KnexConfig, options?: string | KnexFactoryOptions) {
@@ -188,8 +198,8 @@ export class KnexAdapter implements Adapter {
   readonly #logger: Logger
   /** Set on PostgreSQL with notifications enabled: the jobs table names the channel. */
   readonly #wakeChannel?: string
-  /** Queues with a signal in flight: see #signal. */
-  readonly #signals = new Map<string, QueueSignal>()
+  /** Signals asked for since the last NOTIFY: see #signal. */
+  #pendingSignals?: PendingSignals
   /** Watchers of this adapter: see claimDueSchedule. */
   readonly #scheduleWatchers = new Set<ScheduleWatcher>()
   #workerId: string = ''
@@ -205,7 +215,7 @@ export class KnexAdapter implements Adapter {
     this.#ownsConnection = config.ownsConnection ?? false
     this.#logger = config.logger ?? consoleLogger
 
-    if (this.#connection.client.dialect === 'postgresql' && config.notifications !== false) {
+    if (this.#connection.client.dialect === 'postgresql' && config.notifications === true) {
       this.#wakeChannel = wakeChannelName(this.#jobsTable)
       this.watch = async (queues, signal) => {
         const wakeup = new WorkerWakeup()
@@ -250,38 +260,43 @@ export class KnexAdapter implements Adapter {
    *
    * In a transaction, the NOTIFY joins it. Otherwise, the work is stored and
    * the signal is sent in the background: PostgreSQL serializes the commits
-   * that NOTIFY, and delivers each NOTIFY to every LISTEN connection. A queue
-   * gets at most one signal per SIGNAL_INTERVAL per adapter; the signals
-   * asked for meanwhile join the next one, with the earliest due time. That
-   * is enough: promoting a delayed job announces the next one. `destroy()`
-   * waits for them.
+   * that NOTIFY, and delivers each NOTIFY to every LISTEN connection. An
+   * adapter sends at most one NOTIFY per SIGNAL_INTERVAL, for all its queues;
+   * the signals asked for meanwhile join the next one, with the earliest due
+   * time of each queue. That is enough: promoting a delayed job announces the
+   * next one. `destroy()` waits for them.
    */
   async #signal(queue: string, at?: number): Promise<void> {
     if (!this.#wakeChannel) return
+    const ready = at === undefined || at <= Date.now()
     if (this.#connection.isTransaction) {
-      return this.#notify(this.#connection, at === undefined ? { queue } : { queue, at })
+      return this.#notify(this.#connection, jobMessage(queue, ready ? undefined : at))
     }
 
-    const pending = this.#signals.get(queue)
-    const state = pending ?? { ready: false, at: null, sent: Promise.resolve() }
-    if (at === undefined || at <= Date.now()) {
-      state.ready = true
+    const pending = this.#pendingSignals ?? {
+      ready: new Set<string>(),
+      due: new Map<string, number>(),
+      sent: Promise.resolve(),
+    }
+    if (ready) {
+      pending.ready.add(queue)
     } else {
-      state.at = Math.min(state.at ?? Infinity, at)
+      pending.due.set(queue, Math.min(pending.due.get(queue) ?? Infinity, at!))
     }
-    if (pending) return
+    if (this.#pendingSignals) return
 
-    this.#signals.set(queue, state)
-    state.sent = (async () => {
-      while (state.ready || state.at !== null) {
-        const { ready, at: dueAt } = state
-        state.ready = false
-        state.at = null
-        if (ready) await this.#notify(this.#connection, { queue })
-        if (dueAt !== null) await this.#notify(this.#connection, { queue, at: dueAt })
+    this.#pendingSignals = pending
+    pending.sent = (async () => {
+      while (pending.ready.size > 0 || pending.due.size > 0) {
+        const message: WakeMessage = {}
+        if (pending.ready.size > 0) message.ready = [...pending.ready]
+        if (pending.due.size > 0) message.due = Object.fromEntries(pending.due)
+        pending.ready.clear()
+        pending.due.clear()
+        await this.#notify(this.#connection, message)
         await sleep(SIGNAL_INTERVAL)
       }
-      this.#signals.delete(queue)
+      this.#pendingSignals = undefined
     })()
   }
 
@@ -297,11 +312,10 @@ export class KnexAdapter implements Adapter {
       return
     }
 
-    const message: WakeMessage = at === undefined ? { queue } : { queue, at }
     await this.#connection.raw('with inserted as (?) select pg_notify(?, ?)', [
       insert,
       this.#wakeChannel,
-      encodeWakeMessage(message),
+      encodeWakeMessage(jobMessage(queue, at)),
     ])
   }
 
@@ -420,7 +434,7 @@ export class KnexAdapter implements Adapter {
             reject(
               new Error(
                 'LISTEN received no notification within 2s. Behind a pooler in transaction ' +
-                  'mode, such as PgBouncer, pass { notifications: false } to knex()'
+                  'mode, such as PgBouncer, do not enable notifications'
               )
             ),
           LISTEN_PROBE_TIMEOUT
@@ -531,7 +545,7 @@ export class KnexAdapter implements Adapter {
   }
 
   async destroy(): Promise<void> {
-    await Promise.all([...this.#signals.values()].map((state) => state.sent))
+    await this.#pendingSignals?.sent
     if (this.#ownsConnection) {
       await this.#connection.destroy()
     }
@@ -742,7 +756,7 @@ export class KnexAdapter implements Adapter {
           .min('execute_at as at')
           .first()
         if (next?.at !== null && next?.at !== undefined) {
-          await this.#notify(trx, { queue, at: Number(next.at) })
+          await this.#notify(trx, jobMessage(queue, Number(next.at)))
         }
       }
     })
@@ -1204,7 +1218,7 @@ export class KnexAdapter implements Adapter {
       for (let start = 0; start < rows.length; start += SQL_INSERT_CHUNK_SIZE) {
         await connection(this.#jobsTable).insert(rows.slice(start, start + SQL_INSERT_CHUNK_SIZE))
       }
-      await this.#notify(connection, { queue })
+      await this.#notify(connection, jobMessage(queue))
     }
 
     if (this.#connection.isTransaction) {
@@ -1292,7 +1306,7 @@ export class KnexAdapter implements Adapter {
         }
       }
 
-      if (recovered > 0) await this.#notify(trx, { queue })
+      if (recovered > 0) await this.#notify(trx, jobMessage(queue))
       return { recovered, exceeded }
     })
   }
