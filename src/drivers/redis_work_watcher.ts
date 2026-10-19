@@ -45,6 +45,8 @@ export class RedisWorkWatcher implements WorkWatcher {
   /** Receives the result of the BZPOPMIN in flight while a wait reads it. */
   #deliver?: (marker: PoppedMarker | null) => void
   #closed = false
+  /** Ends the BZPOPMIN in flight when its connection closes. */
+  #onClose?: () => void
 
   constructor(connection: Redis, blocking: Redis, markers: readonly RedisMarker[], logger: Logger) {
     this.#connection = connection
@@ -52,6 +54,7 @@ export class RedisWorkWatcher implements WorkWatcher {
     this.#markers = markers
     this.#logger = logger
     this.#prefix = blocking.options?.keyPrefix ?? ''
+    blocking.on('close', () => this.#onClose?.())
   }
 
   reset(): void {}
@@ -141,8 +144,16 @@ export class RedisWorkWatcher implements WorkWatcher {
       const stuck = new Promise<'stuck'>((resolve) => {
         watchdog = setTimeout(() => resolve('stuck'), timeout + subscriptionHeartbeat.timeout)
       })
-      const reply = await Promise.race([command, stuck])
-      if (reply === 'stuck') {
+      // ioredis reconnects a closed connection, but drops its command.
+      const closed = new Promise<'closed'>((resolve) => {
+        this.#onClose = () => resolve('closed')
+      })
+      const reply = await Promise.race([command, stuck, closed])
+      if (this.#closed) {
+        marker = null
+      } else if (reply === 'closed') {
+        marker = this.#mayBeLost()
+      } else if (reply === 'stuck') {
         this.#logger.error(
           { err: new Error('BZPOPMIN did not return in time') },
           'Redis blocking connection is silent, reconnecting'
@@ -160,6 +171,7 @@ export class RedisWorkWatcher implements WorkWatcher {
       }
     } finally {
       clearTimeout(watchdog)
+      this.#onClose = undefined
       this.#reading = undefined
     }
 
