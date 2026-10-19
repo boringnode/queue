@@ -5,8 +5,9 @@ import { parse, retryOnDeadlock } from './utils.js'
 import { JobPool, type PoolEntry } from './job_pool.js'
 import { WorkerHeartbeat, type HeartbeatOperationWrapper } from './worker_heartbeat.js'
 import { Locator } from './locator.js'
+import { WorkerWakeup } from './worker_wakeup.js'
 import type { SingleJobDispatchRequest } from './job_dispatch_runtime.js'
-import type { Adapter, AcquiredJob } from './contracts/adapter.js'
+import type { Adapter, AcquiredJob, Unsubscribe } from './contracts/adapter.js'
 import type { JobExecutionOutcome, JobExecutionRuntime } from './job_runtime.js'
 import type { Logger, WorkerCycle } from './types/main.js'
 import { DEFAULT_ERROR_RETRY_DELAY, UNKNOWN_JOB_RETRY_DELAY } from './constants.js'
@@ -80,6 +81,8 @@ export class WorkerSession {
   #completionDelayController?: AbortController
   #lastStalledCheck = 0
   #delayController?: AbortController
+  /** Set while `start()` holds a subscription: idle waits sleep until a signal. */
+  #wakeup?: WorkerWakeup
 
   constructor(options: WorkerSessionOptions) {
     this.#workerId = options.workerId
@@ -122,6 +125,10 @@ export class WorkerSession {
     const completion = Promise.withResolvers<void>()
     this.#startCompletion = completion.promise
 
+    // Polls until the subscription is ready: a slow handshake delays no job.
+    const subscribeAbort = new AbortController()
+    const subscription = this.#subscribe(subscribeAbort.signal)
+
     try {
       debug('starting worker %s on queues: %O', this.#workerId, this.#queues)
 
@@ -141,9 +148,15 @@ export class WorkerSession {
           debug('worker %s is idle, waiting for %dms', this.#workerId, delay)
         }
 
-        await this.#waitBeforeNextCycle(delay)
+        await this.#waitBeforeNextCycle(cycle.type === 'idle' && this.#wakeup ? null : delay)
       }
     } finally {
+      this.#wakeup = undefined
+      subscribeAbort.abort()
+      const unsubscribe = await subscription
+      await unsubscribe?.().catch((error) => {
+        this.#logger.error({ err: error, workerId: this.#workerId }, 'Failed to unsubscribe')
+      })
       completion.resolve()
       if (this.#startCompletion === completion.promise) {
         this.#startCompletion = undefined
@@ -270,14 +283,62 @@ export class WorkerSession {
     }
   }
 
-  async #waitBeforeNextCycle(delay: number): Promise<void> {
+  /**
+   * Subscribe to the wake signals of the adapter, when it supports them. A
+   * failure is logged and the worker keeps polling. `signal` aborts a
+   * subscription that is not ready when the session stops.
+   */
+  async #subscribe(signal: AbortSignal): Promise<Unsubscribe | undefined> {
+    if (!this.#adapter.subscribe) return
+
+    const wakeup = new WorkerWakeup()
+
+    try {
+      const unsubscribe = await this.#adapter.subscribe(
+        this.#queues,
+        (at) => wakeup.notify(at),
+        signal
+      )
+      if (!signal.aborted) {
+        this.#wakeup = wakeup
+        debug('worker %s subscribed to wake signals', this.#workerId)
+        // The current wait polls: end it, so the next one sleeps until a signal.
+        this.#delayController?.abort()
+        this.#completionDelayController?.abort()
+      }
+      return unsubscribe
+    } catch (error) {
+      if (signal.aborted) return
+      this.#logger.error(
+        { err: error as Error, workerId: this.#workerId },
+        'Failed to subscribe to wake signals, polling instead'
+      )
+    }
+  }
+
+  /**
+   * Time left before the next stalled check. A subscribed worker sleeps at
+   * most this long: the check doubles as the poll that catches lost signals.
+   */
+  #untilStalledCheck(): number {
+    return Math.max(this.#lastStalledCheck + this.#settings.stalledInterval - Date.now(), 0)
+  }
+
+  /**
+   * Sleep for `delay`, or until a wake signal when `delay` is null.
+   */
+  async #waitBeforeNextCycle(delay: number | null): Promise<void> {
     if (!this.#running) return
 
     const controller = new AbortController()
     this.#delayController = controller
 
     try {
-      await setTimeout(delay, undefined, { signal: controller.signal })
+      if (delay === null) {
+        await this.#wakeup?.wait(this.#untilStalledCheck(), controller.signal)
+      } else {
+        await setTimeout(delay, undefined, { signal: controller.signal })
+      }
     } catch (error) {
       if (!controller.signal.aborted) {
         throw error
@@ -295,6 +356,7 @@ export class WorkerSession {
     try {
       while (this.#running) {
         try {
+          this.#wakeup?.reset()
           await this.#checkStalledJobs()
 
           if (!this.#running) break
@@ -365,7 +427,11 @@ export class WorkerSession {
     this.#completionDelayController = controller
 
     try {
-      await setTimeout(this.#settings.idleDelay, undefined, { signal: controller.signal })
+      if (this.#wakeup) {
+        await this.#wakeup.wait(this.#untilStalledCheck(), controller.signal)
+      } else {
+        await setTimeout(this.#settings.idleDelay, undefined, { signal: controller.signal })
+      }
     } catch (error) {
       if (!controller.signal.aborted) {
         throw error

@@ -1,6 +1,17 @@
 import { REDIS_DEDUP_LUA, REDIS_JOB_STORAGE_LUA } from './redis_job_storage.js'
 
 /**
+ * Publishes the wake signal of a script, given as its last two ARGV: the
+ * channel and the message. Publishing from the script keeps one round trip
+ * and sends the signal with the write it announces.
+ */
+const PUBLISH_WAKE_LUA = `
+  local function publish_wake()
+    redis.call('PUBLISH', ARGV[#ARGV - 1], ARGV[#ARGV])
+  end
+`
+
+/**
  * Lua script for pushing a job to the queue.
  * Stores job data in the central hash and adds jobId to pending ZSET.
  */
@@ -14,8 +25,11 @@ export const PUSH_JOB_SCRIPT = `
 
 ${REDIS_JOB_STORAGE_LUA}
 
+${PUBLISH_WAKE_LUA}
+
   store_job_data(data_key, overlay_key, job_id, job_data)
   redis.call('ZADD', pending_key, score, job_id)
+  publish_wake()
 
   return 1
 `
@@ -57,6 +71,10 @@ export const PUSH_DEDUP_JOB_SCRIPT = `
 
 ${REDIS_JOB_STORAGE_LUA}
 ${REDIS_DEDUP_LUA}
+${PUBLISH_WAKE_LUA}
+
+  -- The job may be skipped: a spurious signal only costs a poll.
+  publish_wake()
 
   local existing_result = resolve_dedup_existing_job(
     data_key,
@@ -96,8 +114,11 @@ export const PUSH_DELAYED_JOB_SCRIPT = `
 
 ${REDIS_JOB_STORAGE_LUA}
 
+${PUBLISH_WAKE_LUA}
+
   store_job_data(data_key, overlay_key, job_id, job_data)
   redis.call('ZADD', delayed_key, execute_at, job_id)
+  publish_wake()
 
   return 1
 `
@@ -118,6 +139,8 @@ export const ACQUIRE_JOB_SCRIPT = `
   local worker_id = ARGV[1]
   local now = tonumber(ARGV[2])
   local lease_token = ARGV[3]
+  local wake_channel = ARGV[4]
+  local queue = ARGV[5]
 
 ${REDIS_JOB_STORAGE_LUA}
 
@@ -133,6 +156,13 @@ ${REDIS_JOB_STORAGE_LUA}
         redis.call('ZADD', pending_key, score, job_id)
         redis.call('ZREM', delayed_key, job_id)
       end
+    end
+
+    -- Workers only know the next delayed job: announce the one after it.
+    local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+    if #next_delayed > 0 then
+      redis.call('PUBLISH', wake_channel,
+        cjson.encode({ queue = queue, at = tonumber(next_delayed[2]) }))
     end
   end
 
@@ -318,6 +348,7 @@ export const RETRY_JOB_SCRIPT = `
 
 ${REDIS_JOB_STORAGE_LUA}
 ${REDIS_LEASE_LUA}
+${PUBLISH_WAKE_LUA}
 
   -- Verify the caller still holds the job
   if not holds_lease(active_key, job_id, lease_token) then
@@ -353,6 +384,7 @@ ${REDIS_LEASE_LUA}
     redis.call('ZADD', pending_key, score, job_id)
   end
 
+  publish_wake()
   return 1
 `
 
@@ -378,6 +410,7 @@ export const RECOVER_STALLED_JOBS_SCRIPT = `
   local lease_token_prefix = ARGV[6]
 
 ${REDIS_JOB_STORAGE_LUA}
+${PUBLISH_WAKE_LUA}
 
   local recovered = 0
   -- The first element is replaced by the recovered count before returning.
@@ -433,6 +466,9 @@ ${REDIS_JOB_STORAGE_LUA}
   end
 
   result[1] = recovered
+  if recovered > 0 then
+    publish_wake()
+  end
   return result
 `
 
@@ -590,6 +626,9 @@ export const UPSERT_SCHEDULE_SCRIPT = `
   local next_run_at = ARGV[4]
 
 ${SCHEDULE_DUE_INDEX_LUA}
+${PUBLISH_WAKE_LUA}
+
+  publish_wake()
 
   -- The same test as migrate(): an indexed id with a 0.7 hash at its old key.
   if redis.call('SISMEMBER', schedules_index_key, id) == 1
@@ -668,6 +707,9 @@ export const UPDATE_SCHEDULE_SCRIPT = `
   local updates = cjson.decode(ARGV[2])
 
 ${SCHEDULE_DUE_INDEX_LUA}
+${PUBLISH_WAKE_LUA}
+
+  publish_wake()
 
   if redis.call('EXISTS', schedule_key) == 0 then
     redis.call('ZREM', due_key, id)
@@ -703,6 +745,9 @@ export const FINALIZE_CRON_SCHEDULE_SCRIPT = `
   local next_run_at = ARGV[5]
 
 ${SCHEDULE_DUE_INDEX_LUA}
+${PUBLISH_WAKE_LUA}
+
+  publish_wake()
 
   if redis.call('EXISTS', schedule_key) == 0 then
     redis.call('ZREM', due_key, id)
@@ -852,6 +897,7 @@ ${SCHEDULE_DUE_INDEX_LUA}
  * KEYS[2] = schedule key prefix (e.g. "schedules::data::")
  * ARGV[1] = now (epoch milliseconds)
  * ARGV[2] = claim token, kept by the schedule when it is a cron
+ * ARGV[3], ARGV[4] = wake channel and message, published when the due index changes
  *
  * Returns nil, or `{ 'claimed' | 'unfinalized', <schedule hash as JSON> }`.
  */
@@ -862,13 +908,22 @@ export const CLAIM_SCHEDULE_SCRIPT = `
   local claim_token = ARGV[2]
 
 ${SCHEDULE_DUE_INDEX_LUA}
+${PUBLISH_WAKE_LUA}
+
+  local skipped = false
 
   while true do
     local candidates = redis.call('ZRANGEBYSCORE', due_key, '-inf', tostring(now), 'LIMIT', 0, 1)
 
     if #candidates == 0 then
+      -- Subscribers may wait for a skipped entry: let them read the next one.
+      if skipped then
+        publish_wake()
+      end
       return nil
     end
+
+    skipped = true
 
     local id = candidates[1]
     local schedule_key = prefix .. id
@@ -952,6 +1007,7 @@ ${SCHEDULE_DUE_INDEX_LUA}
               'claimed_at', new_claimed_at)
 
             sync_schedule_due_index(schedule_key, due_key, id)
+            publish_wake()
 
             -- Return the schedule data (before update) as JSON
             return { 'claimed', cjson.encode(schedule) }

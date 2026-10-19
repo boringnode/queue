@@ -411,8 +411,15 @@ import Knex from 'knex'
 const connection = Knex({ client: 'pg', connection: '...' })
 const adapter = knex(connection)
 
-// Custom table name
+// Custom table names
 const adapter = knex(config, 'custom_jobs_table')
+const adapter = knex(config, {
+  tableName: 'custom_jobs_table',
+  schedulesTableName: 'custom_schedules_table',
+})
+
+// Behind PgBouncer in transaction mode, which does not support LISTEN: poll instead
+const adapter = knex(config, { notifications: false })
 ```
 
 </details>
@@ -932,7 +939,7 @@ const config = {
   worker: {
     adapter: 'redis', // Registered Adapter listened to by this Worker
     concurrency: 5, // Parallel jobs
-    idleDelay: '2s', // Poll interval when idle
+    idleDelay: '2s', // Poll interval when idle (adapters without wake signals)
     timeout: '1m', // Default job timeout
     stalledThreshold: '30s', // When to consider job stalled
     stalledInterval: '30s', // How often to check
@@ -942,6 +949,19 @@ const config = {
   },
 }
 ```
+
+On Redis and PostgreSQL (Knex), an idle Worker does not poll: the Adapter signals new jobs through
+Redis pub/sub or `LISTEN`/`NOTIFY`, and the Worker also wakes when a delayed job, a retry, or a
+schedule becomes due. A job dispatched in a PostgreSQL transaction is signaled when it commits. A
+signal can be lost, so the Worker still checks its queues every `stalledInterval`. Behind a pooler
+that does not support `LISTEN`, such as PgBouncer in transaction mode, pass `notifications: false`
+to `knex()`. MySQL, SQLite, and Kysely poll every `idleDelay`.
+
+The process that dispatches a job sends its signal. A job dispatched by an older version of the
+package, or written to the storage without the Adapter, sends none: the Worker finds it at its next
+stalled check. Upgrade the processes that dispatch jobs with, or before, the Workers. Each Worker
+holds one more connection for its subscription: a Redis connection, or a PostgreSQL connection
+outside of the Knex pool.
 
 Run one Worker per process. A Worker listens on one Adapter, so to process the queues of several
 Adapters, start one process per Adapter. Starting a second Worker while another one runs in the
