@@ -18,6 +18,8 @@ import { withKnexQuerySpy } from './_utils/with_knex_query_spy.js'
 import { pauseKnexDeletes } from './_utils/pause_deletes.js'
 import { registerRetentionRaceSuite } from './_utils/register_retention_race_suite.js'
 import { MemoryLogger } from './_mocks/memory_logger.js'
+import { startSilentProxy } from './_utils/silent_proxy.js'
+import { subscriptionHeartbeat } from '../src/drivers/wake_messages.js'
 import {
   pgDeleteFailureSql,
   registerPruneFailureSuite,
@@ -186,6 +188,36 @@ test.group('Adapter | Redis', (group) => {
     })
     await new Promise((resolve) => setTimeout(resolve, 100))
     assert.deepEqual(wakes, [])
+  })
+
+  test('reconnects a subscription that stops answering', async ({ cleanup }) => {
+    shortenHeartbeat(cleanup)
+    const target = {
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+    }
+    const proxy = await startSilentProxy(target)
+    cleanup(() => proxy.close())
+    // Only the subscriber connection goes through the proxy.
+    const direct = new Redis({ ...target, keyPrefix: KEY_PREFIX, db: 15 })
+    direct.duplicate = () =>
+      new Redis({ host: '127.0.0.1', port: proxy.port, keyPrefix: KEY_PREFIX, db: 15 })
+    cleanup(() => direct.disconnect())
+
+    const wakes: number[] = []
+    const subscriber = new RedisAdapter(direct, false, new MemoryLogger())
+    const unsubscribe = await subscriber.subscribe(['default'], (at) => wakes.push(at))
+    cleanup(unsubscribe)
+    proxy.silence()
+    wakes.splice(0)
+
+    await new RedisAdapter(connection).pushOn('default', {
+      id: 'after-silence',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+    })
+    await waitFor(() => wakes.length > 0)
   })
 
   test('listSchedules should use bounded network round-trips as schedule count grows', async ({
@@ -2196,6 +2228,21 @@ test.group('Adapter | Redis', (group) => {
  * A jobs table as the previous versions left it: no unique index, and expired
  * owners that still hold their dedup id.
  */
+/** Ping subscription connections every 50 ms, with 100 ms to answer. */
+function shortenHeartbeat(cleanup: (callback: () => void) => void) {
+  const defaults = { ...subscriptionHeartbeat }
+  Object.assign(subscriptionHeartbeat, { interval: 50, timeout: 100 })
+  cleanup(() => Object.assign(subscriptionHeartbeat, defaults))
+}
+
+async function waitFor(condition: () => boolean, timeout = 2000) {
+  const start = Date.now()
+  while (!condition()) {
+    if (Date.now() - start > timeout) throw new Error('Condition not met in time')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
 async function assertDedupMigration(
   assert: Assert,
   connection: ReturnType<typeof Knex>,
@@ -2733,6 +2780,49 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     )
     while (wakes.length === 0) await new Promise((resolve) => setTimeout(resolve, 10))
     assert.isNotNull(await subscriber.getJob(job.id, 'default'))
+  })
+
+  test('reconnects a LISTEN connection that stops answering', async ({ cleanup }) => {
+    shortenHeartbeat(cleanup)
+    const proxy = await startSilentProxy({
+      host: process.env.PG_HOST || 'localhost',
+      port: Number.parseInt(process.env.PG_PORT || '5432', 10),
+    })
+    cleanup(() => proxy.close())
+    // The LISTEN connection goes through the proxy.
+    const knexClient = connection.client as KnexTypes.Client & {
+      connectionConfigProvider?: () => Promise<object>
+    }
+    knexClient.connectionConfigProvider = async () => ({
+      host: '127.0.0.1',
+      port: proxy.port,
+      user: process.env.PG_USER || 'postgres',
+      password: process.env.PG_PASSWORD || 'postgres',
+      database: process.env.PG_DATABASE || 'queue_test',
+    })
+    cleanup(() => {
+      knexClient.connectionConfigProvider = undefined
+    })
+
+    const wakes: number[] = []
+    const subscriber = new KnexAdapter({
+      connection,
+      tableName,
+      schedulesTableName,
+      logger: new MemoryLogger(),
+    })
+    const unsubscribe = await subscriber.subscribe!(['default'], (at) => wakes.push(at))
+    cleanup(unsubscribe)
+    proxy.silence()
+    wakes.splice(0)
+
+    await new KnexAdapter({ connection, tableName, schedulesTableName }).pushOn('default', {
+      id: 'after-silence',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+    })
+    await waitFor(() => wakes.length > 0)
   })
 
   test('knex() factory accepts a table name or options', async ({ assert }) => {

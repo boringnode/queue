@@ -12,7 +12,12 @@ import type {
   WakeListener,
 } from '../contracts/adapter.js'
 import { consoleLogger, type Logger } from '../logger.js'
-import { dispatchWakeMessage, encodeWakeMessage, type WakeMessage } from './wake_messages.js'
+import {
+  dispatchWakeMessage,
+  encodeWakeMessage,
+  startHeartbeat,
+  type WakeMessage,
+} from './wake_messages.js'
 import type { AdapterFactoryContext, DedupOutcome } from '../types/main.js'
 import type {
   JobData,
@@ -180,8 +185,17 @@ export class RedisAdapter implements Adapter {
       signal?.removeEventListener('abort', abort)
     }
 
+    const stopHeartbeat = startHeartbeat(
+      () => (subscriber.status === 'ready' ? subscriber.ping() : undefined),
+      () => {
+        logError(new Error('No answer to PING'), 'Redis wake subscriber is silent, reconnecting')
+        subscriber.disconnect(true)
+      }
+    )
+
     return async () => {
       subscribed = false
+      stopHeartbeat()
       subscriber.disconnect()
     }
   }
