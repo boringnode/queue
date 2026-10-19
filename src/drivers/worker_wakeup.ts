@@ -42,16 +42,22 @@ export class WorkerWakeup {
   }
 
   /**
-   * Resolve on a signal for now, when the next timer is due, after
-   * `maxDelay`, or when `signal` aborts.
+   * Resolve true on a signal for now or when the next timer is due, false
+   * after `maxDelay` or when `signal` aborts. Signals and timers wake no
+   * earlier than `cooldown`.
    */
-  async wait(maxDelay: number, signal: AbortSignal): Promise<void> {
-    const deadline = Date.now() + maxDelay
+  async wait(maxDelay: number, signal: AbortSignal, cooldown = 0): Promise<boolean> {
+    const start = Date.now()
+    const deadline = start + maxDelay
+    const quietUntil = start + cooldown
 
-    while (!signal.aborted && !this.#requested) {
+    while (!signal.aborted) {
       const now = Date.now()
-      const until = Math.min(deadline, this.#timers[0] ?? Infinity)
-      if (until <= now) return
+      if (deadline <= now) return false
+
+      const due = this.#requested ? now : (this.#timers[0] ?? Infinity)
+      const wakeAt = Math.max(due, quietUntil)
+      if (wakeAt <= now) return true
 
       await new Promise<void>((resolve) => {
         const done = () => {
@@ -60,11 +66,13 @@ export class WorkerWakeup {
           this.#interrupt = undefined
           resolve()
         }
-        const timer = setTimeout(done, until - now)
+        const timer = setTimeout(done, Math.min(deadline, wakeAt) - now)
         signal.addEventListener('abort', done, { once: true })
         this.#interrupt = done
       })
     }
+
+    return false
   }
 
   /** Returns false when `at` was already known or past the bound. */

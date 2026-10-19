@@ -5,14 +5,14 @@ import Knex from 'knex'
 import type { Knex as KnexTypes } from 'knex'
 import { test } from '@japa/runner'
 import type { Assert } from '@japa/assert'
-import { Redis } from 'ioredis'
+import { Redis, type RedisOptions } from 'ioredis'
 import { CronExpressionParser } from 'cron-parser'
 import { MemoryAdapter } from './_mocks/memory_adapter.js'
 import { redis, RedisAdapter } from '../src/drivers/redis_adapter.js'
 import { knex, KnexAdapter } from '../src/drivers/knex_adapter.js'
 import { KnexQueueSchemaService } from '../src/services/knex_queue_schema.js'
 import { registerDriverTestSuite } from './_utils/register_driver_test_suite.js'
-import { registerWakeSignalSuite } from './_utils/register_wake_signal_suite.js'
+import { registerWorkWatcherSuite } from './_utils/register_work_watcher_suite.js'
 import { withRedisWriteSpy } from './_utils/with_redis_write_spy.js'
 import { withKnexQuerySpy } from './_utils/with_knex_query_spy.js'
 import { pauseKnexDeletes } from './_utils/pause_deletes.js'
@@ -118,12 +118,15 @@ test.group('Adapter | Redis', (group) => {
     createAdapter: () => new RedisAdapter(connection),
   })
 
-  registerWakeSignalSuite({
+  registerWorkWatcherSuite({
     test,
     createAdapter: () => new RedisAdapter(connection),
   })
 
-  test('dispatches for an ACL user without channel permissions', async ({ assert, cleanup }) => {
+  test('dispatches and watches for an ACL user without channel permissions', async ({
+    assert,
+    cleanup,
+  }) => {
     // New ACL users get no channel permission by default since Redis 7.
     await connection.call(
       'ACL',
@@ -148,49 +151,71 @@ test.group('Adapter | Redis', (group) => {
       await connection.call('ACL', 'DELUSER', 'queue-no-channels')
     })
     const adapter = new RedisAdapter(restricted)
+    const watcher = await adapter.watch(['default'])
+    cleanup(() => watcher.close())
 
+    const waiting = watcher.wait(2000, new AbortController().signal, 0)
     await adapter.pushOn('default', { id: 'acl-job', name: 'TestJob', payload: {}, attempts: 0 })
-    await adapter.pushLaterOn(
-      'default',
-      { id: 'acl-delayed', name: 'TestJob', payload: {}, attempts: 0 },
-      0
-    )
-    const acquired = await adapter.popFrom('default')
-    assert.equal(acquired?.id, 'acl-job')
-    assert.isTrue(await adapter.retryJob(acquired!, 'default'))
-
-    // The worker cannot subscribe: it polls instead.
-    await assert.rejects(() => adapter.subscribe(['default'], () => {}), /NOPERM/)
+    assert.isTrue(await waiting)
   })
 
-  test('does not wake subscribers of another database', async ({ assert, cleanup }) => {
-    const other = new Redis({
-      host: process.env.REDIS_HOST || 'localhost',
-      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
-      keyPrefix: KEY_PREFIX,
-      db: 14,
-    })
+  test('wakes one waiting watcher per marker', async ({ assert, cleanup }) => {
+    const writer = new RedisAdapter(connection)
+    const job = (id: string) => ({ id, name: 'TestJob', payload: {}, attempts: 0 })
+    // Pushed while every worker is busy: two jobs leave one marker.
+    await writer.pushOn('default', job('first'))
+    await writer.pushOn('default', job('second'))
+
+    const watchers = await Promise.all([
+      new RedisAdapter(connection).watch(['default']),
+      new RedisAdapter(connection).watch(['default']),
+    ])
+    const controller = new AbortController()
     cleanup(async () => {
-      await other.quit()
+      controller.abort()
+      await Promise.all(watchers.map((watcher) => watcher.close()))
     })
-    const wakes: number[] = []
-    const unsubscribe = await new RedisAdapter(connection).subscribe(['default'], (at) =>
-      wakes.push(at)
-    )
-    cleanup(unsubscribe)
-    wakes.splice(0)
+    const woken: number[] = []
+    for (const [index, watcher] of watchers.entries()) {
+      void watcher.wait(5000, controller.signal, 0).then((wake) => wake && woken.push(index))
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.lengthOf(woken, 1)
 
-    await new RedisAdapter(other).pushOn('default', {
-      id: 'other-db',
-      name: 'TestJob',
-      payload: {},
-      attempts: 0,
-    })
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    assert.deepEqual(wakes, [])
+    // The woken worker takes a job while another remains: the next one wakes.
+    await writer.popFrom('default')
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.sameMembers(woken, [0, 1])
   })
 
-  test('reconnects a subscription that stops answering', async ({ cleanup }) => {
+  test('hands a due time to another watcher when its watcher stops waiting', async ({
+    assert,
+    cleanup,
+  }) => {
+    const first = await new RedisAdapter(connection).watch(['default'])
+    const second = await new RedisAdapter(connection).watch(['default'])
+    cleanup(() => Promise.all([first.close(), second.close()]).then(() => {}))
+
+    const busy = new AbortController()
+    const firstWait = first.wait(5000, busy.signal, 0)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const writer = new RedisAdapter(connection)
+    await writer.pushLaterOn(
+      'default',
+      { id: 'later', name: 'TestJob', payload: {}, attempts: 0 },
+      300
+    )
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    // The first watcher holds the due time, then its worker gets busy.
+    busy.abort()
+    assert.isFalse(await firstWait)
+    const start = Date.now()
+    assert.isTrue(await second.wait(2000, new AbortController().signal, 0))
+    assert.closeTo(Date.now() - start, 200, 100)
+  })
+
+  test('reconnects a blocking connection that stops answering', async ({ assert, cleanup }) => {
     shortenHeartbeat(cleanup)
     const target = {
       host: process.env.REDIS_HOST || 'localhost',
@@ -198,27 +223,37 @@ test.group('Adapter | Redis', (group) => {
     }
     const proxy = await startSilentProxy(target)
     cleanup(() => proxy.close())
-    // Only the subscriber connection goes through the proxy.
+    // Only the blocking connection goes through the proxy.
     const direct = new Redis({ ...target, keyPrefix: KEY_PREFIX, db: 15 })
-    direct.duplicate = () =>
-      new Redis({ host: '127.0.0.1', port: proxy.port, keyPrefix: KEY_PREFIX, db: 15 })
+    direct.duplicate = (override?: Partial<RedisOptions>) =>
+      new Redis({ host: '127.0.0.1', port: proxy.port, keyPrefix: KEY_PREFIX, db: 15, ...override })
     cleanup(() => direct.disconnect())
 
-    const wakes: number[] = []
-    const subscriber = new RedisAdapter(direct, false, new MemoryLogger())
-    const unsubscribe = await subscriber.subscribe(['default'], (at) => wakes.push(at))
-    cleanup(unsubscribe)
+    const logger = new MemoryLogger()
+    const watcher = await new RedisAdapter(direct, false, logger).watch(['default'])
+    cleanup(() => watcher.close())
+    const silences = () =>
+      logger.logs.filter((entry) => entry.message.includes('connection is silent')).length
+    const waiting = watcher.wait(2000, new AbortController().signal, 0)
+    await new Promise((resolve) => setTimeout(resolve, 50))
     proxy.silence()
-    wakes.splice(0)
 
-    await new RedisAdapter(connection).pushOn('default', {
-      id: 'after-silence',
-      name: 'TestJob',
-      payload: {},
-      attempts: 0,
-    })
-    await waitFor(() => wakes.length > 0)
-  })
+    const writer = new RedisAdapter(connection)
+    const job = (id: string) => ({ id, name: 'TestJob', payload: {}, attempts: 0 })
+    // The marker of this push may be lost with the silent connection: the
+    // watcher wakes to look once it gives up on it.
+    await writer.pushOn('default', job('during-silence'))
+    assert.isTrue(await waiting)
+    await writer.popFrom('default')
+
+    assert.equal(silences(), 1)
+
+    // The new connection receives the next marker.
+    const next = watcher.wait(2000, new AbortController().signal, 0)
+    await writer.pushOn('default', job('after-reconnection'))
+    assert.isTrue(await next)
+    assert.equal(silences(), 1)
+  }).timeout(5000)
 
   test('listSchedules should use bounded network round-trips as schedule count grows', async ({
     assert,
@@ -2228,19 +2263,11 @@ test.group('Adapter | Redis', (group) => {
  * A jobs table as the previous versions left it: no unique index, and expired
  * owners that still hold their dedup id.
  */
-/** Ping subscription connections every 50 ms, with 100 ms to answer. */
+/** Check watcher connections every 50 ms, with 300 ms to answer. */
 function shortenHeartbeat(cleanup: (callback: () => void) => void) {
   const defaults = { ...subscriptionHeartbeat }
-  Object.assign(subscriptionHeartbeat, { interval: 50, timeout: 100 })
+  Object.assign(subscriptionHeartbeat, { interval: 50, timeout: 300 })
   cleanup(() => Object.assign(subscriptionHeartbeat, defaults))
-}
-
-async function waitFor(condition: () => boolean, timeout = 2000) {
-  const start = Date.now()
-  while (!condition()) {
-    if (Date.now() - start > timeout) throw new Error('Condition not met in time')
-    await new Promise((resolve) => setTimeout(resolve, 10))
-  }
 }
 
 async function assertDedupMigration(
@@ -2474,7 +2501,7 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     },
   })
 
-  registerWakeSignalSuite({
+  registerWorkWatcherSuite({
     test,
     inTransaction: (operation) =>
       connection.transaction((trx) =>
@@ -2495,18 +2522,17 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       execute_at: executeAt,
     })
     const now = Date.now()
-    const nextAt = now + 60_000
+    const nextAt = now + 400
     await connection(tableName).insert([
       row('locked', now - 2000),
       row('own', now - 1000),
       row('next', nextAt),
     ])
 
-    const wakes: number[] = []
-    const subscriber = new KnexAdapter({ connection, tableName, schedulesTableName })
-    const unsubscribe = await subscriber.subscribe!(['default'], (at) => wakes.push(at))
-    cleanup(unsubscribe)
-    wakes.splice(0)
+    const watcher = await new KnexAdapter({ connection, tableName, schedulesTableName }).watch!([
+      'default',
+    ])
+    cleanup(() => watcher.close())
 
     // Another worker holds the oldest due row while it promotes it.
     const trx = await connection.transaction()
@@ -2516,8 +2542,9 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     await trx(tableName).where('id', 'locked').forUpdate().first()
 
     await new KnexAdapter({ connection, tableName, schedulesTableName }).popFrom('default')
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    assert.deepEqual(wakes, [nextAt])
+    watcher.reset()
+    assert.isTrue(await watcher.wait(2000, new AbortController().signal, 0))
+    assert.isAtLeast(Date.now(), nextAt - 20, 'not woken for the locked row')
   })
 
   /**
@@ -2597,24 +2624,24 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
   test('rejects a LISTEN connection that receives no notification', async ({ assert, cleanup }) => {
     // As behind PgBouncer in transaction mode: LISTEN succeeds, nothing arrives.
     fakeListenClients(cleanup, () => ({}))
-    const subscriber = new KnexAdapter({ connection, tableName, schedulesTableName })
+    const watching = new KnexAdapter({ connection, tableName, schedulesTableName })
 
     await assert.rejects(
-      () => subscriber.subscribe!(['default'], () => {}),
+      () => watching.watch!(['default']),
       /pass \{ notifications: false \} to knex\(\)/
     )
   }).timeout(5000)
 
   test('aborts a first LISTEN connection still in its handshake', async ({ assert, cleanup }) => {
     const created = fakeListenClients(cleanup, () => ({ connect: () => new Promise(() => {}) }))
-    const subscriber = new KnexAdapter({ connection, tableName, schedulesTableName })
+    const watching = new KnexAdapter({ connection, tableName, schedulesTableName })
     const controller = new AbortController()
 
-    const subscription = subscriber.subscribe!(['default'], () => {}, controller.signal)
+    const watcher = watching.watch!(['default'], controller.signal)
     while (created.length < 1) await new Promise((resolve) => setTimeout(resolve, 5))
     controller.abort()
 
-    await assert.rejects(() => subscription)
+    await assert.rejects(() => watcher)
     assert.isTrue(created[0].ended)
   })
 
@@ -2634,10 +2661,8 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       created_at: Date.now(),
     })
     const worker = new KnexAdapter({ connection, tableName, schedulesTableName })
-    const wakes: number[] = []
-    const unsubscribe = await worker.subscribe!(['default'], (at) => wakes.push(at))
-    cleanup(unsubscribe)
-    wakes.splice(0)
+    const watcher = await worker.watch!(['default'])
+    cleanup(() => watcher.close())
 
     // Another worker is claiming the schedule when it becomes due.
     const trx = await connection.transaction()
@@ -2648,8 +2673,11 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     await new Promise((resolve) => setTimeout(resolve, 150))
 
     assert.isNull(await worker.claimDueSchedule())
-    await new Promise((resolve) => setTimeout(resolve, 50))
-    assert.deepEqual(wakes, [], 'the commit of the other claim notifies')
+    watcher.reset()
+    assert.isFalse(
+      await watcher.wait(100, new AbortController().signal, 0),
+      'the commit of the other claim notifies'
+    )
   })
 
   test('calls the connection provider again when its settings expire', async ({
@@ -2677,7 +2705,8 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     cleanup(() => provider.destroy())
     const listenerName = async () => {
       const result = await connection.raw(
-        `select application_name from pg_stat_activity where query like 'LISTEN%' and application_name like 'listen-%'`
+        // The LISTEN connection, not the probe that notifies through another one.
+        `select application_name from pg_stat_activity where application_name like 'listen-%' and query not like '%pg_notify%'`
       )
       return result.rows.map((row: { application_name: string }) => row.application_name)
     }
@@ -2688,8 +2717,8 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       schedulesTableName,
       logger: new MemoryLogger(),
     })
-    const unsubscribe = await subscriber.subscribe!(['default'], () => {})
-    cleanup(unsubscribe)
+    const watcher = await subscriber.watch!(['default'])
+    cleanup(() => watcher.close())
     const [first] = await listenerName()
 
     // Rotated credentials: the provider marks its settings expired.
@@ -2705,7 +2734,7 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     assert.notEqual(second, first)
   })
 
-  test('does not reconnect a LISTEN connection that failed to subscribe', async ({
+  test('does not reconnect a LISTEN connection that failed to start', async ({
     assert,
     cleanup,
   }) => {
@@ -2723,23 +2752,20 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       schedulesTableName,
       logger: new MemoryLogger(),
     })
-    await assert.rejects(
-      () => subscriber.subscribe!(['default'], () => {}),
-      'Connection terminated'
-    )
+    await assert.rejects(() => subscriber.watch!(['default']), 'Connection terminated')
 
     // Past the reconnection delay
     await new Promise((resolve) => setTimeout(resolve, 1200))
     assert.lengthOf(created, 1)
   })
 
-  test('aborts a LISTEN reconnection still in its handshake when unsubscribing', async ({
+  test('aborts a LISTEN reconnection still in its handshake when closed', async ({
     assert,
     cleanup,
   }) => {
-    // The second connection never completes its handshake.
+    // The first connection and its probe work, the next never completes its handshake.
     const created = fakeListenClients(cleanup, (index) =>
-      index === 1 ? 'real' : { connect: () => new Promise(() => {}) }
+      index <= 2 ? 'real' : { connect: () => new Promise(() => {}) }
     )
 
     const subscriber = new KnexAdapter({
@@ -2748,12 +2774,12 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       schedulesTableName,
       logger: new MemoryLogger(),
     })
-    const unsubscribe = await subscriber.subscribe!(['default'], () => {})
+    const watcher = await subscriber.watch!(['default'])
     created[0].emit('error', new Error('Connection terminated'))
 
-    while (created.length < 2) await new Promise((resolve) => setTimeout(resolve, 20))
-    await unsubscribe()
-    assert.isTrue(created[1].ended)
+    while (created.length < 3) await new Promise((resolve) => setTimeout(resolve, 20))
+    await watcher.close()
+    assert.isTrue(created[2].ended)
   })
 
   test('signals jobs of a table whose name is too long for a channel', async ({
@@ -2768,21 +2794,21 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     await connection.raw('create table ?? (like ?? including all)', [longTableName, tableName])
     const options = { tableName: longTableName, schedulesTableName }
 
-    const wakes: number[] = []
     const subscriber = new KnexAdapter({ connection, ...options })
-    const unsubscribe = await subscriber.subscribe!(['default'], (at) => wakes.push(at))
-    cleanup(unsubscribe)
-    wakes.splice(0)
+    const watcher = await subscriber.watch!(['default'])
+    cleanup(() => watcher.close())
+    watcher.reset()
+    const waiting = watcher.wait(2000, new AbortController().signal, 0)
 
     const job = { id: 'long-table-job', name: 'TestJob', payload: {}, attempts: 0 }
     await connection.transaction((trx) =>
       new KnexAdapter({ connection: trx, ...options }).pushOn('default', job)
     )
-    while (wakes.length === 0) await new Promise((resolve) => setTimeout(resolve, 10))
+    assert.isTrue(await waiting)
     assert.isNotNull(await subscriber.getJob(job.id, 'default'))
   })
 
-  test('reconnects a LISTEN connection that stops answering', async ({ cleanup }) => {
+  test('reconnects a LISTEN connection that stops answering', async ({ assert, cleanup }) => {
     shortenHeartbeat(cleanup)
     const proxy = await startSilentProxy({
       host: process.env.PG_HOST || 'localhost',
@@ -2804,25 +2830,99 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       knexClient.connectionConfigProvider = undefined
     })
 
-    const wakes: number[] = []
-    const subscriber = new KnexAdapter({
+    const logger = new MemoryLogger()
+    const watcher = await new KnexAdapter({
       connection,
       tableName,
       schedulesTableName,
-      logger: new MemoryLogger(),
-    })
-    const unsubscribe = await subscriber.subscribe!(['default'], (at) => wakes.push(at))
-    cleanup(unsubscribe)
+      logger,
+    }).watch!(['default'])
+    cleanup(() => watcher.close())
+    watcher.reset()
+    const waiting = watcher.wait(4000, new AbortController().signal, 0)
     proxy.silence()
-    wakes.splice(0)
 
+    // Its notification is lost: the new connection announces it.
     await new KnexAdapter({ connection, tableName, schedulesTableName }).pushOn('default', {
       id: 'after-silence',
       name: 'TestJob',
       payload: {},
       attempts: 0,
     })
-    await waitFor(() => wakes.length > 0)
+    assert.isTrue(await waiting)
+    assert.include(
+      logger.logs.map((entry) => String(entry.obj?.err)),
+      'Error: The LISTEN connection did not answer a ping'
+    )
+  }).timeout(6000)
+
+  test('a watcher woken for nothing sleeps through its cooldown', async ({ assert, cleanup }) => {
+    const watcher = await new KnexAdapter({ connection, tableName, schedulesTableName }).watch!([
+      'default',
+    ])
+    cleanup(() => watcher.close())
+    watcher.reset()
+
+    const start = Date.now()
+    const waiting = watcher.wait(2000, new AbortController().signal, 300)
+    await new KnexAdapter({ connection, tableName, schedulesTableName }).pushOn('default', {
+      id: 'during-cooldown',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+    })
+    assert.isTrue(await waiting)
+    assert.closeTo(Date.now() - start, 300, 80)
+  })
+
+  test('sends one notification per interval for a burst of pushes', async ({ assert, cleanup }) => {
+    const listener = (await connection.client.acquireRawConnection()) as {
+      query(sql: string): Promise<unknown>
+      on(event: 'notification', listener: (message: { payload?: string }) => void): void
+    }
+    cleanup(() => connection.client.destroyRawConnection(listener))
+    const payloads: string[] = []
+    listener.on('notification', (message) => payloads.push(message.payload ?? ''))
+    await listener.query(`LISTEN "${tableName}"`)
+
+    const writer = new KnexAdapter({ connection, tableName, schedulesTableName })
+    const start = Date.now()
+    for (let index = 0; index < 50; index++) {
+      await writer.pushOn('default', {
+        id: `burst-${index}`,
+        name: 'TestJob',
+        payload: {},
+        attempts: 0,
+      })
+    }
+    const elapsed = Date.now() - start
+    await writer.destroy()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    assert.isAtLeast(payloads.length, 1)
+    assert.isAtMost(payloads.length, Math.ceil(elapsed / 50) + 1)
+  })
+
+  test('watches without holding a connection of the pool', async ({ assert, cleanup }) => {
+    // The worker holds a pool connection while its watcher starts.
+    const trx = await connection.transaction()
+    cleanup(async () => {
+      await trx.rollback()
+    })
+    await trx.raw('select 1')
+    const pool = (
+      connection.client as KnexTypes.Client & {
+        pool: { numUsed(): number; numFree(): number }
+      }
+    ).pool
+    const before = pool.numUsed() + pool.numFree()
+
+    const watcher = await new KnexAdapter({ connection, tableName, schedulesTableName }).watch!([
+      'default',
+    ])
+    cleanup(() => watcher.close())
+
+    assert.equal(pool.numUsed() + pool.numFree(), before)
   })
 
   test('knex() factory accepts a table name or options', async ({ assert }) => {
@@ -2831,11 +2931,11 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     await knex(connection, tableName)().pushOn('default', job)
 
     const polling = knex(connection, { tableName, schedulesTableName, notifications: false })()
-    assert.isUndefined(polling.subscribe)
+    assert.isUndefined(polling.watch)
     assert.isNotNull(await polling.getJob(job.id, 'default'), 'the string sets the jobs table')
 
     const listening = knex(connection, { tableName, schedulesTableName })()
-    assert.isFunction(listening.subscribe)
+    assert.isFunction(listening.watch)
   })
 
   registerPruneFailureSuite({

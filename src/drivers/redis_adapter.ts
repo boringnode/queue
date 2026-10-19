@@ -8,16 +8,10 @@ import type {
   JobLease,
   PushResult,
   StalledJobsRecovery,
-  Unsubscribe,
-  WakeListener,
+  WorkWatcher,
 } from '../contracts/adapter.js'
 import { consoleLogger, type Logger } from '../logger.js'
-import {
-  dispatchWakeMessage,
-  encodeWakeMessage,
-  startHeartbeat,
-  type WakeMessage,
-} from './wake_messages.js'
+import { RedisWorkWatcher } from './redis_work_watcher.js'
 import type { AdapterFactoryContext, DedupOutcome } from '../types/main.js'
 import type {
   JobData,
@@ -43,6 +37,7 @@ import {
   REMOVE_JOB_SCRIPT,
   RENEW_JOBS_SCRIPT,
   RETRY_JOB_SCRIPT,
+  SEED_MARKERS_SCRIPT,
   UPDATE_SCHEDULE_SCRIPT,
   UPSERT_SCHEDULE_SCRIPT,
 } from './redis_scripts.js'
@@ -53,9 +48,8 @@ const schedulesDueKey = 'schedules::due'
 // Schedule hashes live one level below the index keys so no schedule id can collide with them.
 const scheduleDataPrefix = 'schedules::data::'
 const legacyScheduleDataPrefix = 'schedules::'
-// Pub/sub channels belong to no database and ioredis does not prefix them:
-// the adapter adds the key prefix and the database itself.
-const wakeChannelSuffix = 'jobs::wake'
+// Below the due index: a 0.7 schedule hash lives at `schedules::<id>`.
+const schedulesMarkerKey = 'schedules::due::marker'
 
 /**
  * An ioredis connection, or the options to create one.
@@ -112,97 +106,43 @@ export class RedisAdapter implements Adapter {
     this.#logger = logger
   }
 
-  get #wakeChannel(): string {
-    const options = this.#connection.options
-    return `${options?.keyPrefix ?? ''}${wakeChannelSuffix}::${options?.db ?? 0}`
-  }
-
   /**
-   * The channel and message of a wake signal, passed as the last two ARGV of
-   * the script that announces it (see PUBLISH_WAKE_LUA).
+   * Wait for work with BZPOPMIN on the markers of the queues and schedules,
+   * through a dedicated connection: a blocking command holds its connection.
    */
-  #wake(message: WakeMessage): [string, string] {
-    return [this.#wakeChannel, encodeWakeMessage(message)]
-  }
-
-  /**
-   * Listen on the wake channel through a dedicated connection: a connection
-   * in subscriber mode cannot run other commands.
-   */
-  async subscribe(
-    queues: readonly string[],
-    onWake: WakeListener,
-    signal?: AbortSignal
-  ): Promise<Unsubscribe> {
+  async watch(queues: readonly string[], signal?: AbortSignal): Promise<WorkWatcher> {
     signal?.throwIfAborted()
-    const subscriber = this.#connection.duplicate()
-    let subscribed = false
+    const markers = queues.map((queue) => ({
+      key: this.#getKeys(queue).marker,
+      source: this.#getKeys(queue).delayed,
+    }))
+    markers.push({ key: schedulesMarkerKey, source: schedulesDueKey })
 
-    const logError = (error: unknown, message: string) => {
-      this.#logger.error({ err: error as Error }, message)
-    }
-
-    // Signals sent before subscribing, or while disconnected, are lost.
-    const announce = async () => {
-      onWake(Date.now())
-      for (const queue of queues) {
-        const [, score] = await this.#connection.zrange(
-          this.#getKeys(queue).delayed,
-          '0',
-          '0',
-          'WITHSCORES'
-        )
-        if (score !== undefined) onWake(Number(score))
-      }
-      const nextSchedule = await this.#nextScheduleAt()
-      if (nextSchedule !== null) onWake(nextSchedule)
-    }
-
-    subscriber.on('error', (error) => logError(error, 'Redis wake subscriber error'))
-    subscriber.on('message', (channel: string, raw: string) => {
-      if (channel !== this.#wakeChannel) return
-      dispatchWakeMessage(raw, queues, onWake, () => this.#nextScheduleAt()).catch((error) =>
-        logError(error, 'Failed to handle a wake signal')
-      )
+    // A command interrupted by a reconnection fails instead of blocking again.
+    const blocking = this.#connection.duplicate({ autoResendUnfulfilledCommands: false })
+    blocking.on('error', (error) => {
+      this.#logger.error({ err: error }, 'Redis blocking connection error')
     })
-    // ioredis subscribes again on reconnection.
-    subscriber.on('ready', () => {
-      if (subscribed) announce().catch((error) => logError(error, 'Failed to announce due work'))
-    })
-
-    const abort = () => subscriber.disconnect()
+    const abort = () => blocking.disconnect()
     signal?.addEventListener('abort', abort, { once: true })
 
     try {
-      await subscriber.subscribe(this.#wakeChannel)
-      subscribed = true
-      await announce()
+      await blocking.ping()
+      const seedKeys = queues.flatMap((queue) => {
+        const keys = this.#getKeys(queue)
+        return [keys.pending, keys.delayed, keys.marker]
+      })
+      seedKeys.push(schedulesDueKey, schedulesMarkerKey)
+      await this.#connection.eval(SEED_MARKERS_SCRIPT, seedKeys.length, ...seedKeys)
       signal?.throwIfAborted()
     } catch (error) {
-      subscriber.disconnect()
+      blocking.disconnect()
       throw error
     } finally {
       signal?.removeEventListener('abort', abort)
     }
 
-    const stopHeartbeat = startHeartbeat(
-      () => (subscriber.status === 'ready' ? subscriber.ping() : undefined),
-      () => {
-        logError(new Error('No answer to PING'), 'Redis wake subscriber is silent, reconnecting')
-        subscriber.disconnect(true)
-      }
-    )
-
-    return async () => {
-      subscribed = false
-      stopHeartbeat()
-      subscriber.disconnect()
-    }
-  }
-
-  async #nextScheduleAt(): Promise<number | null> {
-    const [, score] = await this.#connection.zrange(schedulesDueKey, '0', '0', 'WITHSCORES')
-    return score === undefined ? null : Number(score)
+    return new RedisWorkWatcher(this.#connection, blocking, markers, this.#logger)
   }
 
   #getKeys(queue: string) {
@@ -212,6 +152,7 @@ export class RedisAdapter implements Adapter {
       delayed: `${redisKey}::${queue}::delayed`,
       active: `${redisKey}::${queue}::active`,
       overlay: `${redisKey}::${queue}::metadata`,
+      marker: `${redisKey}::${queue}::marker`,
       completed: `${redisKey}::${queue}::completed`,
       completedIndex: `${redisKey}::${queue}::completed::index`,
       failed: `${redisKey}::${queue}::failed`,
@@ -252,17 +193,16 @@ export class RedisAdapter implements Adapter {
 
     const result = await this.#connection.eval(
       ACQUIRE_JOB_SCRIPT,
-      5,
+      6,
       keys.data,
       keys.pending,
       keys.active,
       keys.delayed,
       keys.overlay,
+      keys.marker,
       this.#workerId,
       now.toString(),
-      leaseToken,
-      this.#wakeChannel,
-      queue
+      leaseToken
     )
 
     if (!result) {
@@ -369,19 +309,17 @@ export class RedisAdapter implements Adapter {
 
     const retried = await this.#connection.eval(
       RETRY_JOB_SCRIPT,
-      5,
+      6,
       keys.data,
       keys.active,
       keys.pending,
       keys.delayed,
       keys.overlay,
+      keys.marker,
       job.id,
       retryAt ? retryAt.getTime().toString() : '0',
       now.toString(),
-      job.leaseToken,
-      ...this.#wake(
-        retryAt && retryAt.getTime() > now ? { queue, at: retryAt.getTime() } : { queue }
-      )
+      job.leaseToken
     )
     return retried === 1
   }
@@ -431,12 +369,13 @@ export class RedisAdapter implements Adapter {
       const [payloadData, payloadIsUndefined] = encodeRedisJobPayloadOverlay(jobData.payload)
       const result = (await this.#connection.eval(
         PUSH_DEDUP_JOB_SCRIPT,
-        5,
+        6,
         keys.data,
         keys.delayed,
         dedupKey,
         keys.pending,
         keys.overlay,
+        keys.marker,
         jobData.id,
         JSON.stringify(jobData),
         executeAt.toString(),
@@ -445,21 +384,21 @@ export class RedisAdapter implements Adapter {
         jobData.dedup.replace ? '1' : '0',
         payloadData,
         payloadIsUndefined,
-        ...this.#wake({ queue, at: executeAt })
+        '1'
       )) as [string, string]
       return { outcome: result[0] as DedupOutcome, jobId: result[1] }
     }
 
     await this.#connection.eval(
       PUSH_DELAYED_JOB_SCRIPT,
-      3,
+      4,
       keys.data,
       keys.delayed,
       keys.overlay,
+      keys.marker,
       jobData.id,
       JSON.stringify(jobData),
-      executeAt.toString(),
-      ...this.#wake({ queue, at: executeAt })
+      executeAt.toString()
     )
   }
 
@@ -474,12 +413,13 @@ export class RedisAdapter implements Adapter {
       const [payloadData, payloadIsUndefined] = encodeRedisJobPayloadOverlay(jobData.payload)
       const result = (await this.#connection.eval(
         PUSH_DEDUP_JOB_SCRIPT,
-        5,
+        6,
         keys.data,
         keys.pending,
         dedupKey,
         keys.delayed,
         keys.overlay,
+        keys.marker,
         jobData.id,
         JSON.stringify(jobData),
         score.toString(),
@@ -488,21 +428,21 @@ export class RedisAdapter implements Adapter {
         jobData.dedup.replace ? '1' : '0',
         payloadData,
         payloadIsUndefined,
-        ...this.#wake({ queue })
+        '0'
       )) as [string, string]
       return { outcome: result[0] as DedupOutcome, jobId: result[1] }
     }
 
     await this.#connection.eval(
       PUSH_JOB_SCRIPT,
-      3,
+      4,
       keys.data,
       keys.pending,
       keys.overlay,
+      keys.marker,
       jobData.id,
       JSON.stringify(jobData),
-      score.toString(),
-      ...this.#wake({ queue })
+      score.toString()
     )
   }
 
@@ -529,7 +469,7 @@ export class RedisAdapter implements Adapter {
       multi.zadd(keys.pending, score, job.id)
     }
 
-    multi.publish(...this.#wake({ queue }))
+    multi.zadd(keys.marker, 0, '0')
     await multi.exec()
   }
 
@@ -555,18 +495,18 @@ export class RedisAdapter implements Adapter {
 
     const [recovered, ...exceeded] = (await this.#connection.eval(
       RECOVER_STALLED_JOBS_SCRIPT,
-      4,
+      5,
       keys.data,
       keys.active,
       keys.pending,
       keys.overlay,
+      keys.marker,
       now.toString(),
       stalledThreshold.toString(),
       maxStalledCount.toString(),
       this.#workerId,
       maxExceeded.toString(),
-      leaseTokenPrefix,
-      ...this.#wake({ queue })
+      leaseTokenPrefix
     )) as [number, ...string[]]
 
     return {
@@ -623,16 +563,16 @@ export class RedisAdapter implements Adapter {
 
     const unfinalizedClaim = (await this.#connection.eval(
       UPSERT_SCHEDULE_SCRIPT,
-      4,
+      5,
       scheduleKey,
       schedulesIndexKey,
       schedulesDueKey,
       `${legacyScheduleDataPrefix}${id}`,
+      schedulesMarkerKey,
       id,
       now.toString(),
       JSON.stringify(scheduleData),
-      config.nextRunAt?.getTime().toString() ?? '',
-      ...this.#wake({ schedules: true })
+      config.nextRunAt?.getTime().toString() ?? ''
     )) as [string, string, string] | null
 
     // Finalize it as its worker would have, from the time of the claim. The
@@ -729,12 +669,12 @@ export class RedisAdapter implements Adapter {
 
     await this.#connection.eval(
       UPDATE_SCHEDULE_SCRIPT,
-      2,
+      3,
       scheduleKey,
       schedulesDueKey,
+      schedulesMarkerKey,
       id,
-      JSON.stringify(data),
-      ...this.#wake({ schedules: true })
+      JSON.stringify(data)
     )
   }
 
@@ -745,7 +685,6 @@ export class RedisAdapter implements Adapter {
       .del(scheduleKey)
       .srem(schedulesIndexKey, id)
       .zrem(schedulesDueKey, id)
-      .publish(...this.#wake({ schedules: true }))
       .exec()
   }
 
@@ -767,12 +706,12 @@ export class RedisAdapter implements Adapter {
     while (true) {
       const result = (await this.#connection.eval(
         CLAIM_SCHEDULE_SCRIPT,
-        2,
+        3,
         schedulesDueKey,
         scheduleDataPrefix,
+        schedulesMarkerKey,
         now.toString(),
-        claimToken,
-        ...this.#wake({ schedules: true })
+        claimToken
       )) as ['claimed' | 'unfinalized', string] | null
 
       if (!result) {
@@ -837,15 +776,15 @@ export class RedisAdapter implements Adapter {
 
     await this.#connection.eval(
       FINALIZE_CRON_SCHEDULE_SCRIPT,
-      2,
+      3,
       `${scheduleDataPrefix}${claim.id}`,
       schedulesDueKey,
+      schedulesMarkerKey,
       claim.id,
       claim.cronExpression,
       claim.configRevision,
       claim.claimToken,
-      nextRunAt.toString(),
-      ...this.#wake({ schedules: true })
+      nextRunAt.toString()
     )
   }
 

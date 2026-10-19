@@ -1,17 +1,97 @@
 import { REDIS_DEDUP_LUA, REDIS_JOB_STORAGE_LUA } from './redis_job_storage.js'
 
 /**
- * Publishes the wake signal of a script, given as its last two ARGV: the
- * channel and the message. Publishing from the script keeps one round trip
- * and sends the signal with the write it announces.
+ * Markers wake idle workers, as in BullMQ. A marker key is a sorted set that
+ * workers wait on with BZPOPMIN: each marker wakes one worker only, and a
+ * marker written while every worker is busy waits for the first idle one.
  *
- * The signal is a hint: pcall keeps a refused PUBLISH, such as for an ACL
- * user without channel permissions (the Redis 7 default), from failing a
- * script whose writes Redis does not roll back. Workers then poll.
+ * - Member '0', score 0: a job is ready. Many pushes leave one marker. The
+ *   worker that pops a job writes it again while jobs remain, to wake the
+ *   next worker.
+ * - Member '1': the earliest known time at which a delayed job or a schedule
+ *   becomes due. A worker holds it until then.
+ *
+ * The marker key of a script is its last key.
  */
-const PUBLISH_WAKE_LUA = `
-  local function publish_wake()
-    redis.pcall('PUBLISH', ARGV[#ARGV - 1], ARGV[#ARGV])
+const MARKER_LUA = `
+  local marker_key = KEYS[#KEYS]
+
+  local function mark_ready()
+    redis.call('ZADD', marker_key, 0, '0')
+  end
+
+  -- A later time would hide the earlier one.
+  local function mark_due(at)
+    local current = redis.call('ZSCORE', marker_key, '1')
+    if not current or tonumber(current) > at then
+      redis.call('ZADD', marker_key, at, '1')
+    end
+  end
+
+  -- Exactly the first score of a sorted set, once the previous one is handled.
+  local function mark_first_of(key)
+    local first = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+    if #first > 0 then
+      redis.call('ZADD', marker_key, first[2], '1')
+    else
+      redis.call('ZREM', marker_key, '1')
+    end
+  end
+`
+
+/**
+ * Writes the markers of work stored before a worker waits for it, or by an
+ * older version of this package. KEYS = per queue its pending, delayed and
+ * marker keys, then the schedules due index and its marker.
+ */
+export const SEED_MARKERS_SCRIPT = `
+  local function seed(source_key, marker_key, ready)
+    local first = redis.call('ZRANGE', source_key, 0, 0, 'WITHSCORES')
+    if #first == 0 then
+      return
+    end
+    if ready then
+      redis.call('ZADD', marker_key, 0, '0')
+      return
+    end
+    local current = redis.call('ZSCORE', marker_key, '1')
+    if not current or tonumber(current) > tonumber(first[2]) then
+      redis.call('ZADD', marker_key, first[2], '1')
+    end
+  end
+
+  for i = 1, #KEYS - 2, 3 do
+    seed(KEYS[i], KEYS[i + 2], true)
+    seed(KEYS[i + 1], KEYS[i + 2], false)
+  end
+  seed(KEYS[#KEYS - 1], KEYS[#KEYS], false)
+`
+
+/**
+ * Marks the first entry of a sorted set due after now, ARGV[1]. KEYS = the
+ * sorted set (delayed jobs or schedules), its marker. A worker woken by a
+ * due marker runs it: what is due now is its own work, and the marker of
+ * the next entry is not lost if its cycle writes none.
+ */
+export const ADVANCE_MARKER_SCRIPT = `
+  local next = redis.call('ZRANGEBYSCORE', KEYS[1], '(' .. ARGV[1], '+inf', 'WITHSCORES', 'LIMIT', 0, 1)
+  if #next == 0 then
+    return
+  end
+  local current = redis.call('ZSCORE', KEYS[2], '1')
+  if not current or tonumber(current) > tonumber(next[2]) then
+    redis.call('ZADD', KEYS[2], next[2], '1')
+  end
+`
+
+/**
+ * Puts back a marker a worker popped but does not act on: ARGV = member,
+ * score. A due time only replaces a later one.
+ */
+export const RELEASE_MARKER_SCRIPT = `
+  local current = redis.call('ZSCORE', KEYS[1], ARGV[1])
+  if not current or tonumber(current) > tonumber(ARGV[2]) then
+    redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
   end
 `
 
@@ -28,12 +108,11 @@ export const PUSH_JOB_SCRIPT = `
   local score = tonumber(ARGV[3])
 
 ${REDIS_JOB_STORAGE_LUA}
-
-${PUBLISH_WAKE_LUA}
+${MARKER_LUA}
 
   store_job_data(data_key, overlay_key, job_id, job_data)
   redis.call('ZADD', pending_key, score, job_id)
-  publish_wake()
+  mark_ready()
 
   return 1
 `
@@ -72,13 +151,18 @@ export const PUSH_DEDUP_JOB_SCRIPT = `
   local replace = tonumber(ARGV[6])
   local payload_data = ARGV[7]
   local payload_is_undefined = tonumber(ARGV[8])
+  local delayed = ARGV[9] == '1'
 
 ${REDIS_JOB_STORAGE_LUA}
 ${REDIS_DEDUP_LUA}
-${PUBLISH_WAKE_LUA}
+${MARKER_LUA}
 
-  -- The job may be skipped: a spurious signal only costs a poll.
-  publish_wake()
+  -- The job may be skipped: a spurious marker only costs one worker a look.
+  if delayed then
+    mark_due(score)
+  else
+    mark_ready()
+  end
 
   local existing_result = resolve_dedup_existing_job(
     data_key,
@@ -117,12 +201,11 @@ export const PUSH_DELAYED_JOB_SCRIPT = `
   local execute_at = tonumber(ARGV[3])
 
 ${REDIS_JOB_STORAGE_LUA}
-
-${PUBLISH_WAKE_LUA}
+${MARKER_LUA}
 
   store_job_data(data_key, overlay_key, job_id, job_data)
   redis.call('ZADD', delayed_key, execute_at, job_id)
-  publish_wake()
+  mark_due(execute_at)
 
   return 1
 `
@@ -143,10 +226,9 @@ export const ACQUIRE_JOB_SCRIPT = `
   local worker_id = ARGV[1]
   local now = tonumber(ARGV[2])
   local lease_token = ARGV[3]
-  local wake_channel = ARGV[4]
-  local queue = ARGV[5]
 
 ${REDIS_JOB_STORAGE_LUA}
+${MARKER_LUA}
 
   -- Process delayed jobs: move ready jobs to pending
   local ready_job_ids = redis.call('ZRANGEBYSCORE', delayed_key, 0, now)
@@ -162,18 +244,18 @@ ${REDIS_JOB_STORAGE_LUA}
       end
     end
 
-    -- Workers only know the next delayed job: announce the one after it.
-    local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
-    if #next_delayed > 0 then
-      redis.pcall('PUBLISH', wake_channel,
-        cjson.encode({ queue = queue, at = tonumber(next_delayed[2]) }))
-    end
+    mark_first_of(delayed_key)
   end
 
   -- Pop highest priority job (lowest score)
   local result = redis.call('ZPOPMIN', pending_key)
   if not result or #result == 0 then
     return nil
+  end
+
+  -- Wake the next idle worker while jobs remain.
+  if redis.call('ZCARD', pending_key) > 0 then
+    mark_ready()
   end
 
   local job_id = result[1]
@@ -352,7 +434,7 @@ export const RETRY_JOB_SCRIPT = `
 
 ${REDIS_JOB_STORAGE_LUA}
 ${REDIS_LEASE_LUA}
-${PUBLISH_WAKE_LUA}
+${MARKER_LUA}
 
   -- Verify the caller still holds the job
   if not holds_lease(active_key, job_id, lease_token) then
@@ -380,15 +462,16 @@ ${PUBLISH_WAKE_LUA}
   -- Add back to pending or delayed
   if retry_at and retry_at > now then
     redis.call('ZADD', delayed_key, retry_at, job_id)
+    mark_due(retry_at)
   else
     -- Score = priority * 1e13 + timestamp
     -- Lower score = higher priority, FIFO within same priority
     local priority = job.priority or 5
     local score = priority * 10000000000000 + now
     redis.call('ZADD', pending_key, score, job_id)
+    mark_ready()
   end
 
-  publish_wake()
   return 1
 `
 
@@ -414,7 +497,7 @@ export const RECOVER_STALLED_JOBS_SCRIPT = `
   local lease_token_prefix = ARGV[6]
 
 ${REDIS_JOB_STORAGE_LUA}
-${PUBLISH_WAKE_LUA}
+${MARKER_LUA}
 
   local recovered = 0
   -- The first element is replaced by the recovered count before returning.
@@ -471,7 +554,7 @@ ${PUBLISH_WAKE_LUA}
 
   result[1] = recovered
   if recovered > 0 then
-    publish_wake()
+    mark_ready()
   end
   return result
 `
@@ -630,9 +713,7 @@ export const UPSERT_SCHEDULE_SCRIPT = `
   local next_run_at = ARGV[4]
 
 ${SCHEDULE_DUE_INDEX_LUA}
-${PUBLISH_WAKE_LUA}
-
-  publish_wake()
+${MARKER_LUA}
 
   -- The same test as migrate(): an indexed id with a 0.7 hash at its old key.
   if redis.call('SISMEMBER', schedules_index_key, id) == 1
@@ -685,6 +766,7 @@ ${PUBLISH_WAKE_LUA}
   )
   redis.call('SADD', schedules_index_key, id)
   sync_schedule_due_index(schedule_key, due_key, id)
+  mark_first_of(due_key)
 
   -- A finished schedule never keeps a claim token, so an empty next run with
   -- one is a cron claim not finalized yet.
@@ -711,12 +793,11 @@ export const UPDATE_SCHEDULE_SCRIPT = `
   local updates = cjson.decode(ARGV[2])
 
 ${SCHEDULE_DUE_INDEX_LUA}
-${PUBLISH_WAKE_LUA}
-
-  publish_wake()
+${MARKER_LUA}
 
   if redis.call('EXISTS', schedule_key) == 0 then
     redis.call('ZREM', due_key, id)
+    mark_first_of(due_key)
     return 0
   end
 
@@ -731,6 +812,7 @@ ${PUBLISH_WAKE_LUA}
   end
 
   sync_schedule_due_index(schedule_key, due_key, id)
+  mark_first_of(due_key)
 
   return 1
 `
@@ -749,12 +831,11 @@ export const FINALIZE_CRON_SCHEDULE_SCRIPT = `
   local next_run_at = ARGV[5]
 
 ${SCHEDULE_DUE_INDEX_LUA}
-${PUBLISH_WAKE_LUA}
-
-  publish_wake()
+${MARKER_LUA}
 
   if redis.call('EXISTS', schedule_key) == 0 then
     redis.call('ZREM', due_key, id)
+    mark_first_of(due_key)
     return 0
   end
 
@@ -772,6 +853,7 @@ ${PUBLISH_WAKE_LUA}
       redis.call('HDEL', schedule_key, 'claim_token', 'claimed_at')
     end
     sync_schedule_due_index(schedule_key, due_key, id)
+    mark_first_of(due_key)
     return 0
   end
 
@@ -788,6 +870,7 @@ ${PUBLISH_WAKE_LUA}
   redis.call('HSET', schedule_key, 'next_run_at', next_run_at)
   redis.call('HDEL', schedule_key, 'claim_token', 'claimed_at')
   sync_schedule_due_index(schedule_key, due_key, id)
+  mark_first_of(due_key)
 
   return 1
 `
@@ -901,7 +984,7 @@ ${SCHEDULE_DUE_INDEX_LUA}
  * KEYS[2] = schedule key prefix (e.g. "schedules::data::")
  * ARGV[1] = now (epoch milliseconds)
  * ARGV[2] = claim token, kept by the schedule when it is a cron
- * ARGV[3], ARGV[4] = wake channel and message, published when the due index changes
+ * KEYS[3] = schedules marker, written when the due index changes
  *
  * Returns nil, or `{ 'claimed' | 'unfinalized', <schedule hash as JSON> }`.
  */
@@ -912,7 +995,7 @@ export const CLAIM_SCHEDULE_SCRIPT = `
   local claim_token = ARGV[2]
 
 ${SCHEDULE_DUE_INDEX_LUA}
-${PUBLISH_WAKE_LUA}
+${MARKER_LUA}
 
   local skipped = false
 
@@ -920,9 +1003,8 @@ ${PUBLISH_WAKE_LUA}
     local candidates = redis.call('ZRANGEBYSCORE', due_key, '-inf', tostring(now), 'LIMIT', 0, 1)
 
     if #candidates == 0 then
-      -- Subscribers may wait for a skipped entry: let them read the next one.
       if skipped then
-        publish_wake()
+        mark_first_of(due_key)
       end
       return nil
     end
@@ -1011,7 +1093,7 @@ ${PUBLISH_WAKE_LUA}
               'claimed_at', new_claimed_at)
 
             sync_schedule_due_index(schedule_key, due_key, id)
-            publish_wake()
+            mark_first_of(due_key)
 
             -- Return the schedule data (before update) as JSON
             return { 'claimed', cjson.encode(schedule) }
