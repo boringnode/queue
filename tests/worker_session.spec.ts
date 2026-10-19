@@ -11,6 +11,7 @@ import {
 import { ControllableAdapter } from './_mocks/controllable_adapter.js'
 import { trackPromise } from './_utils/track_promise.js'
 import { MemoryLogger } from './_mocks/memory_logger.js'
+import type { Unsubscribe, WakeListener } from '../src/contracts/adapter.js'
 
 type SessionOverrides = Partial<Omit<WorkerSessionOptions, 'settings' | 'jobExecutionRuntime'>> & {
   jobExecutionRuntime?: Partial<JobExecutor>
@@ -867,5 +868,155 @@ test.group('WorkerSession', () => {
 
     assert.equal(startedCycle?.type, 'started')
     assert.equal(errorCycle?.type, 'error')
+  })
+})
+
+/** Hands the wake listener of `subscribe` to the test. */
+class SubscribableAdapter extends ControllableAdapter {
+  onWake?: WakeListener
+  subscribeError?: Error
+
+  async subscribe(
+    _queues: readonly string[],
+    onWake: WakeListener,
+    _signal?: AbortSignal
+  ): Promise<Unsubscribe> {
+    if (this.subscribeError) throw this.subscribeError
+    this.onWake = onWake
+    return async () => {
+      this.onWake = undefined
+    }
+  }
+}
+
+const job = (id: string) => ({ id, name: 'TestJob', payload: {}, attempts: 0 })
+
+test.group('WorkerSession | wake signals', () => {
+  test('sleeps until a wake signal instead of polling every idleDelay', async ({
+    assert,
+    cleanup,
+  }) => {
+    const adapter = new SubscribableAdapter()
+    const executed = Promise.withResolvers<void>()
+    const session = createSession({
+      adapter,
+      settings: { idleDelay: 10 },
+      jobExecutionRuntime: {
+        async execute() {
+          executed.resolve()
+          return { type: 'completed' }
+        },
+      },
+    })
+    cleanup(() => session.stop())
+
+    const start = session.start()
+    await adapter.acquisitions.waitForSettled(1)
+    await setTimeout(100)
+    assert.equal(adapter.acquisitions.calls, 1)
+
+    await adapter.pushOn('default', job('woken'))
+    adapter.onWake!(Date.now())
+    await executed.promise
+
+    await session.stop()
+    await start
+    assert.isUndefined(adapter.onWake, 'stopping ends the subscription')
+  })
+
+  test('wakes when a signalled due time is reached', async ({ assert, cleanup }) => {
+    const adapter = new SubscribableAdapter()
+    const session = createSession({ adapter })
+    cleanup(() => session.stop())
+
+    void session.start()
+    await adapter.acquisitions.waitForSettled(1)
+    adapter.onWake!(Date.now() + 150)
+
+    await setTimeout(75)
+    assert.equal(adapter.acquisitions.calls, 1)
+    await setTimeout(150)
+    assert.equal(adapter.acquisitions.calls, 2)
+  })
+
+  test('keeps a signal received while looking for work', async ({ cleanup }) => {
+    const adapter = new SubscribableAdapter()
+    adapter.acquisitions.block(1)
+    const session = createSession({ adapter })
+    cleanup(async () => {
+      adapter.acquisitions.releaseAll()
+      await session.stop()
+    })
+
+    void session.start()
+    await adapter.acquisitions.waitForStarted(1)
+    adapter.onWake!(Date.now())
+    adapter.acquisitions.release(1)
+
+    // Lost, the signal would leave the session asleep until the stalled check.
+    await adapter.acquisitions.waitForStarted(2)
+  })
+
+  test('polls and stops while the subscription is not ready', async ({ assert }) => {
+    const adapter = new SubscribableAdapter()
+    let aborted = false
+    adapter.subscribe = (_queues, _onWake, signal) =>
+      new Promise<Unsubscribe>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          aborted = true
+          reject(signal.reason)
+        })
+      })
+    const logger = new MemoryLogger()
+    const session = createSession({ adapter, logger, settings: { idleDelay: 10 } })
+
+    const start = session.start()
+    await adapter.acquisitions.waitForStarted(3)
+    await session.stop()
+    await start
+
+    assert.isTrue(aborted, 'stopping aborts the pending subscription')
+    assert.deepEqual(logger.logs, [], 'an aborted subscription is not an error')
+  })
+
+  test('follows the signals of a subscription that gets ready while polling', async ({
+    assert,
+    cleanup,
+  }) => {
+    const adapter = new SubscribableAdapter()
+    const ready = Promise.withResolvers<void>()
+    const subscribe = adapter.subscribe.bind(adapter)
+    adapter.subscribe = async (queues, onWake, signal) => {
+      await ready.promise
+      return subscribe(queues, onWake, signal)
+    }
+    const session = createSession({ adapter, settings: { idleDelay: 60_000 } })
+    cleanup(() => session.stop())
+
+    void session.start()
+    await adapter.acquisitions.waitForSettled(1)
+    await setTimeout(20) // the session now sleeps for idleDelay
+    ready.resolve()
+    while (!adapter.onWake) await setTimeout(1)
+    adapter.onWake(Date.now() + 100)
+
+    // Without it, the first poll would wait for idleDelay.
+    await setTimeout(200)
+    assert.isAtLeast(adapter.acquisitions.calls, 2)
+  })
+
+  test('polls every idleDelay when subscribing fails', async ({ assert, cleanup }) => {
+    const adapter = new SubscribableAdapter()
+    adapter.subscribeError = new Error('LISTEN is not supported')
+    const logger = new MemoryLogger()
+    const session = createSession({ adapter, logger, settings: { idleDelay: 10 } })
+    cleanup(() => session.stop())
+
+    void session.start()
+    await adapter.acquisitions.waitForStarted(3)
+
+    const errors = logger.logs.filter((entry) => entry.level === 'error')
+    assert.equal(errors[0].message, 'Failed to subscribe to wake signals, polling instead')
+    assert.strictEqual(errors[0].obj?.err, adapter.subscribeError)
   })
 })

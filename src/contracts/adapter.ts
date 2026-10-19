@@ -56,6 +56,17 @@ export interface StalledJobsRecovery {
 }
 
 /**
+ * Receives the time (epoch ms) at which work may become due: now for a job
+ * ready to run, later for a delayed job, a retry, or a schedule.
+ */
+export type WakeListener = (at: number) => void
+
+/**
+ * Ends a subscription opened by `Adapter.subscribe`.
+ */
+export type Unsubscribe = () => Promise<void>
+
+/**
  * Adapter interface for queue storage backends.
  *
  * Implementations handle job persistence, atomic operations, and
@@ -99,6 +110,30 @@ export interface Adapter {
    * @returns The acquired job, or null if queue is empty
    */
   popFrom(queue: string): Promise<AcquiredJob | null>
+
+  /**
+   * Optional. Notify a worker when work may become due on `queues`, so it can
+   * sleep instead of polling. Without it, the worker polls every `idleDelay`.
+   *
+   * Signals are hints. A signal may be lost (reconnection, a broker without
+   * delivery guarantees), so the worker still polls once per stalled interval.
+   * To make up for signals sent before subscribing or while disconnected, the
+   * adapter calls `onWake` with now and with the next known due times once
+   * subscribed and after each reconnection.
+   *
+   * The worker polls until `subscribe` resolves, and aborts `signal` when it
+   * stops first: the adapter then releases what it opened and rejects.
+   *
+   * @param queues - The queues the worker processes
+   * @param onWake - Called with the time at which work may become due
+   * @param signal - Aborted when the worker stops before the subscription is ready
+   * @returns Ends the subscription
+   */
+  subscribe?(
+    queues: readonly string[],
+    onWake: WakeListener,
+    signal?: AbortSignal
+  ): Promise<Unsubscribe>
 
   /**
    * Recover stalled jobs that have been active for too long.
