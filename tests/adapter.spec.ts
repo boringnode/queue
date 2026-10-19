@@ -2577,9 +2577,12 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     test,
     inTransaction: (operation) =>
       connection.transaction((trx) =>
-        operation(new KnexAdapter({ connection: trx, tableName, schedulesTableName }))
+        operation(
+          new KnexAdapter({ connection: trx, tableName, schedulesTableName, notifications: true })
+        )
       ),
-    createAdapter: () => new KnexAdapter({ connection, tableName, schedulesTableName }),
+    createAdapter: () =>
+      new KnexAdapter({ connection, tableName, schedulesTableName, notifications: true }),
   })
 
   test('announces a future delayed job past rows another transaction promotes', async ({
@@ -2601,9 +2604,12 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       row('next', nextAt),
     ])
 
-    const watcher = await new KnexAdapter({ connection, tableName, schedulesTableName }).watch!([
-      'default',
-    ])
+    const watcher = await new KnexAdapter({
+      connection,
+      tableName,
+      schedulesTableName,
+      notifications: true,
+    }).watch!(['default'])
     cleanup(() => watcher.close())
 
     // Another worker holds the oldest due row while it promotes it.
@@ -2613,7 +2619,12 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     })
     await trx(tableName).where('id', 'locked').forUpdate().first()
 
-    await new KnexAdapter({ connection, tableName, schedulesTableName }).popFrom('default')
+    await new KnexAdapter({
+      connection,
+      tableName,
+      schedulesTableName,
+      notifications: true,
+    }).popFrom('default')
     watcher.reset()
     assert.isTrue(await watcher.wait(2000, new AbortController().signal, 0))
     assert.isAtLeast(Date.now(), nextAt - 20, 'not woken for the locked row')
@@ -2696,17 +2707,24 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
   test('rejects a LISTEN connection that receives no notification', async ({ assert, cleanup }) => {
     // As behind PgBouncer in transaction mode: LISTEN succeeds, nothing arrives.
     fakeListenClients(cleanup, () => ({}))
-    const watching = new KnexAdapter({ connection, tableName, schedulesTableName })
+    const watching = new KnexAdapter({
+      connection,
+      tableName,
+      schedulesTableName,
+      notifications: true,
+    })
 
-    await assert.rejects(
-      () => watching.watch!(['default']),
-      /pass \{ notifications: false \} to knex\(\)/
-    )
+    await assert.rejects(() => watching.watch!(['default']), /do not enable notifications/)
   }).timeout(5000)
 
   test('aborts a first LISTEN connection still in its handshake', async ({ assert, cleanup }) => {
     const created = fakeListenClients(cleanup, () => ({ connect: () => new Promise(() => {}) }))
-    const watching = new KnexAdapter({ connection, tableName, schedulesTableName })
+    const watching = new KnexAdapter({
+      connection,
+      tableName,
+      schedulesTableName,
+      notifications: true,
+    })
     const controller = new AbortController()
 
     const watcher = watching.watch!(['default'], controller.signal)
@@ -2732,7 +2750,12 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       status: 'active',
       created_at: Date.now(),
     })
-    const worker = new KnexAdapter({ connection, tableName, schedulesTableName })
+    const worker = new KnexAdapter({
+      connection,
+      tableName,
+      schedulesTableName,
+      notifications: true,
+    })
     const watcher = await worker.watch!(['default'])
     cleanup(() => watcher.close())
 
@@ -2785,6 +2808,7 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
 
     const subscriber = new KnexAdapter({
       connection: provider,
+      notifications: true,
       tableName,
       schedulesTableName,
       logger: new MemoryLogger(),
@@ -2823,6 +2847,7 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       tableName,
       schedulesTableName,
       logger: new MemoryLogger(),
+      notifications: true,
     })
     await assert.rejects(() => subscriber.watch!(['default']), 'Connection terminated')
 
@@ -2845,6 +2870,7 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       tableName,
       schedulesTableName,
       logger: new MemoryLogger(),
+      notifications: true,
     })
     const watcher = await subscriber.watch!(['default'])
     created[0].emit('error', new Error('Connection terminated'))
@@ -2864,7 +2890,7 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     await connection.raw('create schema if not exists ??', [schema])
     cleanup(() => connection.raw('drop schema ?? cascade', [schema]))
     await connection.raw('create table ?? (like ?? including all)', [longTableName, tableName])
-    const options = { tableName: longTableName, schedulesTableName }
+    const options = { tableName: longTableName, schedulesTableName, notifications: true }
 
     const subscriber = new KnexAdapter({ connection, ...options })
     const watcher = await subscriber.watch!(['default'])
@@ -2908,6 +2934,7 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       tableName,
       schedulesTableName,
       logger,
+      notifications: true,
     }).watch!(['default'])
     cleanup(() => watcher.close())
     watcher.reset()
@@ -2915,7 +2942,12 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     proxy.silence()
 
     // Its notification is lost: the new connection announces it.
-    await new KnexAdapter({ connection, tableName, schedulesTableName }).pushOn('default', {
+    await new KnexAdapter({
+      connection,
+      tableName,
+      schedulesTableName,
+      notifications: true,
+    }).pushOn('default', {
       id: 'after-silence',
       name: 'TestJob',
       payload: {},
@@ -2929,15 +2961,23 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
   }).timeout(6000)
 
   test('a watcher woken for nothing sleeps through its cooldown', async ({ assert, cleanup }) => {
-    const watcher = await new KnexAdapter({ connection, tableName, schedulesTableName }).watch!([
-      'default',
-    ])
+    const watcher = await new KnexAdapter({
+      connection,
+      tableName,
+      schedulesTableName,
+      notifications: true,
+    }).watch!(['default'])
     cleanup(() => watcher.close())
     watcher.reset()
 
     const start = Date.now()
     const waiting = watcher.wait(2000, new AbortController().signal, 300)
-    await new KnexAdapter({ connection, tableName, schedulesTableName }).pushOn('default', {
+    await new KnexAdapter({
+      connection,
+      tableName,
+      schedulesTableName,
+      notifications: true,
+    }).pushOn('default', {
       id: 'during-cooldown',
       name: 'TestJob',
       payload: {},
@@ -2947,7 +2987,10 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     assert.closeTo(Date.now() - start, 300, 80)
   })
 
-  test('sends one notification per interval for a burst of pushes', async ({ assert, cleanup }) => {
+  test('sends one notification per interval for a burst of pushes to several queues', async ({
+    assert,
+    cleanup,
+  }) => {
     const listener = (await connection.client.acquireRawConnection()) as {
       query(sql: string): Promise<unknown>
       on(event: 'notification', listener: (message: { payload?: string }) => void): void
@@ -2957,10 +3000,16 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     listener.on('notification', (message) => payloads.push(message.payload ?? ''))
     await listener.query(`LISTEN "${tableName}"`)
 
-    const writer = new KnexAdapter({ connection, tableName, schedulesTableName })
+    const writer = new KnexAdapter({
+      connection,
+      tableName,
+      schedulesTableName,
+      notifications: true,
+    })
     const start = Date.now()
     for (let index = 0; index < 50; index++) {
-      await writer.pushOn('default', {
+      // Spread over queues: the interval holds for the adapter.
+      await writer.pushOn(`queue-${index % 5}`, {
         id: `burst-${index}`,
         name: 'TestJob',
         payload: {},
@@ -2989,9 +3038,12 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     ).pool
     const before = pool.numUsed() + pool.numFree()
 
-    const watcher = await new KnexAdapter({ connection, tableName, schedulesTableName }).watch!([
-      'default',
-    ])
+    const watcher = await new KnexAdapter({
+      connection,
+      tableName,
+      schedulesTableName,
+      notifications: true,
+    }).watch!(['default'])
     cleanup(() => watcher.close())
 
     assert.equal(pool.numUsed() + pool.numFree(), before)
@@ -3002,11 +3054,11 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
 
     await knex(connection, tableName)().pushOn('default', job)
 
-    const polling = knex(connection, { tableName, schedulesTableName, notifications: false })()
-    assert.isUndefined(polling.watch)
+    const polling = knex(connection, { tableName, schedulesTableName })()
+    assert.isUndefined(polling.watch, 'polls by default')
     assert.isNotNull(await polling.getJob(job.id, 'default'), 'the string sets the jobs table')
 
-    const listening = knex(connection, { tableName, schedulesTableName })()
+    const listening = knex(connection, { tableName, schedulesTableName, notifications: true })()
     assert.isFunction(listening.watch)
   })
 
