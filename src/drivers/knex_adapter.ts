@@ -479,19 +479,23 @@ export class KnexAdapter implements Adapter {
     }
 
     const connect = async () => {
-      const connection = await createClient()
-      client = connection
-      connection.on('error', onLost)
-      connection.on('end', () => onLost())
-      connection.on('notification', (message) => {
-        if (message.channel !== channel || !message.payload) return
-        if (message.payload === probe?.payload) return probe.received.resolve()
-        dispatchWakeMessage(message.payload, queues, onWake, (at) => {
-          watcher.at = at
-          onWake(at)
-        })
-      })
+      // Set when the caller gave up on this attempt: a late client stays unused.
+      let abandoned = false
       const start = async () => {
+        // A connection config provider may look settings up: it may stall too.
+        const connection = await createClient()
+        if (abandoned) return
+        client = connection
+        connection.on('error', onLost)
+        connection.on('end', () => onLost())
+        connection.on('notification', (message) => {
+          if (message.channel !== channel || !message.payload) return
+          if (message.payload === probe?.payload) return probe.received.resolve()
+          dispatchWakeMessage(message.payload, queues, onWake, (at) => {
+            watcher.at = at
+            onWake(at)
+          })
+        })
         await connection.connect()
         // Announcements read unqualified tables, as the pool does.
         await knexClient.setSchemaSearchPath(connection)
@@ -514,6 +518,9 @@ export class KnexAdapter implements Adapter {
       starting.catch(() => {})
       try {
         await Promise.race([starting, stalled, closing.promise])
+      } catch (error) {
+        abandoned = true
+        throw error
       } finally {
         clearTimeout(timer)
       }
