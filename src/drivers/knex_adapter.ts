@@ -41,6 +41,7 @@ import {
   dispatchWakeMessage,
   encodeWakeMessage,
   startHeartbeat,
+  subscriptionHeartbeat,
   type WakeListener,
   type WakeMessage,
 } from './wake_messages.js'
@@ -82,6 +83,8 @@ interface PgListenClient {
   ): void
   on(event: 'error' | 'end', listener: (error?: Error) => void): void
   removeAllListeners(): void
+  /** The socket of node-postgres, to destroy a connection that does not end. */
+  connection?: { stream?: { destroy(): void } }
 }
 
 /**
@@ -356,7 +359,13 @@ export class KnexAdapter implements Adapter {
       client = undefined
       if (!current) return
       current.removeAllListeners()
+      // A graceful end waits for the server, which a stalled connection never answers.
+      const timer = setTimeout(
+        () => current.connection?.stream?.destroy(),
+        subscriptionHeartbeat.timeout
+      )
       await current.end().catch(() => {})
+      clearTimeout(timer)
     }
 
     // A connection config provider is called again once its settings expire,
@@ -470,14 +479,33 @@ export class KnexAdapter implements Adapter {
           onWake(at)
         })
       })
-      await Promise.race([connection.connect(), closing.promise])
-      // Announcements read unqualified tables, as the pool does.
-      await knexClient.setSchemaSearchPath(connection)
-      await connection.query(`LISTEN "${channel.replaceAll('"', '""')}"`)
+      const start = async () => {
+        await connection.connect()
+        // Announcements read unqualified tables, as the pool does.
+        await knexClient.setSchemaSearchPath(connection)
+        await connection.query(`LISTEN "${channel.replaceAll('"', '""')}"`)
+        if (closed) return
+        await verify()
+        listening = true
+        await announce(connection)
+      }
+      // A connection may stall before the heartbeat watches it: give up on
+      // it, so that the caller falls back to polling or reconnects.
+      let timer: NodeJS.Timeout | undefined
+      const stalled = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('The LISTEN connection did not start in time')),
+          LISTEN_PROBE_TIMEOUT + subscriptionHeartbeat.timeout
+        )
+      })
+      const starting = start()
+      starting.catch(() => {})
+      try {
+        await Promise.race([starting, stalled, closing.promise])
+      } finally {
+        clearTimeout(timer)
+      }
       if (closed) return release()
-      await verify()
-      listening = true
-      await announce(connection)
     }
     const stopHeartbeat = startHeartbeat(
       () => (listening ? client?.query('select 1') : undefined),
@@ -1000,7 +1028,8 @@ export class KnexAdapter implements Adapter {
         data: JSON.stringify(jobData),
         score,
       })
-      await this.#signal(queue)
+      // Other outcomes leave the existing job as it was.
+      if (result.outcome === 'added') await this.#signal(queue)
       return result
     }
 
@@ -1025,7 +1054,9 @@ export class KnexAdapter implements Adapter {
         data: JSON.stringify(jobData),
         execute_at: executeAt,
       })
-      await this.#signal(queue, executeAt)
+      // A due time no job has would wake watchers in vain, and could hide
+      // the one of another job signalled with it.
+      if (result.outcome === 'added') await this.#signal(queue, executeAt)
       return result
     }
 

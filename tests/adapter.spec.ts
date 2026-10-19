@@ -2910,6 +2910,59 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     assert.isTrue(created[2].ended)
   })
 
+  test('reconnects a LISTEN connection whose replacement stalls', async ({ assert, cleanup }) => {
+    shortenHeartbeat(cleanup)
+    // The first connection and its probe work, the next never completes its handshake.
+    const created = fakeListenClients(cleanup, (index) =>
+      index === 3 ? { connect: () => new Promise(() => {}) } : 'real'
+    )
+    const options = { connection, tableName, schedulesTableName, notifications: true }
+    const watcher = await new KnexAdapter({ ...options, logger: new MemoryLogger() }).watch!([
+      'default',
+    ])
+    cleanup(() => watcher.close())
+    created[0].emit('error', new Error('Connection terminated'))
+
+    // The stalled connection is given up, and the next one listens.
+    const deadline = Date.now() + 8000
+    while (created.length < 5 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.lengthOf(created, 5)
+    assert.isTrue(created[2].ended)
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    watcher.reset()
+    const waiting = watcher.wait(2000, new AbortController().signal, 0)
+    const job = { id: 'after-stall', name: 'TestJob', payload: {}, attempts: 0 }
+    await new KnexAdapter(options).pushOn('default', job)
+    assert.isTrue(await waiting)
+  }).timeout(10_000)
+
+  test('signals no due time for a delayed job deduplicated away', async ({ assert, cleanup }) => {
+    const options = { connection, tableName, schedulesTableName, notifications: true }
+    const watcher = await new KnexAdapter(options).watch!(['default'])
+    cleanup(() => watcher.close())
+    watcher.reset()
+    const start = Date.now()
+    const waiting = watcher.wait(2000, new AbortController().signal, 0)
+
+    const writer = new KnexAdapter(options)
+    const job = (id: string, dedup?: { id: string }) => ({
+      id,
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+      dedup,
+    })
+    await writer.pushLaterOn('default', job('owner', { id: 'slot' }), 3000)
+    // Skipped: no job is due at 200ms. Its time would hide the next one.
+    await writer.pushLaterOn('default', job('duplicate', { id: 'slot' }), 200)
+    await writer.pushLaterOn('default', job('next'), 500)
+
+    assert.isTrue(await waiting)
+    assert.isAtLeast(Date.now() - start, 450)
+  })
+
   test('signals jobs of a table whose name is too long for a channel', async ({
     assert,
     cleanup,
