@@ -123,20 +123,30 @@ export class RedisAdapter implements Adapter {
     blocking.on('error', (error) => {
       this.#logger.error({ err: error }, 'Redis blocking connection error')
     })
-    // A PING queued during a silent handshake never settles: abort rejects.
+    // A command queued during a silent handshake never settles: abort rejects.
     const aborted = Promise.withResolvers<never>()
     aborted.promise.catch(() => {})
     const abort = () => aborted.reject(signal!.reason)
     signal?.addEventListener('abort', abort, { once: true })
 
     try {
-      await Promise.race([blocking.ping(), aborted.promise])
       const seedKeys = queues.flatMap((queue) => {
         const keys = this.#getKeys(queue)
         return [keys.pending, keys.delayed, keys.marker]
       })
       seedKeys.push(schedulesDueKey, schedulesMarkerKey)
-      await this.#connection.eval(SEED_MARKERS_SCRIPT, seedKeys.length, ...seedKeys)
+      // A user without the @blocking ACL category cannot wait: probe BZPOPMIN,
+      // so that such a worker polls instead. In MULTI, it returns at once.
+      const probe = blocking
+        .multi()
+        .bzpopmin(`${markers[0].key}::probe`, 0)
+        .exec()
+        .catch((error: { previousErrors?: Error[] }) => {
+          // EXECABORT tells nothing: the NOPERM error is the one to log.
+          throw error.previousErrors?.[0] ?? error
+        })
+      const seed = this.#connection.eval(SEED_MARKERS_SCRIPT, seedKeys.length, ...seedKeys)
+      await Promise.race([Promise.all([probe, seed]), aborted.promise])
       signal?.throwIfAborted()
     } catch (error) {
       blocking.disconnect()

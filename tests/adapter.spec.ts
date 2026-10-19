@@ -160,6 +160,35 @@ test.group('Adapter | Redis', (group) => {
     assert.isTrue(await waiting)
   })
 
+  test('refuses to watch for an ACL user that cannot block', async ({ assert, cleanup }) => {
+    await connection.call(
+      'ACL',
+      'SETUSER',
+      'queue-no-blocking',
+      'on',
+      '>pw',
+      '~*',
+      '&*',
+      '+@all',
+      '-@blocking'
+    )
+    const restricted = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+      keyPrefix: KEY_PREFIX,
+      db: 15,
+      username: 'queue-no-blocking',
+      password: 'pw',
+    })
+    cleanup(async () => {
+      restricted.disconnect()
+      await connection.call('ACL', 'DELUSER', 'queue-no-blocking')
+    })
+
+    // The worker polls instead of logging a failed wait every second.
+    await assert.rejects(() => new RedisAdapter(restricted).watch(['default']), /NOPERM/)
+  })
+
   test('wakes one waiting watcher per marker', async ({ assert, cleanup }) => {
     const writer = new RedisAdapter(connection)
     const job = (id: string) => ({ id, name: 'TestJob', payload: {}, attempts: 0 })
