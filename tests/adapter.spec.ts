@@ -2611,11 +2611,15 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
    * client gets the behavior `behave` returns for its 1-based creation
    * number: 'real' for a working connection, or a fake one.
    */
+  type FakeBehavior = {
+    connect?: () => Promise<void>
+    query?: () => Promise<void>
+    end?: () => Promise<void>
+  }
+
   function fakeListenClients(
     cleanup: (callback: () => void) => void,
-    behave: (
-      index: number
-    ) => 'real' | { connect?: () => Promise<void>; query?: () => Promise<void> }
+    behave: (index: number) => 'real' | FakeBehavior
   ) {
     type PgClient = new (settings: unknown) => {
       end(): Promise<void>
@@ -2630,16 +2634,24 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       client.driver = driver
     })
 
-    const created: Array<{ ended: boolean; emit: (event: string, error?: Error) => void }> = []
+    const created: Array<{
+      ended: boolean
+      destroyed?: boolean
+      emit: (event: string, error?: Error) => void
+    }> = []
     const FakeClient = class {
       #listeners = new Map<string, (error?: Error) => void>()
-      #behavior: { connect?: () => Promise<void>; query?: () => Promise<void> }
+      #behavior: FakeBehavior
       state = {
         ended: false,
+        destroyed: false,
         emit: (event: string, error?: Error) => this.#listeners.get(event)?.(error),
       }
 
-      constructor(behavior: { connect?: () => Promise<void>; query?: () => Promise<void> }) {
+      // As node-postgres: the socket, destroyed when end() does not settle.
+      connection = { stream: { destroy: () => (this.state.destroyed = true) } }
+
+      constructor(behavior: FakeBehavior) {
         this.#behavior = behavior
         created.push(this.state)
       }
@@ -2658,6 +2670,7 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
       }
       async end() {
         this.state.ended = true
+        await this.#behavior.end?.()
       }
     }
     client.driver.Client = function (settings: unknown) {
@@ -2691,6 +2704,45 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     })
 
     await assert.rejects(() => watching.watch!(['default']), /do not enable notifications/)
+  }).timeout(5000)
+
+  test('rejects a LISTEN probe whose connection fails', async ({ assert, cleanup }) => {
+    // The probe sends its notification, then its connection fails.
+    const created = fakeListenClients(cleanup, (index) =>
+      index === 1
+        ? 'real'
+        : {
+            async query() {
+              setTimeout(() => created[1].emit('error', new Error('Connection terminated')), 10)
+            },
+          }
+    )
+    const watching = new KnexAdapter({
+      connection,
+      tableName,
+      schedulesTableName,
+      notifications: true,
+    })
+
+    await assert.rejects(() => watching.watch!(['default']), 'Connection terminated')
+  })
+
+  test('destroys a LISTEN probe connection that does not end', async ({ assert, cleanup }) => {
+    shortenHeartbeat(cleanup)
+    const never = () => new Promise<void>(() => {})
+    const created = fakeListenClients(cleanup, (index) =>
+      index === 1 ? 'real' : { connect: never, end: never }
+    )
+    const watching = new KnexAdapter({
+      connection,
+      tableName,
+      schedulesTableName,
+      notifications: true,
+    })
+
+    await assert.rejects(() => watching.watch!(['default']), /do not enable notifications/)
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    assert.isTrue(created[1].destroyed)
   }).timeout(5000)
 
   test('aborts a first LISTEN connection still in its handshake', async ({ assert, cleanup }) => {

@@ -96,6 +96,21 @@ function wakeChannelName(table: string): string {
   return `queue_jobs_${createHash('sha256').update(table).digest('hex').slice(0, 40)}`
 }
 
+/**
+ * End a LISTEN or probe client. A graceful end waits for the server, which a
+ * stalled connection never answers: its socket is destroyed after a while.
+ */
+async function endListenClient(client: PgListenClient): Promise<void> {
+  client.removeAllListeners()
+  client.on('error', () => {})
+  const timer = setTimeout(
+    () => client.connection?.stream?.destroy(),
+    subscriptionHeartbeat.timeout
+  )
+  await client.end().catch(() => {})
+  clearTimeout(timer)
+}
+
 /** The message of a job of `queue` ready now, or due at `at`. */
 function jobMessage(queue: string, at?: number): WakeMessage {
   return at === undefined ? { ready: [queue] } : { due: { [queue]: at } }
@@ -358,14 +373,7 @@ export class KnexAdapter implements Adapter {
       const current = client
       client = undefined
       if (!current) return
-      current.removeAllListeners()
-      // A graceful end waits for the server, which a stalled connection never answers.
-      const timer = setTimeout(
-        () => current.connection?.stream?.destroy(),
-        subscriptionHeartbeat.timeout
-      )
-      await current.end().catch(() => {})
-      clearTimeout(timer)
+      await endListenClient(current)
     }
 
     // A connection config provider is called again once its settings expire,
@@ -437,6 +445,10 @@ export class KnexAdapter implements Adapter {
       }
       const { received, payload } = probe
       const sender = await createClient()
+      // An error event without a listener would crash the process.
+      const failed = Promise.withResolvers<never>()
+      failed.promise.catch(() => {})
+      sender.on('error', (error) => failed.reject(error))
       let timer: NodeJS.Timeout | undefined
       const timeout = new Promise<never>((_resolve, reject) => {
         timer = setTimeout(
@@ -458,11 +470,11 @@ export class KnexAdapter implements Adapter {
       })()
       exchange.catch(() => {})
       try {
-        await Promise.race([exchange, timeout, closing.promise])
+        await Promise.race([exchange, failed.promise, timeout, closing.promise])
       } finally {
         clearTimeout(timer)
         probe = undefined
-        void sender.end().catch(() => {})
+        void endListenClient(sender)
       }
     }
 
