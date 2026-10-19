@@ -121,6 +121,73 @@ test.group('Adapter | Redis', (group) => {
     createAdapter: () => new RedisAdapter(connection),
   })
 
+  test('dispatches for an ACL user without channel permissions', async ({ assert, cleanup }) => {
+    // New ACL users get no channel permission by default since Redis 7.
+    await connection.call(
+      'ACL',
+      'SETUSER',
+      'queue-no-channels',
+      'on',
+      '>pw',
+      '~*',
+      '+@all',
+      'resetchannels'
+    )
+    const restricted = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+      keyPrefix: KEY_PREFIX,
+      db: 15,
+      username: 'queue-no-channels',
+      password: 'pw',
+    })
+    cleanup(async () => {
+      restricted.disconnect()
+      await connection.call('ACL', 'DELUSER', 'queue-no-channels')
+    })
+    const adapter = new RedisAdapter(restricted)
+
+    await adapter.pushOn('default', { id: 'acl-job', name: 'TestJob', payload: {}, attempts: 0 })
+    await adapter.pushLaterOn(
+      'default',
+      { id: 'acl-delayed', name: 'TestJob', payload: {}, attempts: 0 },
+      0
+    )
+    const acquired = await adapter.popFrom('default')
+    assert.equal(acquired?.id, 'acl-job')
+    assert.isTrue(await adapter.retryJob(acquired!, 'default'))
+
+    // The worker cannot subscribe: it polls instead.
+    await assert.rejects(() => adapter.subscribe(['default'], () => {}), /NOPERM/)
+  })
+
+  test('does not wake subscribers of another database', async ({ assert, cleanup }) => {
+    const other = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+      keyPrefix: KEY_PREFIX,
+      db: 14,
+    })
+    cleanup(async () => {
+      await other.quit()
+    })
+    const wakes: number[] = []
+    const unsubscribe = await new RedisAdapter(connection).subscribe(['default'], (at) =>
+      wakes.push(at)
+    )
+    cleanup(unsubscribe)
+    wakes.splice(0)
+
+    await new RedisAdapter(other).pushOn('default', {
+      id: 'other-db',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+    })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.deepEqual(wakes, [])
+  })
+
   test('listSchedules should use bounded network round-trips as schedule count grows', async ({
     assert,
   }) => {
@@ -2408,29 +2475,39 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
 
   /**
    * Replace the node-postgres client the adapter creates for LISTEN. Each
-   * fake gets the behavior `behave` returns for its 1-based creation number.
+   * client gets the behavior `behave` returns for its 1-based creation
+   * number: 'real' for a working connection, or a fake one.
    */
   function fakeListenClients(
     cleanup: (callback: () => void) => void,
-    behave: (index: number) => { connect?: () => Promise<void>; query?: () => Promise<void> }
+    behave: (
+      index: number
+    ) => 'real' | { connect?: () => Promise<void>; query?: () => Promise<void> }
   ) {
-    const client = connection.client as KnexTypes.Client & { driver: { Client: unknown } }
+    type PgClient = new (settings: unknown) => {
+      end(): Promise<void>
+      on(event: string, listener: (error?: Error) => void): unknown
+      emit(event: string, error?: Error): unknown
+    }
+    const client = connection.client as KnexTypes.Client & { driver: { Client: PgClient } }
     const driver = client.driver
+    const RealClient = driver.Client
     client.driver = { ...driver }
     cleanup(() => {
       client.driver = driver
     })
 
     const created: Array<{ ended: boolean; emit: (event: string, error?: Error) => void }> = []
-    client.driver.Client = class {
+    const FakeClient = class {
       #listeners = new Map<string, (error?: Error) => void>()
-      #behavior = behave(created.length + 1)
+      #behavior: { connect?: () => Promise<void>; query?: () => Promise<void> }
       state = {
         ended: false,
         emit: (event: string, error?: Error) => this.#listeners.get(event)?.(error),
       }
 
-      constructor() {
+      constructor(behavior: { connect?: () => Promise<void>; query?: () => Promise<void> }) {
+        this.#behavior = behavior
         created.push(this.state)
       }
       on(event: string, listener: (error?: Error) => void) {
@@ -2450,8 +2527,36 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
         this.state.ended = true
       }
     }
+    client.driver.Client = function (settings: unknown) {
+      const behavior = behave(created.length + 1)
+      if (behavior !== 'real') return new FakeClient(behavior)
+
+      const real = new RealClient(settings)
+      const state = {
+        ended: false,
+        emit: (event: string, error?: Error) => real.emit(event, error),
+      }
+      created.push(state)
+      const end = real.end.bind(real)
+      real.end = () => {
+        state.ended = true
+        return end()
+      }
+      return real
+    } as unknown as PgClient
     return created
   }
+
+  test('rejects a LISTEN connection that receives no notification', async ({ assert, cleanup }) => {
+    // As behind PgBouncer in transaction mode: LISTEN succeeds, nothing arrives.
+    fakeListenClients(cleanup, () => ({}))
+    const subscriber = new KnexAdapter({ connection, tableName, schedulesTableName })
+
+    await assert.rejects(
+      () => subscriber.subscribe!(['default'], () => {}),
+      /pass \{ notifications: false \} to knex\(\)/
+    )
+  }).timeout(5000)
 
   test('aborts a first LISTEN connection still in its handshake', async ({ assert, cleanup }) => {
     const created = fakeListenClients(cleanup, () => ({ connect: () => new Promise(() => {}) }))
@@ -2586,9 +2691,9 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     cleanup,
   }) => {
     // The second connection never completes its handshake.
-    const created = fakeListenClients(cleanup, (index) => ({
-      connect: index === 1 ? async () => {} : () => new Promise(() => {}),
-    }))
+    const created = fakeListenClients(cleanup, (index) =>
+      index === 1 ? 'real' : { connect: () => new Promise(() => {}) }
+    )
 
     const subscriber = new KnexAdapter({
       connection,
@@ -2602,6 +2707,32 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     while (created.length < 2) await new Promise((resolve) => setTimeout(resolve, 20))
     await unsubscribe()
     assert.isTrue(created[1].ended)
+  })
+
+  test('signals jobs of a table whose name is too long for a channel', async ({
+    assert,
+    cleanup,
+  }) => {
+    // A schema and a table name of 63 bytes each, the PostgreSQL maximum.
+    const schema = `tenant_${'x'.repeat(56)}`
+    const longTableName = `${schema}.queue_jobs_test`
+    await connection.raw('create schema if not exists ??', [schema])
+    cleanup(() => connection.raw('drop schema ?? cascade', [schema]))
+    await connection.raw('create table ?? (like ?? including all)', [longTableName, tableName])
+    const options = { tableName: longTableName, schedulesTableName }
+
+    const wakes: number[] = []
+    const subscriber = new KnexAdapter({ connection, ...options })
+    const unsubscribe = await subscriber.subscribe!(['default'], (at) => wakes.push(at))
+    cleanup(unsubscribe)
+    wakes.splice(0)
+
+    const job = { id: 'long-table-job', name: 'TestJob', payload: {}, attempts: 0 }
+    await connection.transaction((trx) =>
+      new KnexAdapter({ connection: trx, ...options }).pushOn('default', job)
+    )
+    while (wakes.length === 0) await new Promise((resolve) => setTimeout(resolve, 10))
+    assert.isNotNull(await subscriber.getJob(job.id, 'default'))
   })
 
   test('knex() factory accepts a table name or options', async ({ assert }) => {

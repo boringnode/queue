@@ -48,7 +48,8 @@ const schedulesDueKey = 'schedules::due'
 // Schedule hashes live one level below the index keys so no schedule id can collide with them.
 const scheduleDataPrefix = 'schedules::data::'
 const legacyScheduleDataPrefix = 'schedules::'
-// ioredis does not prefix pub/sub channels: the adapter adds the key prefix itself.
+// Pub/sub channels belong to no database and ioredis does not prefix them:
+// the adapter adds the key prefix and the database itself.
 const wakeChannelSuffix = 'jobs::wake'
 
 /**
@@ -107,7 +108,8 @@ export class RedisAdapter implements Adapter {
   }
 
   get #wakeChannel(): string {
-    return `${this.#connection.options?.keyPrefix ?? ''}${wakeChannelSuffix}`
+    const options = this.#connection.options
+    return `${options?.keyPrefix ?? ''}${wakeChannelSuffix}::${options?.db ?? 0}`
   }
 
   /**
@@ -363,7 +365,9 @@ export class RedisAdapter implements Adapter {
       retryAt ? retryAt.getTime().toString() : '0',
       now.toString(),
       job.leaseToken,
-      ...this.#wake({ queue, at: Math.max(retryAt?.getTime() ?? now, now) })
+      ...this.#wake(
+        retryAt && retryAt.getTime() > now ? { queue, at: retryAt.getTime() } : { queue }
+      )
     )
     return retried === 1
   }
@@ -470,7 +474,7 @@ export class RedisAdapter implements Adapter {
         jobData.dedup.replace ? '1' : '0',
         payloadData,
         payloadIsUndefined,
-        ...this.#wake({ queue, at: timestamp })
+        ...this.#wake({ queue })
       )) as [string, string]
       return { outcome: result[0] as DedupOutcome, jobId: result[1] }
     }
@@ -484,7 +488,7 @@ export class RedisAdapter implements Adapter {
       jobData.id,
       JSON.stringify(jobData),
       score.toString(),
-      ...this.#wake({ queue, at: timestamp })
+      ...this.#wake({ queue })
     )
   }
 
@@ -511,7 +515,7 @@ export class RedisAdapter implements Adapter {
       multi.zadd(keys.pending, score, job.id)
     }
 
-    multi.publish(...this.#wake({ queue, at: now }))
+    multi.publish(...this.#wake({ queue }))
     await multi.exec()
   }
 
@@ -548,7 +552,7 @@ export class RedisAdapter implements Adapter {
       this.#workerId,
       maxExceeded.toString(),
       leaseTokenPrefix,
-      ...this.#wake({ queue, at: now })
+      ...this.#wake({ queue })
     )) as [number, ...string[]]
 
     return {
