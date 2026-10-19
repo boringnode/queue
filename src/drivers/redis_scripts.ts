@@ -4,10 +4,14 @@ import { REDIS_DEDUP_LUA, REDIS_JOB_STORAGE_LUA } from './redis_job_storage.js'
  * Publishes the wake signal of a script, given as its last two ARGV: the
  * channel and the message. Publishing from the script keeps one round trip
  * and sends the signal with the write it announces.
+ *
+ * The signal is a hint: pcall keeps a refused PUBLISH, such as for an ACL
+ * user without channel permissions (the Redis 7 default), from failing a
+ * script whose writes Redis does not roll back. Workers then poll.
  */
 const PUBLISH_WAKE_LUA = `
   local function publish_wake()
-    redis.call('PUBLISH', ARGV[#ARGV - 1], ARGV[#ARGV])
+    redis.pcall('PUBLISH', ARGV[#ARGV - 1], ARGV[#ARGV])
   end
 `
 
@@ -161,7 +165,7 @@ ${REDIS_JOB_STORAGE_LUA}
     -- Workers only know the next delayed job: announce the one after it.
     local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
     if #next_delayed > 0 then
-      redis.call('PUBLISH', wake_channel,
+      redis.pcall('PUBLISH', wake_channel,
         cjson.encode({ queue = queue, at = tonumber(next_delayed[2]) }))
     end
   end
