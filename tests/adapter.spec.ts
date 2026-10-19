@@ -255,6 +255,34 @@ test.group('Adapter | Redis', (group) => {
     assert.equal(silences(), 1)
   }).timeout(5000)
 
+  test('reconnects a blocking connection the server closes', async ({ assert, cleanup }) => {
+    const logger = new MemoryLogger()
+    const watcher = await new RedisAdapter(connection, false, logger).watch(['default'])
+    cleanup(() => watcher.close())
+    const waiting = watcher.wait(3000, new AbortController().signal, 0)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // Its reply may be lost: the watcher looks for work at once, not after
+    // the timeout of BZPOPMIN.
+    const start = Date.now()
+    const clients = (await connection.client('LIST')) as string
+    const blocked = clients.split('\n').find((line) => line.includes('cmd=bzpopmin'))!
+    await connection.client('KILL', 'ID', blocked.match(/id=(\d+)/)![1])
+    assert.isTrue(await waiting)
+    assert.isBelow(Date.now() - start, 500)
+
+    // The new connection receives the next marker.
+    const next = watcher.wait(3000, new AbortController().signal, 0)
+    await new RedisAdapter(connection).pushOn('default', {
+      id: 'after-kill',
+      name: 'TestJob',
+      payload: {},
+      attempts: 0,
+    })
+    assert.isTrue(await next)
+    assert.isBelow(Date.now() - start, 1000)
+  }).timeout(5000)
+
   test('listSchedules should use bounded network round-trips as schedule count grows', async ({
     assert,
   }) => {
