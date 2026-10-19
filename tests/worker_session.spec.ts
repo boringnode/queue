@@ -83,20 +83,13 @@ test.group('WorkerSession', () => {
     assert.deepEqual(adapter.polledQueues, ['critical', 'default', 'low'])
   })
 
-  test('fans out remaining acquisitions after the initial probe finds work', async ({
-    assert,
-    cleanup,
-  }) => {
+  test('acquires one job at a time until the pool is full', async ({ assert, cleanup }) => {
     const adapter = new ControllableAdapter()
     const executionGate = Promise.withResolvers<void>()
-    let executionsStarted = 0
-    adapter.acquisitions.block(2, 3)
-
     const session = createSession({
       adapter,
       jobExecutionRuntime: {
         async execute() {
-          executionsStarted++
           await executionGate.promise
           return { type: 'completed' }
         },
@@ -105,12 +98,11 @@ test.group('WorkerSession', () => {
     })
 
     cleanup(async () => {
-      adapter.releaseAll()
       executionGate.resolve()
       await session.stop()
     })
 
-    for (let index = 1; index <= 3; index++) {
+    for (let index = 1; index <= 4; index++) {
       await adapter.pushOn('default', {
         id: `backlog-job-${index}`,
         name: 'TestJob',
@@ -120,18 +112,11 @@ test.group('WorkerSession', () => {
       })
     }
 
-    const cycle = session.processCycle()
-    await adapter.acquisitions.waitForStarted(3)
-
-    assert.equal(adapter.acquisitions.calls, 3)
-
-    adapter.acquisitions.release(2, 3)
-
-    assert.equal((await cycle)?.type, 'started')
-    assert.equal(executionsStarted, 3)
+    assert.equal((await session.processCycle())?.type, 'started')
+    assert.equal(adapter.acquisitions.calls, 3, 'stops once the pool is full')
   })
 
-  test('uses one probe per subsequent empty tick after processing one job', async ({
+  test('uses one acquisition per empty tick after processing one job', async ({
     assert,
     cleanup,
   }) => {
@@ -149,14 +134,14 @@ test.group('WorkerSession', () => {
     })
 
     assert.equal((await session.processCycle())?.type, 'started')
-    assert.equal(adapter.acquisitions.calls, 10)
+    assert.equal(adapter.acquisitions.calls, 2, 'stops at the first empty acquisition')
     assert.equal((await session.processCycle())?.type, 'completed')
 
     assert.equal((await session.processCycle())?.type, 'idle')
-    assert.equal(adapter.acquisitions.calls, 11)
+    assert.equal(adapter.acquisitions.calls, 3)
 
     assert.equal((await session.processCycle())?.type, 'idle')
-    assert.equal(adapter.acquisitions.calls, 12)
+    assert.equal(adapter.acquisitions.calls, 4)
   })
 
   test('reuses one completion wait across idle ticks and observes a later job', async ({
@@ -798,61 +783,9 @@ test.group('WorkerSession', () => {
     await Promise.all([stop, start])
   })
 
-  test('waits for sibling acquisitions when one acquisition fails', async ({ assert, cleanup }) => {
+  test('emits a started job before a later acquisition error', async ({ assert, cleanup }) => {
     const adapter = new ControllableAdapter()
-    let jobCompleted = false
-    adapter.acquisitions.block(2, 3).fail(2, new Error('Failed to acquire job'))
-    adapter.finalizations.block(1)
-
-    const session = createSession({
-      adapter,
-      jobExecutionRuntime: {
-        async execute() {
-          jobCompleted = true
-          return { type: 'completed' }
-        },
-      },
-      settings: { concurrency: 3 },
-    })
-
-    cleanup(async () => {
-      adapter.releaseAll()
-      await session.stop()
-    })
-
-    await adapter.pushOn('default', {
-      id: 'late-job-after-sibling-error',
-      name: 'TestJob',
-      payload: {},
-      attempts: 0,
-      priority: 0,
-    })
-
-    const start = session.start()
-    await adapter.acquisitions.waitForStarted(3)
-    adapter.acquisitions.release(2)
-    await adapter.acquisitions.waitForSettled(2)
-
-    const stop = trackPromise(session.stop())
-    assert.isFalse(stop.settled)
-
-    adapter.acquisitions.release(3)
-    await adapter.finalizations.waitForStarted()
-    assert.isTrue(jobCompleted)
-    assert.isFalse(stop.settled)
-
-    adapter.finalizations.release(1)
-    await Promise.all([stop.promise, start])
-    assert.equal(adapter.acquisitions.calls, 3)
-    assert.isNull(await adapter.getJob('late-job-after-sibling-error', 'default'))
-  })
-
-  test('emits successful acquisitions before a sibling acquisition error', async ({
-    assert,
-    cleanup,
-  }) => {
-    const adapter = new ControllableAdapter()
-    adapter.acquisitions.fail(2, new Error('Failed to acquire sibling job'))
+    adapter.acquisitions.fail(2, new Error('Failed to acquire the next job'))
     const session = createSession({ adapter, settings: { concurrency: 2 } })
     cleanup(() => session.stop())
 
