@@ -46,3 +46,47 @@ export async function dispatchWakeMessage(
     onWake(typeof message.at === 'number' ? message.at : Date.now())
   }
 }
+
+/**
+ * How often a subscription connection is pinged, and how long it has to
+ * answer. Tests shorten them.
+ */
+export const subscriptionHeartbeat = { interval: 10_000, timeout: 5_000 }
+
+/**
+ * Ping a subscription connection on an interval. A connection can stop
+ * delivering without closing, behind a stuck proxy or a half-open TCP
+ * connection: `onSilent` is called when a ping gets no answer in time, to
+ * reconnect. `ping` returns undefined to skip a beat, while reconnecting.
+ *
+ * Returns a function that stops the heartbeat.
+ */
+export function startHeartbeat(
+  ping: () => Promise<unknown> | undefined,
+  onSilent: () => void
+): () => void {
+  let timeout: NodeJS.Timeout | undefined
+
+  const interval = setInterval(() => {
+    if (timeout) return
+    const answer = ping()
+    if (!answer) return
+
+    const timer = setTimeout(() => {
+      timeout = undefined
+      onSilent()
+    }, subscriptionHeartbeat.timeout)
+    timeout = timer
+    const answered = () => {
+      clearTimeout(timer)
+      if (timeout === timer) timeout = undefined
+    }
+    answer.then(answered, answered)
+  }, subscriptionHeartbeat.interval)
+  interval.unref()
+
+  return () => {
+    clearInterval(interval)
+    clearTimeout(timeout)
+  }
+}

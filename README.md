@@ -961,7 +961,8 @@ The process that dispatches a job sends its signal. A job dispatched by an older
 package, or written to the storage without the Adapter, sends none: the Worker finds it at its next
 stalled check. Upgrade the processes that dispatch jobs with, or before, the Workers. Each Worker
 holds one more connection for its subscription: a Redis connection, or a PostgreSQL connection
-outside of the Knex pool.
+outside of the Knex pool. The Worker pings it every 10 seconds and reconnects when it gets no answer
+within 5 seconds.
 
 Run one Worker per process. A Worker listens on one Adapter, so to process the queues of several
 Adapters, start one process per Adapter. Starting a second Worker while another one runs in the

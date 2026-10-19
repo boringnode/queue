@@ -37,7 +37,12 @@ import {
 import { KnexQueueSchemaService } from '../services/knex_queue_schema.js'
 import { scheduleDatesMigrationRequiredMessage } from '../services/schedule_dates.js'
 import { SCHEDULE_TIMING_COLUMNS } from '../services/schedule_timing.js'
-import { dispatchWakeMessage, encodeWakeMessage, type WakeMessage } from './wake_messages.js'
+import {
+  dispatchWakeMessage,
+  encodeWakeMessage,
+  startHeartbeat,
+  type WakeMessage,
+} from './wake_messages.js'
 
 export { KnexQueueSchemaService } from '../services/knex_queue_schema.js'
 export type { ScheduleDatesMigrationOptions } from '../services/schedule_dates.js'
@@ -298,6 +303,7 @@ export class KnexAdapter implements Adapter {
     let closed = false
     let reconnectTimer: NodeJS.Timeout | undefined
     let reconnectDelay = LISTEN_RECONNECT_DELAY
+    let listening = false
     // A client ended in its handshake never settles connect(): closing does.
     const closing = Promise.withResolvers<never>()
     closing.promise.catch(() => {})
@@ -342,6 +348,7 @@ export class KnexAdapter implements Adapter {
     }
 
     const onLost = (error?: Error) => {
+      listening = false
       if (closed || reconnectTimer) return
       this.#logger.error({ err: error }, 'Lost the LISTEN connection, reconnecting')
       void release()
@@ -406,14 +413,20 @@ export class KnexAdapter implements Adapter {
       await connection.query(`LISTEN "${channel.replaceAll('"', '""')}"`)
       if (closed) return release()
       await verify()
+      listening = true
       await announce()
     }
+    const stopHeartbeat = startHeartbeat(
+      () => (listening ? client?.query('select 1') : undefined),
+      () => onLost(new Error('The LISTEN connection did not answer a ping'))
+    )
 
     signal?.throwIfAborted()
     this.#scheduleWatchers.add(watcher)
     const close = async () => {
       closed = true
       closing.reject(new Error('The LISTEN subscription is closed'))
+      stopHeartbeat()
       clearTimeout(reconnectTimer)
       signal?.removeEventListener('abort', abort)
       this.#scheduleWatchers.delete(watcher)
