@@ -480,40 +480,28 @@ export class WorkerSession {
     return completed
   }
 
+  /**
+   * Acquire jobs one at a time until the pool is full or the queues run dry.
+   * An empty queue then costs one acquisition, not one per free slot: a
+   * watching worker looks for work on every wake.
+   */
   async #fillPool(): Promise<PoolFillResult> {
-    const slotsAvailable = this.#settings.concurrency - this.#pool.size
+    const cycles: StartedCycle[] = []
 
-    if (slotsAvailable <= 0) return { cycles: [], errors: [] }
+    while (this.#running && this.#pool.size < this.#settings.concurrency) {
+      let cycle: StartedCycle | null
 
-    let probe: StartedCycle | null
-
-    try {
-      probe = await this.#acquireAndStartNextJob()
-    } catch (error) {
-      return { cycles: [], errors: [error] }
-    }
-
-    if (!probe) return { cycles: [], errors: [] }
-    if (!this.#running) return { cycles: [probe], errors: [] }
-
-    const acquisitions: Array<Promise<StartedCycle | null>> = []
-    for (let index = 1; index < slotsAvailable; index++) {
-      acquisitions.push(this.#acquireAndStartNextJob())
-    }
-
-    const results = await Promise.allSettled(acquisitions)
-    const cycles = [probe]
-    const errors: unknown[] = []
-
-    for (const result of results) {
-      if (result.status === 'rejected') {
-        errors.push(result.reason)
-      } else if (result.value) {
-        cycles.push(result.value)
+      try {
+        cycle = await this.#acquireAndStartNextJob()
+      } catch (error) {
+        return { cycles, errors: [error] }
       }
+
+      if (!cycle) break
+      cycles.push(cycle)
     }
 
-    return { cycles, errors }
+    return { cycles, errors: [] }
   }
 
   async #acquireAndStartNextJob(): Promise<StartedCycle | null> {
