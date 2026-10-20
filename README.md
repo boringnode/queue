@@ -954,6 +954,8 @@ On Redis, an idle Worker does not poll: it waits on a marker with `BZPOPMIN`, as
 job is dispatched, or a delayed job, a retry, or a schedule becomes due. A dispatched job wakes one
 idle Worker, which wakes the next one while jobs remain. The Worker still checks its queues every
 `stalledInterval`, in case a wake was lost, and holds one more connection to wait for work.
+A connection that goes silent is detected within 15 s; until then, the Worker finds work at its
+stalled check.
 
 The process that dispatches a job wakes the Workers. A job dispatched by an older version of the
 package, or written to Redis without the Adapter, wakes none: the Worker finds it at its next
@@ -964,7 +966,8 @@ they `LISTEN` for a `NOTIFY` instead, and a job dispatched in a transaction wake
 commits. Enable it on every process that dispatches jobs, not only on Workers. It suits a few
 Workers with a high `concurrency`:
 
-- Each Worker holds one more connection.
+- Each Worker holds one more connection: size `max_connections` for 2 connections per Worker,
+  or dispatchers may get none.
 - Every `NOTIFY` reaches every Worker. A Worker woken for a job another Worker took waits
   `idleDelay` before it looks again, so idle Workers never query more often than when polling.
 - It does not work behind a pooler in transaction mode, such as PgBouncer.
