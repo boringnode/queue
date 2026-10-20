@@ -2958,6 +2958,82 @@ test.group('Adapter | Knex (PostgreSQL)', (group) => {
     assert.notEqual(second, first)
   })
 
+  test('keeps the settings of the latest connection provider lookup', async ({
+    assert,
+    cleanup,
+  }) => {
+    shortenHeartbeat(cleanup)
+    // A lookup gated here answers once a later one restored LISTEN.
+    let gate: PromiseWithResolvers<void> | undefined
+    let expired = false
+    let provided = 0
+    const provider = Knex({
+      client: 'pg',
+      connection: async () => {
+        const name = gate ? 'listen-stale' : `listen-fresh-${++provided}`
+        const answered = gate?.promise
+        gate = undefined
+        await answered
+        return {
+          host: process.env.PG_HOST || 'localhost',
+          port: Number.parseInt(process.env.PG_PORT || '5432', 10),
+          user: process.env.PG_USER || 'postgres',
+          password: process.env.PG_PASSWORD || 'postgres',
+          database: process.env.PG_DATABASE || 'queue_test',
+          application_name: name,
+          expirationChecker: () => expired,
+        }
+      },
+    })
+    cleanup(() => provider.destroy())
+    const listeners = async () => {
+      const result = await connection.raw(
+        `select application_name from pg_stat_activity where application_name like 'listen-%' and query not like '%pg_notify%'`
+      )
+      return result.rows.map((row: { application_name: string }) => row.application_name)
+    }
+    const terminate = (name: string) =>
+      connection.raw(
+        `select pg_terminate_backend(pid) from pg_stat_activity where application_name = ?`,
+        [name]
+      )
+    const waitFor = async (name: string, timeout: number) => {
+      const deadline = Date.now() + timeout
+      while (Date.now() < deadline) {
+        const names = await listeners()
+        if (names.includes(name)) return names
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      return listeners()
+    }
+
+    const watcher = await new KnexAdapter({
+      connection: provider,
+      notifications: true,
+      tableName,
+      schedulesTableName,
+      logger: new MemoryLogger(),
+    }).watch!(['default'])
+    cleanup(() => watcher.close())
+
+    // The next lookup stalls past the startup deadline, the one after it works.
+    const stale = Promise.withResolvers<void>()
+    gate = stale
+    expired = true
+    await terminate('listen-fresh-1')
+    assert.include(await waitFor('listen-fresh-2', 8000), 'listen-fresh-2')
+    expired = false
+    stale.resolve()
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    // Reconnecting reuses the cached settings: those of a lookup after the stale one.
+    await terminate('listen-fresh-2')
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    const names = await listeners()
+    assert.lengthOf(names, 1)
+    assert.match(names[0], /^listen-fresh-/)
+  }).timeout(15_000)
+
   test('does not reconnect a LISTEN connection that failed to start', async ({
     assert,
     cleanup,

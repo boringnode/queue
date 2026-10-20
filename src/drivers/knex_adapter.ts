@@ -380,16 +380,22 @@ export class KnexAdapter implements Adapter {
     // as the pool of Knex does, for rotated credentials for instance.
     let providedSettings: object | undefined
     let settingsExpired: (() => boolean) | null = null
+    // Only the latest lookup is cached: an abandoned one may answer later.
+    let lookups = 0
     const createClient = async (): Promise<PgListenClient> => {
       const provider = knexClient.connectionConfigProvider
       if (!provider) return new knexClient.driver.Client(knexClient.connectionSettings)
+      if (providedSettings && !settingsExpired?.()) {
+        return new knexClient.driver.Client(providedSettings)
+      }
 
-      if (!providedSettings || settingsExpired?.()) {
-        const { expirationChecker, ...settings } = await provider()
+      const lookup = ++lookups
+      const { expirationChecker, ...settings } = await provider()
+      if (lookup === lookups) {
         providedSettings = settings
         settingsExpired = expirationChecker ?? null
       }
-      return new knexClient.driver.Client(providedSettings)
+      return new knexClient.driver.Client(settings)
     }
 
     // Signals sent before listening, or while disconnected, are lost. The
