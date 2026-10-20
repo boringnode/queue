@@ -264,6 +264,23 @@ test.group('Adapter | Redis', (group) => {
     await assert.rejects(() => watching)
   }).timeout(2000)
 
+  test('gives up on a blocking connection that does not start', async ({ assert, cleanup }) => {
+    shortenHeartbeat(cleanup)
+    // Accepts connections and never answers, as a connection whose command was lost.
+    const blackhole = createServer(() => {})
+    await new Promise<void>((resolve) => blackhole.listen(0, '127.0.0.1', resolve))
+    cleanup(() => void blackhole.close())
+    const port = (blackhole.address() as AddressInfo).port
+    const direct = new Redis(connection.options)
+    direct.duplicate = (override?: Partial<RedisOptions>) =>
+      new Redis({ ...connection.options, host: '127.0.0.1', port, ...override })
+    cleanup(() => direct.disconnect())
+
+    // Without an abort, the worker falls back to polling.
+    const adapter = new RedisAdapter(direct, false, new MemoryLogger())
+    await assert.rejects(() => adapter.watch(['default']), /did not start in time/)
+  }).timeout(2000)
+
   test('reconnects a blocking connection that stops answering', async ({ assert, cleanup }) => {
     shortenHeartbeat(cleanup)
     const target = {

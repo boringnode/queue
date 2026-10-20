@@ -12,6 +12,7 @@ import type {
 } from '../contracts/adapter.js'
 import { consoleLogger, type Logger } from '../logger.js'
 import { RedisWorkWatcher } from './redis_work_watcher.js'
+import { subscriptionHeartbeat } from './wake_messages.js'
 import type { AdapterFactoryContext, DedupOutcome } from '../types/main.js'
 import type {
   JobData,
@@ -123,11 +124,16 @@ export class RedisAdapter implements Adapter {
     blocking.on('error', (error) => {
       this.#logger.error({ err: error }, 'Redis blocking connection error')
     })
-    // A command queued during a silent handshake never settles: abort rejects.
+    // A command queued during a silent handshake, or dropped on reconnection,
+    // never settles: abort and a deadline reject, so that the worker polls.
     const aborted = Promise.withResolvers<never>()
     aborted.promise.catch(() => {})
     const abort = () => aborted.reject(signal!.reason)
     signal?.addEventListener('abort', abort, { once: true })
+    const deadline = setTimeout(
+      () => aborted.reject(new Error('The Redis blocking connection did not start in time')),
+      subscriptionHeartbeat.interval
+    )
 
     try {
       const seedKeys = queues.flatMap((queue) => {
@@ -152,6 +158,7 @@ export class RedisAdapter implements Adapter {
       blocking.disconnect()
       throw error
     } finally {
+      clearTimeout(deadline)
       signal?.removeEventListener('abort', abort)
     }
 
