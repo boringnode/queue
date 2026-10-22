@@ -160,7 +160,7 @@ test.group('Adapter | Redis', (group) => {
     assert.isTrue(await waiting)
   })
 
-  test('looks again at a drained queue once the worker looks for work', async ({
+  test('looks again at a drained queue once a marker wakes the worker', async ({
     assert,
     cleanup,
   }) => {

@@ -22,10 +22,13 @@ interface PoppedMarker {
 
 const ERROR_RETRY_DELAY_MS = 1_000
 
-/** Lets the adapter drop what it assumed between two looks for work. */
+/** Lets the adapter drop what it assumed while no marker came. */
 export interface RedisWatchHooks {
-  /** The worker is about to look for work. */
-  onReset(): void
+  /**
+   * A wait ended without an abort: woken by a marker, or at its deadline,
+   * which doubles as the poll that catches a lost marker. Also on close.
+   */
+  onWake(): void
   /** A schedule marker woke the worker. */
   onScheduleWake(): void
 }
@@ -76,12 +79,11 @@ export class RedisWorkWatcher implements WorkWatcher {
     blocking.on('close', () => this.#onClose?.())
   }
 
-  reset(): void {
-    this.#hooks.onReset()
-  }
+  reset(): void {}
 
   async wait(maxDelay: number, signal: AbortSignal): Promise<boolean> {
     const deadline = Date.now() + maxDelay
+    let woken = false
 
     try {
       while (!signal.aborted && !this.#closed) {
@@ -90,16 +92,24 @@ export class RedisWorkWatcher implements WorkWatcher {
         if (heldKey !== undefined && heldAt <= now) {
           this.#held.delete(heldKey)
           this.#woke(heldKey)
+          woken = true
           await this.#advance(heldKey, now)
           return true
         }
-        if (deadline <= now) return false
+        if (deadline <= now) {
+          woken = true
+          return false
+        }
 
         const marker = await this.#read(Math.min(deadline, heldAt), signal)
         if (!marker) continue
         this.#woke(marker.key)
-        if (marker.member === '0') return true
+        if (marker.member === '0') {
+          woken = true
+          return true
+        }
         if (marker.score <= Date.now()) {
+          woken = true
           await this.#advance(marker.key, Date.now())
           return true
         }
@@ -109,6 +119,7 @@ export class RedisWorkWatcher implements WorkWatcher {
       }
       return false
     } finally {
+      if (woken) this.#hooks.onWake()
       for (const [key, at] of this.#held) void this.#release({ key, member: '1', score: at })
       this.#held.clear()
     }
@@ -116,6 +127,7 @@ export class RedisWorkWatcher implements WorkWatcher {
 
   async close(): Promise<void> {
     this.#closed = true
+    this.#hooks.onWake()
     this.#deliver?.(null)
     this.#blocking.disconnect()
   }
