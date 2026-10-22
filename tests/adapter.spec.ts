@@ -340,6 +340,50 @@ test.group('Adapter | Redis', (group) => {
     }
   })
 
+  test('history pruning keeps the data of a job id pushed again', async ({ assert }) => {
+    const adapter = new RedisAdapter(connection)
+    const queue = 'reused-id-prune-queue'
+    const retention = { count: 2 }
+
+    async function failNext(expectedId: string) {
+      const job = await adapter.popFrom(queue)
+      assert.equal(job!.id, expectedId)
+      await adapter.failJob(job!, queue, new Error('boom'), retention)
+    }
+
+    await adapter.pushOn(queue, { id: 'op-1', name: 'TestJob', payload: { copy: 1 }, attempts: 0 })
+    await failNext('op-1')
+
+    await adapter.pushOn(queue, { id: 'op-1', name: 'TestJob', payload: { copy: 2 }, attempts: 0 })
+    const live = await adapter.popFrom(queue)
+    assert.equal(live!.id, 'op-1')
+
+    // The failed history now holds op-1, a, b: the old op-1 entry is pruned.
+    for (const id of ['a', 'b']) {
+      await adapter.pushOn(queue, { id, name: 'TestJob', payload: {}, attempts: 0 })
+      await failNext(id)
+    }
+
+    const record = await adapter.getJob('op-1', queue)
+    assert.equal(record?.status, 'active')
+    assert.deepEqual(record?.data.payload, { copy: 2 })
+
+    // Once the live copy completes, a stale failed entry cannot delete its data.
+    await adapter.pushOn(queue, { id: 'op-2', name: 'TestJob', payload: { copy: 1 }, attempts: 0 })
+    await failNext('op-2')
+    await adapter.pushOn(queue, { id: 'op-2', name: 'TestJob', payload: { copy: 2 }, attempts: 0 })
+    const second = await adapter.popFrom(queue)
+    await adapter.completeJob(second!, queue, retention)
+    for (const id of ['c', 'd']) {
+      await adapter.pushOn(queue, { id, name: 'TestJob', payload: {}, attempts: 0 })
+      await failNext(id)
+    }
+
+    const completed = await adapter.getJob('op-2', queue)
+    assert.equal(completed?.status, 'completed')
+    assert.deepEqual(completed?.data.payload, { copy: 2 })
+  })
+
   test('recoverStalledJobs should not delete a newer dedup lock when Redis keyPrefix is disabled', async ({
     assert,
   }) => {

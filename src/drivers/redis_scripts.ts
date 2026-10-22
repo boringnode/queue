@@ -216,6 +216,11 @@ ${REDIS_LEASE_LUA}
  * Lua script for finalizing a job in history.
  * Removes from active, stores finalization info, and prunes old records.
  * When pruning removes job data, also deletes the associated dedup key.
+ *
+ * A job id can be pushed again after it was finalized, and the new copy
+ * overwrites the data. So finalizing drops the id from the other history,
+ * and pruning keeps the data and dedup key of an id that is pending,
+ * delayed, or active again: they belong to the live copy.
  */
 export const FINALIZE_JOB_SCRIPT = `
   local data_key = KEYS[1]
@@ -224,6 +229,10 @@ export const FINALIZE_JOB_SCRIPT = `
   local index_key = KEYS[4]
   local overlay_key = KEYS[5]
   local dedup_prefix = KEYS[6]
+  local pending_key = KEYS[7]
+  local delayed_key = KEYS[8]
+  local other_history_key = KEYS[9]
+  local other_index_key = KEYS[10]
   local job_id = ARGV[1]
   local now = tonumber(ARGV[2])
   local max_age = tonumber(ARGV[3])
@@ -251,6 +260,22 @@ ${REDIS_LEASE_LUA}
   end
   redis.call('HSET', history_key, job_id, cjson.encode(record))
   redis.call('ZADD', index_key, now, job_id)
+  redis.call('HDEL', other_history_key, job_id)
+  redis.call('ZREM', other_index_key, job_id)
+
+  -- Ids whose data no live copy uses anymore.
+  local function finished_ids(ids)
+    local result = {}
+    for i = 1, #ids do
+      local id = ids[i]
+      if redis.call('HEXISTS', active_key, id) == 0
+        and not redis.call('ZSCORE', pending_key, id)
+        and not redis.call('ZSCORE', delayed_key, id) then
+        result[#result + 1] = id
+      end
+    end
+    return result
+  end
 
   local function delete_dedup_for(ids)
     for i = 1, #ids do
@@ -273,10 +298,11 @@ ${REDIS_LEASE_LUA}
     local cutoff = now - max_age
     local expired = redis.call('ZRANGEBYSCORE', index_key, 0, cutoff)
     if #expired > 0 then
-      delete_dedup_for(expired)
+      local finished = finished_ids(expired)
+      delete_dedup_for(finished)
       redis.call('ZREM', index_key, unpack(expired))
       redis.call('HDEL', history_key, unpack(expired))
-      delete_jobs_data(data_key, overlay_key, expired)
+      delete_jobs_data(data_key, overlay_key, finished)
     end
   end
 
@@ -287,10 +313,11 @@ ${REDIS_LEASE_LUA}
       local excess = size - max_count
       local stale = redis.call('ZRANGE', index_key, 0, excess - 1)
       if #stale > 0 then
-        delete_dedup_for(stale)
+        local finished = finished_ids(stale)
+        delete_dedup_for(finished)
         redis.call('ZREM', index_key, unpack(stale))
         redis.call('HDEL', history_key, unpack(stale))
-        delete_jobs_data(data_key, overlay_key, stale)
+        delete_jobs_data(data_key, overlay_key, finished)
       end
     end
   end
