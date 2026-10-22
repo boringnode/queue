@@ -113,7 +113,10 @@ export class RedisAdapter implements Adapter {
    * skip a look that would find nothing. Each skip saves a round trip.
    */
   #watching = false
-  /** Queues an acquisition found empty since the worker last looked for work. */
+  /**
+   * Queues an acquisition found empty since the last wake. A job pushed
+   * since then left a marker, which wakes the worker and clears this.
+   */
   readonly #drained = new Set<string>()
   /** The next schedule due time read by a claim, and when it was read. */
   #nextSchedule?: { at: number; readAt: number }
@@ -182,7 +185,7 @@ export class RedisAdapter implements Adapter {
     this.#watching = true
     return new RedisWorkWatcher(this.#connection, blocking, markers, this.#logger, {
       // A new look covers what changed since the last one.
-      onReset: () => this.#drained.clear(),
+      onWake: () => this.#drained.clear(),
       // A schedule marker may announce a schedule this adapter did not write.
       onScheduleWake: () => (this.#nextSchedule = undefined),
     })
@@ -231,7 +234,7 @@ export class RedisAdapter implements Adapter {
 
   async popFrom(queue: string): Promise<AcquiredJob | null> {
     // Jobs pushed since then left a marker: the next wait finds them.
-    if (this.#drained.delete(queue)) return null
+    if (this.#drained.has(queue)) return null
     const keys = this.#getKeys(queue)
     const now = Date.now()
     const leaseToken = createLeaseToken(this.#workerId)
