@@ -254,7 +254,8 @@ ${MARKER_LUA}
   end
 
   -- Wake the next idle worker while jobs remain.
-  if redis.call('ZCARD', pending_key) > 0 then
+  local remaining = redis.call('ZCARD', pending_key) > 0
+  if remaining then
     mark_ready()
   end
 
@@ -273,7 +274,8 @@ ${MARKER_LUA}
   redis.call('HSET', active_key, job_id, active_data)
 
   return encode_job_result(job_data, overlay_key, job_id, {
-    acquiredAt = now
+    acquiredAt = now,
+    remaining = remaining
   })
 `
 
@@ -1006,7 +1008,9 @@ ${MARKER_LUA}
       if skipped then
         mark_first_of(due_key)
       end
-      return nil
+      -- The next due time, so the caller skips claims until then.
+      local first = redis.call('ZRANGE', due_key, 0, 0, 'WITHSCORES')
+      return { 'none', first[2] or '' }
     end
 
     skipped = true

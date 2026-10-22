@@ -22,6 +22,14 @@ interface PoppedMarker {
 
 const ERROR_RETRY_DELAY_MS = 1_000
 
+/** Lets the adapter drop what it assumed between two looks for work. */
+export interface RedisWatchHooks {
+  /** The worker is about to look for work. */
+  onReset(): void
+  /** A schedule marker woke the worker. */
+  onScheduleWake(): void
+}
+
 /**
  * Waits for the markers that writers add for the queues and schedules (see
  * MARKER_LUA). BZPOPMIN pops each marker for one waiting worker only, so a
@@ -47,17 +55,30 @@ export class RedisWorkWatcher implements WorkWatcher {
   #closed = false
   /** Ends the BZPOPMIN in flight when its connection closes. */
   #onClose?: () => void
+  readonly #hooks: RedisWatchHooks
+  /** The marker of the schedules, the last one. */
+  readonly #schedulesKey: string
 
-  constructor(connection: Redis, blocking: Redis, markers: readonly RedisMarker[], logger: Logger) {
+  constructor(
+    connection: Redis,
+    blocking: Redis,
+    markers: readonly RedisMarker[],
+    logger: Logger,
+    hooks: RedisWatchHooks
+  ) {
     this.#connection = connection
     this.#blocking = blocking
     this.#markers = markers
     this.#logger = logger
+    this.#hooks = hooks
+    this.#schedulesKey = markers[markers.length - 1].key
     this.#prefix = blocking.options?.keyPrefix ?? ''
     blocking.on('close', () => this.#onClose?.())
   }
 
-  reset(): void {}
+  reset(): void {
+    this.#hooks.onReset()
+  }
 
   async wait(maxDelay: number, signal: AbortSignal): Promise<boolean> {
     const deadline = Date.now() + maxDelay
@@ -68,6 +89,7 @@ export class RedisWorkWatcher implements WorkWatcher {
         const [heldKey, heldAt] = this.#nextHeld()
         if (heldKey !== undefined && heldAt <= now) {
           this.#held.delete(heldKey)
+          this.#woke(heldKey)
           await this.#advance(heldKey, now)
           return true
         }
@@ -75,6 +97,7 @@ export class RedisWorkWatcher implements WorkWatcher {
 
         const marker = await this.#read(Math.min(deadline, heldAt), signal)
         if (!marker) continue
+        this.#woke(marker.key)
         if (marker.member === '0') return true
         if (marker.score <= Date.now()) {
           await this.#advance(marker.key, Date.now())
@@ -95,6 +118,10 @@ export class RedisWorkWatcher implements WorkWatcher {
     this.#closed = true
     this.#deliver?.(null)
     this.#blocking.disconnect()
+  }
+
+  #woke(key: string): void {
+    if (key === this.#schedulesKey) this.#hooks.onScheduleWake()
   }
 
   #nextHeld(): [string | undefined, number] {

@@ -53,6 +53,13 @@ const legacyScheduleDataPrefix = 'schedules::'
 const schedulesMarkerKey = 'schedules::due::marker'
 
 /**
+ * How long a watching adapter trusts the next schedule due time it read. A
+ * schedule written elsewhere wakes an idle worker through its marker; a
+ * busy worker finds it within this delay.
+ */
+const SCHEDULE_CACHE_TTL = 1000
+
+/**
  * An ioredis connection, or the options to create one.
  */
 export type RedisConfig = Redis | RedisOptions
@@ -101,6 +108,16 @@ export class RedisAdapter implements Adapter {
   readonly #ownsConnection: boolean
   readonly #logger: Logger
   #workerId: string = ''
+  /**
+   * Set once watching: markers then announce new work, so this adapter can
+   * skip a look that would find nothing. Each skip saves a round trip.
+   */
+  #watching = false
+  /** Queues an acquisition found empty since the worker last looked for work. */
+  readonly #drained = new Set<string>()
+  /** The next schedule due time read by a claim, and when it was read. */
+  #nextSchedule?: { at: number; readAt: number }
+
   constructor(connection: Redis, ownsConnection: boolean = false, logger: Logger = consoleLogger) {
     this.#connection = connection
     this.#ownsConnection = ownsConnection
@@ -162,7 +179,13 @@ export class RedisAdapter implements Adapter {
       signal?.removeEventListener('abort', abort)
     }
 
-    return new RedisWorkWatcher(this.#connection, blocking, markers, this.#logger)
+    this.#watching = true
+    return new RedisWorkWatcher(this.#connection, blocking, markers, this.#logger, {
+      // A new look covers what changed since the last one.
+      onReset: () => this.#drained.clear(),
+      // A schedule marker may announce a schedule this adapter did not write.
+      onScheduleWake: () => (this.#nextSchedule = undefined),
+    })
   }
 
   #getKeys(queue: string) {
@@ -207,6 +230,8 @@ export class RedisAdapter implements Adapter {
   }
 
   async popFrom(queue: string): Promise<AcquiredJob | null> {
+    // Jobs pushed since then left a marker: the next wait finds them.
+    if (this.#drained.delete(queue)) return null
     const keys = this.#getKeys(queue)
     const now = Date.now()
     const leaseToken = createLeaseToken(this.#workerId)
@@ -229,11 +254,13 @@ export class RedisAdapter implements Adapter {
       return null
     }
 
-    const { data, overlay, acquiredAt } = JSON.parse(result as string) as {
+    const { data, overlay, acquiredAt, remaining } = JSON.parse(result as string) as {
       data: string
       overlay?: string
       acquiredAt: number
+      remaining: boolean
     }
+    if (this.#watching && !remaining) this.#drained.add(queue)
 
     return { ...hydrateRedisJob(data, overlay), acquiredAt, leaseToken }
   }
@@ -564,6 +591,7 @@ export class RedisAdapter implements Adapter {
   }
 
   async upsertSchedule(config: ScheduleConfig): Promise<string> {
+    this.#nextSchedule = undefined
     const id = config.id ?? randomUUID()
     const now = Date.now()
     const scheduleKey = `${scheduleDataPrefix}${id}`
@@ -673,6 +701,7 @@ export class RedisAdapter implements Adapter {
     id: string,
     updates: Partial<Pick<ScheduleData, 'status' | 'nextRunAt' | 'lastRunAt' | 'runCount'>>
   ): Promise<void> {
+    this.#nextSchedule = undefined
     const scheduleKey = `${scheduleDataPrefix}${id}`
     const data: Record<string, string> = {}
 
@@ -721,6 +750,9 @@ export class RedisAdapter implements Adapter {
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
     const now = Date.now()
+    const next = this.#nextSchedule
+    if (next && now < next.at && now - next.readAt < SCHEDULE_CACHE_TTL) return null
+    this.#nextSchedule = undefined
     const claimToken = randomUUID()
 
     while (true) {
@@ -732,13 +764,16 @@ export class RedisAdapter implements Adapter {
         schedulesMarkerKey,
         now.toString(),
         claimToken
-      )) as ['claimed' | 'unfinalized', string] | null
+      )) as ['claimed' | 'unfinalized' | 'none', string]
 
-      if (!result) {
+      const [outcome, json] = result
+      if (outcome === 'none') {
+        if (this.#watching) {
+          this.#nextSchedule = { at: json === '' ? Infinity : Number(json), readAt: now }
+        }
         return null
       }
 
-      const [outcome, json] = result
       const data = JSON.parse(json) as Record<string, string>
 
       // The worker of this cron claim died before finalizing it. Its occurrence
