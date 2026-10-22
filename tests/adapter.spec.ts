@@ -160,6 +160,61 @@ test.group('Adapter | Redis', (group) => {
     assert.isTrue(await waiting)
   })
 
+  test('looks again at a drained queue once the worker looks for work', async ({
+    assert,
+    cleanup,
+  }) => {
+    const worker = new RedisAdapter(connection)
+    const watcher = await worker.watch(['default'])
+    cleanup(() => watcher.close())
+    const writer = new RedisAdapter(connection)
+    const job = (id: string) => ({ id, name: 'TestJob', payload: {}, attempts: 0 })
+
+    watcher.reset()
+    await writer.pushOn('default', job('last'))
+    assert.equal((await worker.popFrom('default'))?.id, 'last')
+
+    // Pushed after the queue ran dry: its marker wakes the worker, which finds it.
+    await writer.pushOn('default', job('next'))
+    assert.isTrue(await watcher.wait(1000, new AbortController().signal, 0))
+    watcher.reset()
+    assert.equal((await worker.popFrom('default'))?.id, 'next')
+  })
+
+  test('claims a schedule written elsewhere once its marker wakes the worker', async ({
+    assert,
+    cleanup,
+  }) => {
+    const worker = new RedisAdapter(connection)
+    const watcher = await worker.watch(['default'])
+    cleanup(() => watcher.close())
+    const writer = new RedisAdapter(connection)
+    await writer.upsertSchedule({
+      id: 'later',
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+      nextRunAt: new Date(Date.now() + 60_000),
+    })
+
+    watcher.reset()
+    assert.isNull(await worker.claimDueSchedule())
+    // Due before the next due time this worker read.
+    await writer.upsertSchedule({
+      id: 'sooner',
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+      nextRunAt: new Date(Date.now() + 100),
+    })
+
+    assert.isTrue(await watcher.wait(1000, new AbortController().signal, 0))
+    watcher.reset()
+    assert.equal((await worker.claimDueSchedule())?.id, 'sooner')
+  })
+
   test('refuses to watch for an ACL user that cannot block', async ({ assert, cleanup }) => {
     await connection.call(
       'ACL',
