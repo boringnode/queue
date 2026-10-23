@@ -22,15 +22,12 @@ interface PoppedMarker {
 
 const ERROR_RETRY_DELAY_MS = 1_000
 
-/** Lets the adapter drop what it assumed while no marker came. */
+/** Lets the adapter drop what it assumed while no schedule marker came. */
 export interface RedisWatchHooks {
-  /**
-   * A wait ended without an abort: woken by a marker, or at its deadline,
-   * which doubles as the poll that catches a lost marker. Also on close.
-   */
-  onWake(): void
-  /** A schedule marker woke the worker. */
+  /** A schedule marker woke the worker, or a marker may have been lost. */
   onScheduleWake(): void
+  /** The watcher closed: no marker comes anymore. */
+  onClose(): void
 }
 
 /**
@@ -83,7 +80,6 @@ export class RedisWorkWatcher implements WorkWatcher {
 
   async wait(maxDelay: number, signal: AbortSignal): Promise<boolean> {
     const deadline = Date.now() + maxDelay
-    let woken = false
 
     try {
       while (!signal.aborted && !this.#closed) {
@@ -92,24 +88,16 @@ export class RedisWorkWatcher implements WorkWatcher {
         if (heldKey !== undefined && heldAt <= now) {
           this.#held.delete(heldKey)
           this.#woke(heldKey)
-          woken = true
           await this.#advance(heldKey, now)
           return true
         }
-        if (deadline <= now) {
-          woken = true
-          return false
-        }
+        if (deadline <= now) return false
 
         const marker = await this.#read(Math.min(deadline, heldAt), signal)
         if (!marker) continue
         this.#woke(marker.key)
-        if (marker.member === '0') {
-          woken = true
-          return true
-        }
+        if (marker.member === '0') return true
         if (marker.score <= Date.now()) {
-          woken = true
           await this.#advance(marker.key, Date.now())
           return true
         }
@@ -119,7 +107,6 @@ export class RedisWorkWatcher implements WorkWatcher {
       }
       return false
     } finally {
-      if (woken) this.#hooks.onWake()
       for (const [key, at] of this.#held) void this.#release({ key, member: '1', score: at })
       this.#held.clear()
     }
@@ -127,7 +114,7 @@ export class RedisWorkWatcher implements WorkWatcher {
 
   async close(): Promise<void> {
     this.#closed = true
-    this.#hooks.onWake()
+    this.#hooks.onClose()
     this.#deliver?.(null)
     this.#blocking.disconnect()
   }
@@ -226,6 +213,8 @@ export class RedisWorkWatcher implements WorkWatcher {
    * look for work rather than wait for the next poll.
    */
   #mayBeLost(): PoppedMarker {
+    // The lost marker may be the one of a schedule.
+    this.#hooks.onScheduleWake()
     return { key: this.#markers[0].key, member: '0', score: 0 }
   }
 
