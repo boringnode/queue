@@ -217,6 +217,45 @@ test.group('Adapter | Redis', (group) => {
     assert.equal((await worker.claimDueSchedule())?.id, 'while-busy')
   })
 
+  test('does not cache a claim that a schedule marker overtook', async ({ assert, cleanup }) => {
+    const direct = new Redis(connection.options)
+    cleanup(() => direct.disconnect())
+    // Holds the reply of the next schedule claim, which finds nothing.
+    const held = Promise.withResolvers<void>()
+    let holding = true
+    const evaluate = direct.eval.bind(direct) as (...args: unknown[]) => Promise<unknown>
+    direct.eval = (async (...args: unknown[]) => {
+      const reply = await evaluate(...args)
+      if (holding && args[2] === 'schedules::due') {
+        holding = false
+        await held.promise
+      }
+      return reply
+    }) as typeof direct.eval
+
+    const worker = new RedisAdapter(direct)
+    const watcher = await worker.watch(['default'])
+    cleanup(() => watcher.close())
+    const claiming = worker.claimDueSchedule()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // Written after the claim read the due index: its marker wakes the worker.
+    const waiting = watcher.wait(1000, new AbortController().signal, 0)
+    await new RedisAdapter(connection).upsertSchedule({
+      id: 'after-claim',
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+      nextRunAt: new Date(Date.now()),
+    })
+    assert.isTrue(await waiting)
+    held.resolve()
+    assert.isNull(await claiming)
+
+    assert.equal((await worker.claimDueSchedule())?.id, 'after-claim')
+  })
+
   test('claims every time once its watcher closes', async ({ assert }) => {
     const worker = new RedisAdapter(connection)
     const watcher = await worker.watch(['default'])
