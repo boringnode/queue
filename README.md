@@ -411,8 +411,15 @@ import Knex from 'knex'
 const connection = Knex({ client: 'pg', connection: '...' })
 const adapter = knex(connection)
 
-// Custom table name
+// Custom table names
 const adapter = knex(config, 'custom_jobs_table')
+const adapter = knex(config, {
+  tableName: 'custom_jobs_table',
+  schedulesTableName: 'custom_schedules_table',
+})
+
+// PostgreSQL: wake Workers with LISTEN/NOTIFY instead of polling (see Worker Configuration)
+const adapter = knex(config, { notifications: true })
 ```
 
 </details>
@@ -932,7 +939,7 @@ const config = {
   worker: {
     adapter: 'redis', // Registered Adapter listened to by this Worker
     concurrency: 5, // Parallel jobs
-    idleDelay: '2s', // Poll interval when idle
+    idleDelay: '2s', // Poll interval when idle. PostgreSQL: wait after a wake that found nothing
     timeout: '1m', // Default job timeout
     stalledThreshold: '30s', // When to consider job stalled
     stalledInterval: '30s', // How often to check
@@ -942,6 +949,30 @@ const config = {
   },
 }
 ```
+
+On Redis, an idle Worker does not poll: it waits on a marker with `BZPOPMIN`, as in BullMQ, until a
+job is dispatched, or a delayed job, a retry, or a schedule becomes due. A dispatched job wakes one
+idle Worker, which wakes the next one while jobs remain. The Worker still checks its queues every
+`stalledInterval`, in case a wake was lost, and holds one more connection to wait for work.
+A connection that goes silent is detected within 15 s; until then, the Worker finds work at its
+stalled check.
+
+The process that dispatches a job wakes the Workers. A job dispatched by an older version of the
+package, or written to Redis without the Adapter, wakes none: the Worker finds it at its next
+stalled check. Upgrade the processes that dispatch jobs with, or before, the Workers.
+
+On PostgreSQL, Workers poll every `idleDelay` by default. With `knex(config, { notifications: true })`,
+they `LISTEN` for a `NOTIFY` instead, and a job dispatched in a transaction wakes them when it
+commits. Enable it on every process that dispatches jobs, not only on Workers. It suits a few
+Workers with a high `concurrency`:
+
+- Each Worker holds one more connection: size `max_connections` for 2 connections per Worker,
+  or dispatchers may get none.
+- Every `NOTIFY` reaches every Worker. A Worker woken for a job another Worker took waits
+  `idleDelay` before it looks again, so idle Workers never query more often than when polling.
+- It does not work behind a pooler in transaction mode, such as PgBouncer.
+
+MySQL, SQLite, and Kysely poll every `idleDelay`.
 
 Run one Worker per process. A Worker listens on one Adapter, so to process the queues of several
 Adapters, start one process per Adapter. Starting a second Worker while another one runs in the

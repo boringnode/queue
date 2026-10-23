@@ -11,6 +11,8 @@ import {
 import { ControllableAdapter } from './_mocks/controllable_adapter.js'
 import { trackPromise } from './_utils/track_promise.js'
 import { MemoryLogger } from './_mocks/memory_logger.js'
+import type { WorkWatcher } from '../src/contracts/adapter.js'
+import { WorkerWakeup } from '../src/drivers/worker_wakeup.js'
 
 type SessionOverrides = Partial<Omit<WorkerSessionOptions, 'settings' | 'jobExecutionRuntime'>> & {
   jobExecutionRuntime?: Partial<JobExecutor>
@@ -81,20 +83,13 @@ test.group('WorkerSession', () => {
     assert.deepEqual(adapter.polledQueues, ['critical', 'default', 'low'])
   })
 
-  test('fans out remaining acquisitions after the initial probe finds work', async ({
-    assert,
-    cleanup,
-  }) => {
+  test('acquires one job at a time until the pool is full', async ({ assert, cleanup }) => {
     const adapter = new ControllableAdapter()
     const executionGate = Promise.withResolvers<void>()
-    let executionsStarted = 0
-    adapter.acquisitions.block(2, 3)
-
     const session = createSession({
       adapter,
       jobExecutionRuntime: {
         async execute() {
-          executionsStarted++
           await executionGate.promise
           return { type: 'completed' }
         },
@@ -103,12 +98,11 @@ test.group('WorkerSession', () => {
     })
 
     cleanup(async () => {
-      adapter.releaseAll()
       executionGate.resolve()
       await session.stop()
     })
 
-    for (let index = 1; index <= 3; index++) {
+    for (let index = 1; index <= 4; index++) {
       await adapter.pushOn('default', {
         id: `backlog-job-${index}`,
         name: 'TestJob',
@@ -118,18 +112,11 @@ test.group('WorkerSession', () => {
       })
     }
 
-    const cycle = session.processCycle()
-    await adapter.acquisitions.waitForStarted(3)
-
-    assert.equal(adapter.acquisitions.calls, 3)
-
-    adapter.acquisitions.release(2, 3)
-
-    assert.equal((await cycle)?.type, 'started')
-    assert.equal(executionsStarted, 3)
+    assert.equal((await session.processCycle())?.type, 'started')
+    assert.equal(adapter.acquisitions.calls, 3, 'stops once the pool is full')
   })
 
-  test('uses one probe per subsequent empty tick after processing one job', async ({
+  test('uses one acquisition per empty tick after processing one job', async ({
     assert,
     cleanup,
   }) => {
@@ -147,14 +134,14 @@ test.group('WorkerSession', () => {
     })
 
     assert.equal((await session.processCycle())?.type, 'started')
-    assert.equal(adapter.acquisitions.calls, 10)
+    assert.equal(adapter.acquisitions.calls, 2, 'stops at the first empty acquisition')
     assert.equal((await session.processCycle())?.type, 'completed')
 
     assert.equal((await session.processCycle())?.type, 'idle')
-    assert.equal(adapter.acquisitions.calls, 11)
+    assert.equal(adapter.acquisitions.calls, 3)
 
     assert.equal((await session.processCycle())?.type, 'idle')
-    assert.equal(adapter.acquisitions.calls, 12)
+    assert.equal(adapter.acquisitions.calls, 4)
   })
 
   test('reuses one completion wait across idle ticks and observes a later job', async ({
@@ -796,61 +783,9 @@ test.group('WorkerSession', () => {
     await Promise.all([stop, start])
   })
 
-  test('waits for sibling acquisitions when one acquisition fails', async ({ assert, cleanup }) => {
+  test('emits a started job before a later acquisition error', async ({ assert, cleanup }) => {
     const adapter = new ControllableAdapter()
-    let jobCompleted = false
-    adapter.acquisitions.block(2, 3).fail(2, new Error('Failed to acquire job'))
-    adapter.finalizations.block(1)
-
-    const session = createSession({
-      adapter,
-      jobExecutionRuntime: {
-        async execute() {
-          jobCompleted = true
-          return { type: 'completed' }
-        },
-      },
-      settings: { concurrency: 3 },
-    })
-
-    cleanup(async () => {
-      adapter.releaseAll()
-      await session.stop()
-    })
-
-    await adapter.pushOn('default', {
-      id: 'late-job-after-sibling-error',
-      name: 'TestJob',
-      payload: {},
-      attempts: 0,
-      priority: 0,
-    })
-
-    const start = session.start()
-    await adapter.acquisitions.waitForStarted(3)
-    adapter.acquisitions.release(2)
-    await adapter.acquisitions.waitForSettled(2)
-
-    const stop = trackPromise(session.stop())
-    assert.isFalse(stop.settled)
-
-    adapter.acquisitions.release(3)
-    await adapter.finalizations.waitForStarted()
-    assert.isTrue(jobCompleted)
-    assert.isFalse(stop.settled)
-
-    adapter.finalizations.release(1)
-    await Promise.all([stop.promise, start])
-    assert.equal(adapter.acquisitions.calls, 3)
-    assert.isNull(await adapter.getJob('late-job-after-sibling-error', 'default'))
-  })
-
-  test('emits successful acquisitions before a sibling acquisition error', async ({
-    assert,
-    cleanup,
-  }) => {
-    const adapter = new ControllableAdapter()
-    adapter.acquisitions.fail(2, new Error('Failed to acquire sibling job'))
+    adapter.acquisitions.fail(2, new Error('Failed to acquire the next job'))
     const session = createSession({ adapter, settings: { concurrency: 2 } })
     cleanup(() => session.stop())
 
@@ -867,5 +802,181 @@ test.group('WorkerSession', () => {
 
     assert.equal(startedCycle?.type, 'started')
     assert.equal(errorCycle?.type, 'error')
+  })
+})
+
+/** Hands the watcher of `watch` to the test: `notify` wakes it. */
+class WatchableAdapter extends ControllableAdapter {
+  wakeup?: WorkerWakeup
+  watchError?: Error
+  /** The cooldown of each wait. */
+  cooldowns: number[] = []
+
+  async watch(_queues: readonly string[], _signal?: AbortSignal): Promise<WorkWatcher> {
+    if (this.watchError) throw this.watchError
+    const wakeup = new WorkerWakeup()
+    this.wakeup = wakeup
+    return {
+      reset: () => wakeup.reset(),
+      wait: (maxDelay, signal, cooldown) => {
+        this.cooldowns.push(cooldown)
+        return wakeup.wait(maxDelay, signal, cooldown)
+      },
+      close: async () => {
+        this.wakeup = undefined
+      },
+    }
+  }
+}
+
+const job = (id: string) => ({ id, name: 'TestJob', payload: {}, attempts: 0 })
+
+test.group('WorkerSession | work watcher', () => {
+  test('sleeps until a wake signal instead of polling every idleDelay', async ({
+    assert,
+    cleanup,
+  }) => {
+    const adapter = new WatchableAdapter()
+    const executed = Promise.withResolvers<void>()
+    const session = createSession({
+      adapter,
+      settings: { idleDelay: 10 },
+      jobExecutionRuntime: {
+        async execute() {
+          executed.resolve()
+          return { type: 'completed' }
+        },
+      },
+    })
+    cleanup(() => session.stop())
+
+    const start = session.start()
+    await adapter.acquisitions.waitForSettled(1)
+    await setTimeout(100)
+    assert.equal(adapter.acquisitions.calls, 1)
+
+    await adapter.pushOn('default', job('woken'))
+    adapter.wakeup!.notify(Date.now())
+    await executed.promise
+
+    await session.stop()
+    await start
+    assert.isUndefined(adapter.wakeup, 'stopping closes the watcher')
+  })
+
+  test('wakes when a due time is reached', async ({ assert, cleanup }) => {
+    const adapter = new WatchableAdapter()
+    const session = createSession({ adapter })
+    cleanup(() => session.stop())
+
+    void session.start()
+    await adapter.acquisitions.waitForSettled(1)
+    adapter.wakeup!.notify(Date.now() + 150)
+
+    await setTimeout(75)
+    assert.equal(adapter.acquisitions.calls, 1)
+    await setTimeout(150)
+    assert.equal(adapter.acquisitions.calls, 2)
+  })
+
+  test('keeps a wake received while looking for work', async ({ cleanup }) => {
+    const adapter = new WatchableAdapter()
+    adapter.acquisitions.block(1)
+    const session = createSession({ adapter })
+    cleanup(async () => {
+      adapter.acquisitions.releaseAll()
+      await session.stop()
+    })
+
+    void session.start()
+    await adapter.acquisitions.waitForStarted(1)
+    adapter.wakeup!.notify(Date.now())
+    adapter.acquisitions.release(1)
+
+    // Lost, the signal would leave the session asleep until the stalled check.
+    await adapter.acquisitions.waitForStarted(2)
+  })
+
+  test('polls and stops while the watcher is not ready', async ({ assert }) => {
+    const adapter = new WatchableAdapter()
+    let aborted = false
+    adapter.watch = (_queues, signal) =>
+      new Promise<WorkWatcher>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          aborted = true
+          reject(signal.reason)
+        })
+      })
+    const logger = new MemoryLogger()
+    const session = createSession({ adapter, logger, settings: { idleDelay: 10 } })
+
+    const start = session.start()
+    await adapter.acquisitions.waitForStarted(3)
+    await session.stop()
+    await start
+
+    assert.isTrue(aborted, 'stopping aborts the pending watch')
+    assert.deepEqual(logger.logs, [], 'an aborted watch is not an error')
+  })
+
+  test('follows the wakes of a watcher that gets ready while polling', async ({
+    assert,
+    cleanup,
+  }) => {
+    const adapter = new WatchableAdapter()
+    const ready = Promise.withResolvers<void>()
+    const watch = adapter.watch.bind(adapter)
+    adapter.watch = async (queues, signal) => {
+      await ready.promise
+      return watch(queues, signal)
+    }
+    const session = createSession({ adapter, settings: { idleDelay: 60_000 } })
+    cleanup(() => session.stop())
+
+    void session.start()
+    await adapter.acquisitions.waitForSettled(1)
+    await setTimeout(20) // the session now sleeps for idleDelay
+    ready.resolve()
+    while (!adapter.wakeup) await setTimeout(1)
+    adapter.wakeup.notify(Date.now() + 100)
+
+    // Without it, the first poll would wait for idleDelay.
+    await setTimeout(200)
+    assert.isAtLeast(adapter.acquisitions.calls, 2)
+  })
+
+  test('polls every idleDelay when watching fails', async ({ assert, cleanup }) => {
+    const adapter = new WatchableAdapter()
+    adapter.watchError = new Error('LISTEN is not supported')
+    const logger = new MemoryLogger()
+    const session = createSession({ adapter, logger, settings: { idleDelay: 10 } })
+    cleanup(() => session.stop())
+
+    void session.start()
+    await adapter.acquisitions.waitForStarted(3)
+
+    const errors = logger.logs.filter((entry) => entry.level === 'error')
+    assert.equal(errors[0].message, 'Failed to watch for work, polling instead')
+    assert.strictEqual(errors[0].obj?.err, adapter.watchError)
+  })
+
+  test('cools down for idleDelay after a wake that found no work', async ({ assert, cleanup }) => {
+    const adapter = new WatchableAdapter()
+    const session = createSession({ adapter, settings: { idleDelay: 50 } })
+    cleanup(() => session.stop())
+
+    void session.start()
+    while (adapter.cooldowns.length === 0) await setTimeout(1)
+
+    // Another worker took the job: this wake finds nothing.
+    adapter.wakeup!.notify(Date.now())
+    while (adapter.cooldowns.length < 2) await setTimeout(1)
+    assert.equal(adapter.cooldowns[1], 50)
+
+    // A wake that finds a job: no cooldown once it is done.
+    await adapter.pushOn('default', job('found'))
+    adapter.wakeup!.notify(Date.now())
+    while (adapter.cooldowns.length < 3) await setTimeout(1)
+    assert.deepEqual(adapter.cooldowns, [0, 50, 0])
   })
 })
