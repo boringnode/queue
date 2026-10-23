@@ -115,6 +115,11 @@ export class RedisAdapter implements Adapter {
   #watching = false
   /** The next schedule due time read by a claim, and when it was read. */
   #nextSchedule?: { at: number; readAt: number }
+  /**
+   * Counts invalidations of `#nextSchedule`: a claim in flight during one
+   * read the due index before it, and must not cache its result.
+   */
+  #scheduleRevision = 0
 
   constructor(connection: Redis, ownsConnection: boolean = false, logger: Logger = consoleLogger) {
     this.#connection = connection
@@ -181,11 +186,11 @@ export class RedisAdapter implements Adapter {
     return new RedisWorkWatcher(this.#connection, blocking, markers, this.#logger, {
       // A schedule marker, or one that may be lost, may announce a schedule
       // this adapter did not write.
-      onScheduleWake: () => (this.#nextSchedule = undefined),
+      onScheduleWake: () => this.#forgetNextSchedule(),
       // Without markers, claims look again every time.
       onClose: () => {
         this.#watching = false
-        this.#nextSchedule = undefined
+        this.#forgetNextSchedule()
       },
     })
   }
@@ -589,7 +594,7 @@ export class RedisAdapter implements Adapter {
   }
 
   async upsertSchedule(config: ScheduleConfig): Promise<string> {
-    this.#nextSchedule = undefined
+    this.#forgetNextSchedule()
     const id = config.id ?? randomUUID()
     const now = Date.now()
     const scheduleKey = `${scheduleDataPrefix}${id}`
@@ -699,7 +704,7 @@ export class RedisAdapter implements Adapter {
     id: string,
     updates: Partial<Pick<ScheduleData, 'status' | 'nextRunAt' | 'lastRunAt' | 'runCount'>>
   ): Promise<void> {
-    this.#nextSchedule = undefined
+    this.#forgetNextSchedule()
     const scheduleKey = `${scheduleDataPrefix}${id}`
     const data: Record<string, string> = {}
 
@@ -746,11 +751,17 @@ export class RedisAdapter implements Adapter {
     )
   }
 
+  #forgetNextSchedule(): void {
+    this.#nextSchedule = undefined
+    this.#scheduleRevision++
+  }
+
   async claimDueSchedule(): Promise<ScheduleData | null> {
     const now = Date.now()
     const next = this.#nextSchedule
     if (next && now < next.at && now - next.readAt < SCHEDULE_CACHE_TTL) return null
     this.#nextSchedule = undefined
+    const revision = this.#scheduleRevision
     const claimToken = randomUUID()
 
     while (true) {
@@ -766,7 +777,7 @@ export class RedisAdapter implements Adapter {
 
       const [outcome, json] = result
       if (outcome === 'none') {
-        if (this.#watching) {
+        if (this.#watching && revision === this.#scheduleRevision) {
           this.#nextSchedule = { at: json === '' ? Infinity : Number(json), readAt: now }
         }
         return null
