@@ -254,8 +254,7 @@ ${MARKER_LUA}
   end
 
   -- Wake the next idle worker while jobs remain.
-  local remaining = redis.call('ZCARD', pending_key) > 0
-  if remaining then
+  if redis.call('ZCARD', pending_key) > 0 then
     mark_ready()
   end
 
@@ -274,8 +273,7 @@ ${MARKER_LUA}
   redis.call('HSET', active_key, job_id, active_data)
 
   return encode_job_result(job_data, overlay_key, job_id, {
-    acquiredAt = now,
-    remaining = remaining
+    acquiredAt = now
   })
 `
 

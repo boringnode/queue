@@ -160,27 +160,6 @@ test.group('Adapter | Redis', (group) => {
     assert.isTrue(await waiting)
   })
 
-  test('looks again at a drained queue once a marker wakes the worker', async ({
-    assert,
-    cleanup,
-  }) => {
-    const worker = new RedisAdapter(connection)
-    const watcher = await worker.watch(['default'])
-    cleanup(() => watcher.close())
-    const writer = new RedisAdapter(connection)
-    const job = (id: string) => ({ id, name: 'TestJob', payload: {}, attempts: 0 })
-
-    watcher.reset()
-    await writer.pushOn('default', job('last'))
-    assert.equal((await worker.popFrom('default'))?.id, 'last')
-
-    // Pushed after the queue ran dry: its marker wakes the worker, which finds it.
-    await writer.pushOn('default', job('next'))
-    assert.isTrue(await watcher.wait(1000, new AbortController().signal, 0))
-    watcher.reset()
-    assert.equal((await worker.popFrom('default'))?.id, 'next')
-  })
-
   test('claims a schedule written elsewhere once its marker wakes the worker', async ({
     assert,
     cleanup,
@@ -214,6 +193,85 @@ test.group('Adapter | Redis', (group) => {
     watcher.reset()
     assert.equal((await worker.claimDueSchedule())?.id, 'sooner')
   })
+
+  test('claims a schedule written elsewhere within a second while busy', async ({
+    assert,
+    cleanup,
+  }) => {
+    const worker = new RedisAdapter(connection)
+    const watcher = await worker.watch(['default'])
+    cleanup(() => watcher.close())
+    assert.isNull(await worker.claimDueSchedule())
+
+    // A busy worker does not wait, so no marker reaches it.
+    await new RedisAdapter(connection).upsertSchedule({
+      id: 'while-busy',
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+      nextRunAt: new Date(Date.now()),
+    })
+    assert.isNull(await worker.claimDueSchedule())
+    await new Promise((resolve) => setTimeout(resolve, 1100))
+    assert.equal((await worker.claimDueSchedule())?.id, 'while-busy')
+  })
+
+  test('claims every time once its watcher closes', async ({ assert }) => {
+    const worker = new RedisAdapter(connection)
+    const watcher = await worker.watch(['default'])
+    assert.isNull(await worker.claimDueSchedule())
+    await watcher.close()
+
+    // Polling now: no marker announces this schedule.
+    await new RedisAdapter(connection).upsertSchedule({
+      id: 'after-close',
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+      nextRunAt: new Date(Date.now()),
+    })
+    assert.equal((await worker.claimDueSchedule())?.id, 'after-close')
+  })
+
+  test('claims a schedule whose marker was lost with its connection', async ({
+    assert,
+    cleanup,
+  }) => {
+    shortenHeartbeat(cleanup)
+    const target = {
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+    }
+    const proxy = await startSilentProxy(target)
+    cleanup(() => proxy.close())
+    // Only the blocking connection goes through the proxy.
+    const direct = new Redis({ ...target, keyPrefix: KEY_PREFIX, db: 15 })
+    direct.duplicate = (override?: Partial<RedisOptions>) =>
+      new Redis({ host: '127.0.0.1', port: proxy.port, keyPrefix: KEY_PREFIX, db: 15, ...override })
+    cleanup(() => direct.disconnect())
+
+    const worker = new RedisAdapter(direct, false, new MemoryLogger())
+    const watcher = await worker.watch(['default'])
+    cleanup(() => watcher.close())
+    assert.isNull(await worker.claimDueSchedule())
+    const waiting = watcher.wait(2000, new AbortController().signal, 0)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    proxy.silence()
+
+    // Redis pops its marker for the silent connection: the reply is lost.
+    await new RedisAdapter(connection).upsertSchedule({
+      id: 'lost-marker',
+      name: 'TestJob',
+      payload: {},
+      everyMs: 60_000,
+      timezone: 'UTC',
+      nextRunAt: new Date(Date.now()),
+    })
+    assert.isTrue(await waiting)
+    assert.equal((await worker.claimDueSchedule())?.id, 'lost-marker')
+  }).timeout(5000)
 
   test('refuses to watch for an ACL user that cannot block', async ({ assert, cleanup }) => {
     await connection.call(

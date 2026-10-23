@@ -109,15 +109,10 @@ export class RedisAdapter implements Adapter {
   readonly #logger: Logger
   #workerId: string = ''
   /**
-   * Set once watching: markers then announce new work, so this adapter can
-   * skip a look that would find nothing. Each skip saves a round trip.
+   * Set while a watcher is open: a schedule marker then announces a schedule
+   * written elsewhere, so this adapter can skip claims until the next due time.
    */
   #watching = false
-  /**
-   * Queues an acquisition found empty since the last wake. A job pushed
-   * since then left a marker, which wakes the worker and clears this.
-   */
-  readonly #drained = new Set<string>()
   /** The next schedule due time read by a claim, and when it was read. */
   #nextSchedule?: { at: number; readAt: number }
 
@@ -184,10 +179,14 @@ export class RedisAdapter implements Adapter {
 
     this.#watching = true
     return new RedisWorkWatcher(this.#connection, blocking, markers, this.#logger, {
-      // A new look covers what changed since the last one.
-      onWake: () => this.#drained.clear(),
-      // A schedule marker may announce a schedule this adapter did not write.
+      // A schedule marker, or one that may be lost, may announce a schedule
+      // this adapter did not write.
       onScheduleWake: () => (this.#nextSchedule = undefined),
+      // Without markers, claims look again every time.
+      onClose: () => {
+        this.#watching = false
+        this.#nextSchedule = undefined
+      },
     })
   }
 
@@ -233,8 +232,6 @@ export class RedisAdapter implements Adapter {
   }
 
   async popFrom(queue: string): Promise<AcquiredJob | null> {
-    // Jobs pushed since then left a marker: the next wait finds them.
-    if (this.#drained.has(queue)) return null
     const keys = this.#getKeys(queue)
     const now = Date.now()
     const leaseToken = createLeaseToken(this.#workerId)
@@ -257,13 +254,11 @@ export class RedisAdapter implements Adapter {
       return null
     }
 
-    const { data, overlay, acquiredAt, remaining } = JSON.parse(result as string) as {
+    const { data, overlay, acquiredAt } = JSON.parse(result as string) as {
       data: string
       overlay?: string
       acquiredAt: number
-      remaining: boolean
     }
-    if (this.#watching && !remaining) this.#drained.add(queue)
 
     return { ...hydrateRedisJob(data, overlay), acquiredAt, leaseToken }
   }
