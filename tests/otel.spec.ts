@@ -6,6 +6,7 @@ import { dispatchChannel, executeChannel } from '../src/tracing_channels.js'
 import type { JobExecuteMessage, JobDispatchMessage } from '../src/types/tracing_channels.js'
 import type { AcquiredJob } from '../src/contracts/adapter.js'
 import type { JobData } from '../src/types/main.js'
+import packageJson from '../package.json' with { type: 'json' }
 
 function makeJob(overrides: Partial<AcquiredJob> = {}): AcquiredJob {
   return {
@@ -113,6 +114,8 @@ test.group('QueueInstrumentation | dispatch via DC', (group) => {
     assert.equal(spans[0].attributes['messaging.destination.name'], 'emails')
     assert.equal(spans[0].attributes['messaging.message.id'], 'job-1')
     assert.equal(spans[0].attributes['messaging.job.name'], 'SendEmailJob')
+    assert.equal(spans[0].instrumentationScope.name, '@boringnode/queue')
+    assert.equal(spans[0].instrumentationScope.version, packageJson.version)
 
     instrumentation.disable()
   })
