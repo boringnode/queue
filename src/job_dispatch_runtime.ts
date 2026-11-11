@@ -111,6 +111,7 @@ export class JobDispatchRuntime {
       if (result) {
         pushResult = result
         message.dedupOutcome = result.outcome
+        message.dedupJobId = result.jobId
       }
     }, message)
 

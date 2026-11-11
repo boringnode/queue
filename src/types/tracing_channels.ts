@@ -28,6 +28,12 @@ export type JobDispatchMessage = {
    */
   dedupOutcome?: DedupOutcome
 
+  /**
+   * ID of the job that holds the deduplication key, set with `dedupOutcome`.
+   * It differs from `jobs[0].id` when the dispatch did not add a new job.
+   */
+  dedupJobId?: string
+
   /** Error that caused the dispatch to fail */
   error?: Error
 }
