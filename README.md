@@ -1011,6 +1011,8 @@ renewal that fails is logged at the `warn` level.
 
 `@boringnode/queue` ships with built-in OpenTelemetry instrumentation that creates **PRODUCER** spans for job dispatch and **CONSUMER** spans for job execution, following [OTel messaging semantic conventions](https://opentelemetry.io/docs/specs/semconv/messaging/messaging-spans/).
 
+It requires OpenTelemetry JS SDK 3 (`@opentelemetry/api` 1.10, `@opentelemetry/core` 3, `@opentelemetry/instrumentation` 0.300+). Applications still on SDK 2 should stay on `@boringnode/queue` 0.9.x.
+
 ### Quick Setup
 
 ```typescript
