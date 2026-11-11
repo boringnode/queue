@@ -15,6 +15,7 @@ import type { InstrumentationConfig } from '@opentelemetry/instrumentation'
 import { dispatchChannel, executeChannel } from './tracing_channels.js'
 import type { AcquiredJob } from './contracts/adapter.js'
 import type { JobDispatchMessage, JobExecuteMessage } from './types/tracing_channels.js'
+import packageJson from '../package.json' with { type: 'json' }
 
 export interface QueueInstrumentationConfig extends InstrumentationConfig {
   /**
@@ -53,7 +54,7 @@ export class QueueInstrumentation extends InstrumentationBase<QueueInstrumentati
   #patchedManager?: { init: (...args: any[]) => any }
 
   constructor(config: QueueInstrumentationConfig = {}) {
-    super('@boringnode/queue', '0.1.0', config)
+    super(packageJson.name, packageJson.version, config)
   }
 
   get #messagingSystem(): string {
