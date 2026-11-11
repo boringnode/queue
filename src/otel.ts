@@ -193,6 +193,11 @@ export class QueueInstrumentation extends InstrumentationBase<QueueInstrumentati
     const span = this.dispatchSpans.get(message)
     if (!span) return
 
+    if (message.dedupOutcome) {
+      span.setAttribute('messaging.job.dedup_outcome', message.dedupOutcome)
+      if (message.dedupJobId) span.setAttribute('messaging.message.id', message.dedupJobId)
+    }
+
     if (message.error) {
       span.recordException(message.error)
       span.setStatus({ code: SpanStatusCode.ERROR, message: message.error.message })

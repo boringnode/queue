@@ -159,6 +159,23 @@ test.group('QueueInstrumentation | dispatch via DC', (group) => {
     instrumentation.disable()
   })
 
+  test('reports the deduplicated job instead of the skipped one', async ({ assert }) => {
+    const { instrumentation } = await setupWithWrappers()
+
+    const jobData: JobData = { id: 'new-id', name: 'DedupJob', payload: {}, attempts: 0 }
+    const message: JobDispatchMessage = { jobs: [jobData], queue: 'default' }
+    await dispatchChannel.tracePromise(async () => {
+      message.dedupOutcome = 'skipped'
+      message.dedupJobId = 'existing-id'
+    }, message)
+
+    const spans = getFinishedSpans()
+    assert.equal(spans[0].attributes['messaging.message.id'], 'existing-id')
+    assert.equal(spans[0].attributes['messaging.job.dedup_outcome'], 'skipped')
+
+    instrumentation.disable()
+  })
+
   test('includes delay_ms and batch_count attributes', async ({ assert }) => {
     const { instrumentation } = await setupWithWrappers()
 
