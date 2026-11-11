@@ -231,6 +231,29 @@ test.group('QueueInstrumentation | execute via executionWrapper', (group) => {
   })
   group.each.setup(() => resetSpans())
 
+  test('does not start a CONSUMER span after disable()', async ({ assert }) => {
+    const { instrumentation, executionWrapper } = await setupWithWrappers()
+    instrumentation.disable()
+
+    const job = makeJob({ id: 'disabled-1' })
+    const message: JobExecuteMessage = { job, queue: 'default', status: 'completed' }
+    let activeSpan: unknown
+    const result = await executeChannel.tracePromise(async () => {
+      return executionWrapper(
+        async () => {
+          activeSpan = trace.getActiveSpan()
+          return 'done'
+        },
+        job,
+        'default'
+      )
+    }, message)
+
+    assert.equal(result, 'done')
+    assert.isUndefined(activeSpan)
+    assert.lengthOf(getFinishedSpans(), 0)
+  })
+
   test('creates CONSUMER span with semconv attributes', async ({ assert }) => {
     const { instrumentation, executionWrapper } = await setupWithWrappers()
 
