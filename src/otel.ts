@@ -212,6 +212,10 @@ export class QueueInstrumentation extends InstrumentationBase<QueueInstrumentati
    * execution in OTel context for proper child span parenting.
    */
   #wrapExecution<T>(fn: () => Promise<T>, job: AcquiredJob, queue: string): Promise<T> {
+    // The queue manager keeps this wrapper after disable(); without the
+    // execute subscription, nothing would end the span.
+    if (!this.subscribed) return fn()
+
     const extractedContext = this.#extractParentContext(job.traceContext)
     const parentSpanContext = trace.getSpanContext(extractedContext)
 
