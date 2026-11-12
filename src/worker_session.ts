@@ -6,7 +6,7 @@ import { JobPool, type PoolEntry } from './job_pool.js'
 import { WorkerHeartbeat, type HeartbeatOperationWrapper } from './worker_heartbeat.js'
 import { Locator } from './locator.js'
 import type { SingleJobDispatchRequest } from './job_dispatch_runtime.js'
-import type { Adapter, AcquiredJob } from './contracts/adapter.js'
+import type { Adapter, AcquiredJob, WorkWatcher } from './contracts/adapter.js'
 import type { JobExecutionOutcome, JobExecutionRuntime } from './job_runtime.js'
 import type { Logger, WorkerCycle } from './types/main.js'
 import { DEFAULT_ERROR_RETRY_DELAY, UNKNOWN_JOB_RETRY_DELAY } from './constants.js'
@@ -80,6 +80,10 @@ export class WorkerSession {
   #completionDelayController?: AbortController
   #lastStalledCheck = 0
   #delayController?: AbortController
+  /** Set while `start()` holds a watcher: idle waits sleep until work may be due. */
+  #watcher?: WorkWatcher
+  /** The last wait ended on a wake: if the next look finds no work, it cools down. */
+  #woken = false
 
   constructor(options: WorkerSessionOptions) {
     this.#workerId = options.workerId
@@ -122,11 +126,20 @@ export class WorkerSession {
     const completion = Promise.withResolvers<void>()
     this.#startCompletion = completion.promise
 
+    // Polls until the watcher is ready: a slow handshake delays no job.
+    const watchAbort = new AbortController()
+    const watching = this.#watch(watchAbort.signal)
+
     try {
       debug('starting worker %s on queues: %O', this.#workerId, this.#queues)
 
       for await (const cycle of generator) {
-        if (cycle.type === 'started' || cycle.type === 'completed') {
+        if (cycle.type === 'started') {
+          this.#woken = false
+          continue
+        }
+
+        if (cycle.type === 'completed') {
           continue
         }
 
@@ -141,9 +154,15 @@ export class WorkerSession {
           debug('worker %s is idle, waiting for %dms', this.#workerId, delay)
         }
 
-        await this.#waitBeforeNextCycle(delay)
+        await this.#waitBeforeNextCycle(cycle.type === 'idle' && this.#watcher ? null : delay)
       }
     } finally {
+      this.#watcher = undefined
+      watchAbort.abort()
+      const watcher = await watching
+      await watcher?.close().catch((error) => {
+        this.#logger.error({ err: error, workerId: this.#workerId }, 'Failed to stop watching')
+      })
       completion.resolve()
       if (this.#startCompletion === completion.promise) {
         this.#startCompletion = undefined
@@ -270,14 +289,66 @@ export class WorkerSession {
     }
   }
 
-  async #waitBeforeNextCycle(delay: number): Promise<void> {
+  /**
+   * Watch for work through the adapter, when it supports it. A failure is
+   * logged and the worker keeps polling. `signal` aborts a watcher that is
+   * not ready when the session stops.
+   */
+  async #watch(signal: AbortSignal): Promise<WorkWatcher | undefined> {
+    if (!this.#adapter.watch) return
+
+    try {
+      const watcher = await this.#adapter.watch(this.#queues, signal)
+      if (!signal.aborted) {
+        this.#watcher = watcher
+        debug('worker %s watches for work', this.#workerId)
+        // The current wait polls: end it, so the next one sleeps until work.
+        this.#delayController?.abort()
+        this.#completionDelayController?.abort()
+      }
+      return watcher
+    } catch (error) {
+      if (signal.aborted) return
+      this.#logger.error(
+        { err: error as Error, workerId: this.#workerId },
+        'Failed to watch for work, polling instead'
+      )
+    }
+  }
+
+  /**
+   * Sleep until work may be due. After a wake that found no work, the
+   * watcher cools down for `idleDelay`: idle workers woken together look for
+   * work at most as often as when polling.
+   */
+  async #waitForWork(watcher: WorkWatcher, signal: AbortSignal): Promise<void> {
+    const cooldown = this.#woken ? this.#settings.idleDelay : 0
+    this.#woken = await watcher.wait(this.#untilStalledCheck(), signal, cooldown)
+  }
+
+  /**
+   * Time left before the next stalled check. A watching worker sleeps at
+   * most this long: the check doubles as the poll that catches lost signals.
+   */
+  #untilStalledCheck(): number {
+    return Math.max(this.#lastStalledCheck + this.#settings.stalledInterval - Date.now(), 0)
+  }
+
+  /**
+   * Sleep for `delay`, or until work may be due when `delay` is null.
+   */
+  async #waitBeforeNextCycle(delay: number | null): Promise<void> {
     if (!this.#running) return
 
     const controller = new AbortController()
     this.#delayController = controller
 
     try {
-      await setTimeout(delay, undefined, { signal: controller.signal })
+      if (delay === null) {
+        if (this.#watcher) await this.#waitForWork(this.#watcher, controller.signal)
+      } else {
+        await setTimeout(delay, undefined, { signal: controller.signal })
+      }
     } catch (error) {
       if (!controller.signal.aborted) {
         throw error
@@ -295,6 +366,7 @@ export class WorkerSession {
     try {
       while (this.#running) {
         try {
+          this.#watcher?.reset()
           await this.#checkStalledJobs()
 
           if (!this.#running) break
@@ -365,7 +437,11 @@ export class WorkerSession {
     this.#completionDelayController = controller
 
     try {
-      await setTimeout(this.#settings.idleDelay, undefined, { signal: controller.signal })
+      if (this.#watcher) {
+        await this.#waitForWork(this.#watcher, controller.signal)
+      } else {
+        await setTimeout(this.#settings.idleDelay, undefined, { signal: controller.signal })
+      }
     } catch (error) {
       if (!controller.signal.aborted) {
         throw error
@@ -404,40 +480,28 @@ export class WorkerSession {
     return completed
   }
 
+  /**
+   * Acquire jobs one at a time until the pool is full or the queues run dry.
+   * An empty queue then costs one acquisition, not one per free slot: a
+   * watching worker looks for work on every wake.
+   */
   async #fillPool(): Promise<PoolFillResult> {
-    const slotsAvailable = this.#settings.concurrency - this.#pool.size
+    const cycles: StartedCycle[] = []
 
-    if (slotsAvailable <= 0) return { cycles: [], errors: [] }
+    while (this.#running && this.#pool.size < this.#settings.concurrency) {
+      let cycle: StartedCycle | null
 
-    let probe: StartedCycle | null
-
-    try {
-      probe = await this.#acquireAndStartNextJob()
-    } catch (error) {
-      return { cycles: [], errors: [error] }
-    }
-
-    if (!probe) return { cycles: [], errors: [] }
-    if (!this.#running) return { cycles: [probe], errors: [] }
-
-    const acquisitions: Array<Promise<StartedCycle | null>> = []
-    for (let index = 1; index < slotsAvailable; index++) {
-      acquisitions.push(this.#acquireAndStartNextJob())
-    }
-
-    const results = await Promise.allSettled(acquisitions)
-    const cycles = [probe]
-    const errors: unknown[] = []
-
-    for (const result of results) {
-      if (result.status === 'rejected') {
-        errors.push(result.reason)
-      } else if (result.value) {
-        cycles.push(result.value)
+      try {
+        cycle = await this.#acquireAndStartNextJob()
+      } catch (error) {
+        return { cycles, errors: [error] }
       }
+
+      if (!cycle) break
+      cycles.push(cycle)
     }
 
-    return { cycles, errors }
+    return { cycles, errors: [] }
   }
 
   async #acquireAndStartNextJob(): Promise<StartedCycle | null> {

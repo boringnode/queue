@@ -8,8 +8,11 @@ import type {
   JobLease,
   PushResult,
   StalledJobsRecovery,
+  WorkWatcher,
 } from '../contracts/adapter.js'
-import { consoleLogger } from '../logger.js'
+import { consoleLogger, type Logger } from '../logger.js'
+import { RedisWorkWatcher } from './redis_work_watcher.js'
+import { subscriptionHeartbeat } from './wake_messages.js'
 import type { AdapterFactoryContext, DedupOutcome } from '../types/main.js'
 import type {
   JobData,
@@ -35,6 +38,7 @@ import {
   REMOVE_JOB_SCRIPT,
   RENEW_JOBS_SCRIPT,
   RETRY_JOB_SCRIPT,
+  SEED_MARKERS_SCRIPT,
   UPDATE_SCHEDULE_SCRIPT,
   UPSERT_SCHEDULE_SCRIPT,
 } from './redis_scripts.js'
@@ -45,6 +49,15 @@ const schedulesDueKey = 'schedules::due'
 // Schedule hashes live one level below the index keys so no schedule id can collide with them.
 const scheduleDataPrefix = 'schedules::data::'
 const legacyScheduleDataPrefix = 'schedules::'
+// Below the due index: a 0.7 schedule hash lives at `schedules::<id>`.
+const schedulesMarkerKey = 'schedules::due::marker'
+
+/**
+ * How long a watching adapter trusts the next schedule due time it read. A
+ * schedule written elsewhere wakes an idle worker through its marker; a
+ * busy worker finds it within this delay.
+ */
+const SCHEDULE_CACHE_TTL = 1000
 
 /**
  * An ioredis connection, or the options to create one.
@@ -69,7 +82,7 @@ function isRedisConnection(config?: RedisConfig): config is Redis {
 export function redis(config?: RedisConfig) {
   return ({ logger }: AdapterFactoryContext = { logger: consoleLogger }) => {
     if (isRedisConnection(config)) {
-      return new RedisAdapter(config, false)
+      return new RedisAdapter(config, false, logger)
     }
 
     const options: RedisOptions = {
@@ -86,17 +99,100 @@ export function redis(config?: RedisConfig) {
       logger.error({ err: error }, 'Redis connection error')
     })
 
-    return new RedisAdapter(connection, true)
+    return new RedisAdapter(connection, true, logger)
   }
 }
 
 export class RedisAdapter implements Adapter {
   readonly #connection: Redis
   readonly #ownsConnection: boolean
+  readonly #logger: Logger
   #workerId: string = ''
-  constructor(connection: Redis, ownsConnection: boolean = false) {
+  /**
+   * Set while a watcher is open: a schedule marker then announces a schedule
+   * written elsewhere, so this adapter can skip claims until the next due time.
+   */
+  #watching = false
+  /** The next schedule due time read by a claim, and when it was read. */
+  #nextSchedule?: { at: number; readAt: number }
+  /**
+   * Counts invalidations of `#nextSchedule`: a claim in flight during one
+   * read the due index before it, and must not cache its result.
+   */
+  #scheduleRevision = 0
+
+  constructor(connection: Redis, ownsConnection: boolean = false, logger: Logger = consoleLogger) {
     this.#connection = connection
     this.#ownsConnection = ownsConnection
+    this.#logger = logger
+  }
+
+  /**
+   * Wait for work with BZPOPMIN on the markers of the queues and schedules,
+   * through a dedicated connection: a blocking command holds its connection.
+   */
+  async watch(queues: readonly string[], signal?: AbortSignal): Promise<WorkWatcher> {
+    signal?.throwIfAborted()
+    const markers = queues.map((queue) => ({
+      key: this.#getKeys(queue).marker,
+      source: this.#getKeys(queue).delayed,
+    }))
+    markers.push({ key: schedulesMarkerKey, source: schedulesDueKey })
+
+    // A command interrupted by a reconnection fails instead of blocking again.
+    const blocking = this.#connection.duplicate({ autoResendUnfulfilledCommands: false })
+    blocking.on('error', (error) => {
+      this.#logger.error({ err: error }, 'Redis blocking connection error')
+    })
+    // A command queued during a silent handshake, or dropped on reconnection,
+    // never settles: abort and a deadline reject, so that the worker polls.
+    const aborted = Promise.withResolvers<never>()
+    aborted.promise.catch(() => {})
+    const abort = () => aborted.reject(signal!.reason)
+    signal?.addEventListener('abort', abort, { once: true })
+    const deadline = setTimeout(
+      () => aborted.reject(new Error('The Redis blocking connection did not start in time')),
+      subscriptionHeartbeat.interval
+    )
+
+    try {
+      const seedKeys = queues.flatMap((queue) => {
+        const keys = this.#getKeys(queue)
+        return [keys.pending, keys.delayed, keys.marker]
+      })
+      seedKeys.push(schedulesDueKey, schedulesMarkerKey)
+      // A user without the @blocking ACL category cannot wait: probe BZPOPMIN,
+      // so that such a worker polls instead. In MULTI, it returns at once.
+      const probe = blocking
+        .multi()
+        .bzpopmin(`${markers[0].key}::probe`, 0)
+        .exec()
+        .catch((error: { previousErrors?: Error[] }) => {
+          // EXECABORT tells nothing: the NOPERM error is the one to log.
+          throw error.previousErrors?.[0] ?? error
+        })
+      const seed = this.#connection.eval(SEED_MARKERS_SCRIPT, seedKeys.length, ...seedKeys)
+      await Promise.race([Promise.all([probe, seed]), aborted.promise])
+      signal?.throwIfAborted()
+    } catch (error) {
+      blocking.disconnect()
+      throw error
+    } finally {
+      clearTimeout(deadline)
+      signal?.removeEventListener('abort', abort)
+    }
+
+    this.#watching = true
+    return new RedisWorkWatcher(this.#connection, blocking, markers, this.#logger, {
+      // A schedule marker, or one that may be lost, may announce a schedule
+      // this adapter did not write.
+      onScheduleWake: () => this.#forgetNextSchedule(),
+      // Without markers, claims look again every time.
+      onClose: () => {
+        this.#watching = false
+        this.#forgetNextSchedule()
+      },
+    })
   }
 
   #getKeys(queue: string) {
@@ -106,6 +202,7 @@ export class RedisAdapter implements Adapter {
       delayed: `${redisKey}::${queue}::delayed`,
       active: `${redisKey}::${queue}::active`,
       overlay: `${redisKey}::${queue}::metadata`,
+      marker: `${redisKey}::${queue}::marker`,
       completed: `${redisKey}::${queue}::completed`,
       completedIndex: `${redisKey}::${queue}::completed::index`,
       failed: `${redisKey}::${queue}::failed`,
@@ -146,12 +243,13 @@ export class RedisAdapter implements Adapter {
 
     const result = await this.#connection.eval(
       ACQUIRE_JOB_SCRIPT,
-      5,
+      6,
       keys.data,
       keys.pending,
       keys.active,
       keys.delayed,
       keys.overlay,
+      keys.marker,
       this.#workerId,
       now.toString(),
       leaseToken
@@ -269,12 +367,13 @@ export class RedisAdapter implements Adapter {
 
     const retried = await this.#connection.eval(
       RETRY_JOB_SCRIPT,
-      5,
+      6,
       keys.data,
       keys.active,
       keys.pending,
       keys.delayed,
       keys.overlay,
+      keys.marker,
       job.id,
       retryAt ? retryAt.getTime().toString() : '0',
       now.toString(),
@@ -328,12 +427,13 @@ export class RedisAdapter implements Adapter {
       const [payloadData, payloadIsUndefined] = encodeRedisJobPayloadOverlay(jobData.payload)
       const result = (await this.#connection.eval(
         PUSH_DEDUP_JOB_SCRIPT,
-        5,
+        6,
         keys.data,
         keys.delayed,
         dedupKey,
         keys.pending,
         keys.overlay,
+        keys.marker,
         jobData.id,
         JSON.stringify(jobData),
         executeAt.toString(),
@@ -341,17 +441,19 @@ export class RedisAdapter implements Adapter {
         jobData.dedup.extend ? '1' : '0',
         jobData.dedup.replace ? '1' : '0',
         payloadData,
-        payloadIsUndefined
+        payloadIsUndefined,
+        '1'
       )) as [string, string]
       return { outcome: result[0] as DedupOutcome, jobId: result[1] }
     }
 
     await this.#connection.eval(
       PUSH_DELAYED_JOB_SCRIPT,
-      3,
+      4,
       keys.data,
       keys.delayed,
       keys.overlay,
+      keys.marker,
       jobData.id,
       JSON.stringify(jobData),
       executeAt.toString()
@@ -369,12 +471,13 @@ export class RedisAdapter implements Adapter {
       const [payloadData, payloadIsUndefined] = encodeRedisJobPayloadOverlay(jobData.payload)
       const result = (await this.#connection.eval(
         PUSH_DEDUP_JOB_SCRIPT,
-        5,
+        6,
         keys.data,
         keys.pending,
         dedupKey,
         keys.delayed,
         keys.overlay,
+        keys.marker,
         jobData.id,
         JSON.stringify(jobData),
         score.toString(),
@@ -382,17 +485,19 @@ export class RedisAdapter implements Adapter {
         jobData.dedup.extend ? '1' : '0',
         jobData.dedup.replace ? '1' : '0',
         payloadData,
-        payloadIsUndefined
+        payloadIsUndefined,
+        '0'
       )) as [string, string]
       return { outcome: result[0] as DedupOutcome, jobId: result[1] }
     }
 
     await this.#connection.eval(
       PUSH_JOB_SCRIPT,
-      3,
+      4,
       keys.data,
       keys.pending,
       keys.overlay,
+      keys.marker,
       jobData.id,
       JSON.stringify(jobData),
       score.toString()
@@ -422,6 +527,7 @@ export class RedisAdapter implements Adapter {
       multi.zadd(keys.pending, score, job.id)
     }
 
+    multi.zadd(keys.marker, 0, '0')
     await multi.exec()
   }
 
@@ -447,11 +553,12 @@ export class RedisAdapter implements Adapter {
 
     const [recovered, ...exceeded] = (await this.#connection.eval(
       RECOVER_STALLED_JOBS_SCRIPT,
-      4,
+      5,
       keys.data,
       keys.active,
       keys.pending,
       keys.overlay,
+      keys.marker,
       now.toString(),
       stalledThreshold.toString(),
       maxStalledCount.toString(),
@@ -495,6 +602,7 @@ export class RedisAdapter implements Adapter {
   }
 
   async upsertSchedule(config: ScheduleConfig): Promise<string> {
+    this.#forgetNextSchedule()
     const id = config.id ?? randomUUID()
     const now = Date.now()
     const scheduleKey = `${scheduleDataPrefix}${id}`
@@ -514,11 +622,12 @@ export class RedisAdapter implements Adapter {
 
     const unfinalizedClaim = (await this.#connection.eval(
       UPSERT_SCHEDULE_SCRIPT,
-      4,
+      5,
       scheduleKey,
       schedulesIndexKey,
       schedulesDueKey,
       `${legacyScheduleDataPrefix}${id}`,
+      schedulesMarkerKey,
       id,
       now.toString(),
       JSON.stringify(scheduleData),
@@ -603,6 +712,7 @@ export class RedisAdapter implements Adapter {
     id: string,
     updates: Partial<Pick<ScheduleData, 'status' | 'nextRunAt' | 'lastRunAt' | 'runCount'>>
   ): Promise<void> {
+    this.#forgetNextSchedule()
     const scheduleKey = `${scheduleDataPrefix}${id}`
     const data: Record<string, string> = {}
 
@@ -619,9 +729,10 @@ export class RedisAdapter implements Adapter {
 
     await this.#connection.eval(
       UPDATE_SCHEDULE_SCRIPT,
-      2,
+      3,
       scheduleKey,
       schedulesDueKey,
+      schedulesMarkerKey,
       id,
       JSON.stringify(data)
     )
@@ -648,25 +759,38 @@ export class RedisAdapter implements Adapter {
     )
   }
 
+  #forgetNextSchedule(): void {
+    this.#nextSchedule = undefined
+    this.#scheduleRevision++
+  }
+
   async claimDueSchedule(): Promise<ScheduleData | null> {
     const now = Date.now()
+    const next = this.#nextSchedule
+    if (next && now < next.at && now - next.readAt < SCHEDULE_CACHE_TTL) return null
+    this.#nextSchedule = undefined
+    const revision = this.#scheduleRevision
     const claimToken = randomUUID()
 
     while (true) {
       const result = (await this.#connection.eval(
         CLAIM_SCHEDULE_SCRIPT,
-        2,
+        3,
         schedulesDueKey,
         scheduleDataPrefix,
+        schedulesMarkerKey,
         now.toString(),
         claimToken
-      )) as ['claimed' | 'unfinalized', string] | null
+      )) as ['claimed' | 'unfinalized' | 'none', string]
 
-      if (!result) {
+      const [outcome, json] = result
+      if (outcome === 'none') {
+        if (this.#watching && revision === this.#scheduleRevision) {
+          this.#nextSchedule = { at: json === '' ? Infinity : Number(json), readAt: now }
+        }
         return null
       }
 
-      const [outcome, json] = result
       const data = JSON.parse(json) as Record<string, string>
 
       // The worker of this cron claim died before finalizing it. Its occurrence
@@ -724,9 +848,10 @@ export class RedisAdapter implements Adapter {
 
     await this.#connection.eval(
       FINALIZE_CRON_SCHEDULE_SCRIPT,
-      2,
+      3,
       `${scheduleDataPrefix}${claim.id}`,
       schedulesDueKey,
+      schedulesMarkerKey,
       claim.id,
       claim.cronExpression,
       claim.configRevision,
