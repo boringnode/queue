@@ -28,6 +28,11 @@ export type RegisterFromGlobOptions = {
    * found. Defaults to the console.
    */
   logger?: Logger
+  /**
+   * Throws `E_JOB_LOAD_FAILED` for the first file that fails to import, in
+   * place of the log. The import error is its `cause`. Defaults to `false`.
+   */
+  strict?: boolean
 }
 
 /**
@@ -80,8 +85,9 @@ class LocatorSingleton {
    *
    * Each file should have a default export that is a Job class.
    * The class name is used as the registration name. A file that fails to
-   * import is logged at the `error` level and skipped. When the patterns
-   * match no job file, a warning is logged.
+   * import is logged at the `error` level and skipped. With `strict: true`,
+   * it throws `E_JOB_LOAD_FAILED` in place. When the patterns match no job
+   * file, a warning is logged.
    *
    * @param patterns - Glob patterns to match job files
    * @returns Number of jobs successfully registered
@@ -115,6 +121,10 @@ class LocatorSingleton {
           const module = await this.#import(absolutePath, options.hotReload ?? false)
           JobClass = module.default
         } catch (error) {
+          if (options.strict) {
+            throw new errors.E_JOB_LOAD_FAILED([file], { cause: error })
+          }
+
           failed++
           logger.error({ err: error as Error, file }, `Failed to load job from ${file}`)
           continue

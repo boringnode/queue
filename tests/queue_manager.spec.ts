@@ -214,6 +214,46 @@ test.group('QueueManager', () => {
     assert.equal((logger.logs[0].obj!.err as Error).message, 'Syntax mistake')
   })
 
+  test('loadJobs with strict throws E_JOB_LOAD_FAILED for the configured locations', async ({
+    assert,
+    fs,
+  }) => {
+    await fs.create('strict_configured_job.js', `throw new Error('boom')`)
+    const brokenFile = join(fs.basePath, 'strict_configured_job.js')
+
+    await QueueManager.init({
+      default: 'sync',
+      adapters: { sync: sync() },
+      locations: [brokenFile],
+      logger: new MemoryLogger(),
+      autoLoadJobs: false,
+    })
+
+    const error = await QueueManager.loadJobs(undefined, { strict: true }).then(
+      () => undefined,
+      (err) => err
+    )
+
+    assert.instanceOf(error, errors.E_JOB_LOAD_FAILED)
+    assert.equal((error.cause as Error).message, 'boom')
+  })
+
+  test('loadJobs with strict throws E_JOB_LOAD_FAILED for explicit locations', async ({
+    assert,
+    fs,
+  }) => {
+    await fs.create('strict_explicit_job.js', `export default class {`)
+    const brokenFile = join(fs.basePath, 'strict_explicit_job.js')
+
+    const error = await QueueManager.loadJobs([brokenFile], { strict: true }).then(
+      () => undefined,
+      (err) => err
+    )
+
+    assert.instanceOf(error, errors.E_JOB_LOAD_FAILED)
+    assert.instanceOf(error.cause, SyntaxError)
+  })
+
   test('should load jobs from configured locations', async ({ assert, cleanup }) => {
     cleanup(() => Locator.clear())
 

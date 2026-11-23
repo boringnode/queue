@@ -2,7 +2,7 @@ import { test } from '@japa/runner'
 import { MemoryLogger } from './_mocks/memory_logger.js'
 import { fork, type ChildProcess } from 'node:child_process'
 import { realpath } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { Job } from '../src/job.js'
 import { Locator } from '../src/locator.js'
@@ -126,6 +126,70 @@ test.group('Locator', (group) => {
     assert.lengthOf(logger.logs, 1)
     assert.equal(logger.logs[0].level, 'warn')
     assert.include(logger.logs[0].message, 'No jobs found for locations: ./non-existent-path')
+  })
+
+  test('should log and skip a file that fails to load, and register the other jobs', async ({
+    assert,
+    fs,
+  }) => {
+    const logger = new MemoryLogger()
+    await fs.create('locator_skipped_job.js', `throw new Error('boom')`)
+    await fs.create('locator_good_job.js', `export default class GoodJob {}`)
+
+    const registered = await Locator.registerFromGlob([join(fs.basePath, 'locator_*_job.js')], {
+      logger,
+    })
+
+    assert.equal(registered, 1)
+    assert.isDefined(Locator.get('GoodJob'))
+    assert.lengthOf(logger.logs, 1)
+    assert.equal(logger.logs[0].level, 'error')
+    assert.include(logger.logs[0].message, 'locator_skipped_job.js')
+  })
+
+  test('strict throws E_JOB_LOAD_FAILED for a file that throws on import', async ({
+    assert,
+    fs,
+  }) => {
+    const logger = new MemoryLogger()
+    await fs.create('locator_throwing_job.js', `throw new Error('boom')`)
+    const brokenFile = join(fs.basePath, 'locator_throwing_job.js')
+
+    const error = await Locator.registerFromGlob([brokenFile], { logger, strict: true }).then(
+      () => undefined,
+      (err) => err
+    )
+
+    assert.instanceOf(error, errors.E_JOB_LOAD_FAILED)
+    assert.equal(error.message, `Cannot load job from "${brokenFile}"`)
+    assert.equal(error.code, 'E_JOB_LOAD_FAILED')
+    assert.equal((error.cause as Error).message, 'boom')
+    assert.lengthOf(logger.logs, 0)
+  })
+
+  test('strict throws E_JOB_LOAD_FAILED for a file with a syntax error', async ({ assert, fs }) => {
+    await fs.create('locator_syntax_error_job.js', `export default class {`)
+    const brokenFile = join(fs.basePath, 'locator_syntax_error_job.js')
+
+    const error = await Locator.registerFromGlob([brokenFile], { strict: true }).then(
+      () => undefined,
+      (err) => err
+    )
+
+    assert.instanceOf(error, errors.E_JOB_LOAD_FAILED)
+    assert.instanceOf(error.cause, SyntaxError)
+  })
+
+  test('strict does not throw for a file with no default export', async ({ assert, fs }) => {
+    const logger = new MemoryLogger()
+    await fs.create('helpers.js', `export const value = 1`)
+
+    const registered = await Locator.registerFromGlob([join(fs.basePath, 'helpers.js')], {
+      logger,
+      strict: true,
+    })
+
+    assert.equal(registered, 0)
   })
 
   test('should return undefined for non-existent job', ({ assert }) => {
