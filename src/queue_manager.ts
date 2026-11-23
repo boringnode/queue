@@ -166,6 +166,8 @@ class QueueManagerSingleton {
    * register jobs at a precise moment in their command lifecycle.
    *
    * @param locations - Optional glob patterns. Defaults to the configured locations.
+   * @param options - `strict: true` throws `E_JOB_LOAD_FAILED` for the first
+   *   job file that fails to import, in place of the log.
    * @returns Number of jobs successfully registered.
    *
    * @example
@@ -175,9 +177,15 @@ class QueueManagerSingleton {
    *
    * // Or with explicit locations
    * await QueueManager.loadJobs(['./app/jobs/**\/*.js'])
+   *
+   * // Or throw when a job file fails to load
+   * await QueueManager.loadJobs(undefined, { strict: true })
    * ```
    */
-  async loadJobs(locations: string[] = this.#locations): Promise<number> {
+  async loadJobs(
+    locations: string[] = this.#locations,
+    options: { strict?: boolean } = {}
+  ): Promise<number> {
     if (locations.length === 0) {
       return 0
     }
@@ -185,6 +193,7 @@ class QueueManagerSingleton {
     return Locator.registerFromGlob(locations, {
       hotReload: this.#hotReload,
       logger: this.#logger,
+      strict: options.strict,
     })
   }
 

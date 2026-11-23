@@ -105,6 +105,35 @@ await worker.start(['default', 'email'])
 await QueueManager.destroy()
 ```
 
+## Loading Jobs
+
+`QueueManager.init()` imports each file that matches `locations`. A file that fails to import, for
+example one with a syntax error, is logged at the `error` level and skipped. The other jobs are
+registered.
+
+A worker process can refuse to start instead. Turn off `autoLoadJobs`, then load the jobs with
+`strict: true`. The first file that fails to import throws `E_JOB_LOAD_FAILED`, and the import
+error is its `cause`:
+
+```typescript
+import { QueueManager, errors } from '@boringnode/queue'
+
+await QueueManager.init({ ...config, autoLoadJobs: false })
+
+try {
+  await QueueManager.loadJobs(undefined, { strict: true })
+} catch (error) {
+  if (error instanceof errors.E_JOB_LOAD_FAILED) {
+    console.error(error.message, error.cause)
+    process.exit(1)
+  }
+  throw error
+}
+```
+
+`Locator.registerFromGlob()` accepts the same option:
+`Locator.registerFromGlob(['./app/jobs/**/*.ts'], { strict: true })`.
+
 ## Hot Reloading Jobs
 
 During development, jobs discovered from `locations` can be reloaded before each execution. This
